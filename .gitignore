@@ -1,0 +1,21 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+
+# ---- harness 运行时数据 ----
+# 会话 JSONL、检查点、浏览器窗口 profile（几十 MB，且含本机路径）
+.harness/
+
+# ---- 本地配置与 IDE ----
+.idea/
+.vscode/
+*.local.json
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+
+# ---- 演示用仓库（含嵌套 git 仓库与 worktree，按需自行 git init）----
+demo-projects/
+# 演示运行产生的输出
+examples/demo-workspace/notes/

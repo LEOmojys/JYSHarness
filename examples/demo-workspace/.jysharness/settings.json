@@ -1,0 +1,22 @@
+{
+  "permissionMode": "acceptEdits",
+  "sandboxMode": "workspace-write",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write"
+    ],
+    "ask": [
+      "Bash(git push *)"
+    ],
+    "deny": [
+      "Read(.env*)"
+    ]
+  },
+  "provider": "mock",
+  "model": "mock-1",
+  "maxTurns": 30
+}

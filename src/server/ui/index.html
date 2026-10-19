@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JYSHarness</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">JYS</div>
+        <div class="brand-text">
+          <div class="brand-name">JYSHarness</div>
+          <div class="brand-sub" id="brandSub">正在连接…</div>
+        </div>
+      </div>
+
+      <button class="new-session" id="newSessionBtn">
+        <span class="plus">+</span> 新建会话
+        <kbd>Ctrl+N</kbd>
+      </button>
+
+      <div class="side-label">会话</div>
+      <div class="session-list" id="sessionList"></div>
+
+      <div class="panel-tabs" id="panelTabs">
+        <button data-panel="files" class="active">文件</button>
+        <button data-panel="todos">待办</button>
+        <button data-panel="jobs">任务</button>
+        <button data-panel="skills">技能</button>
+        <button data-panel="rules">规则</button>
+      </div>
+      <div class="panel" id="panelBody"></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <span class="dot" id="statusDot"></span>
+          <span class="title" id="sessionTitle">新会话</span>
+          <button class="ghost ws-chip" id="workspaceChip" title="切换工作区">📁 <span id="wsName">workspace</span></button>
+          <span class="tag mono" id="modelTag">—</span>
+          <span class="tag mono" id="sandboxTag">—</span>
+        </div>
+        <div class="topbar-right">
+          <select id="agentModeSelect" title="工作模式">
+            <option value="default">普通模式</option>
+            <option value="makePlugin">插件开发</option>
+          </select>
+          <select id="modeSelect" title="权限模式">
+            <option value="default">默认</option>
+            <option value="acceptEdits">自动接受编辑</option>
+            <option value="plan">计划</option>
+            <option value="dontAsk">不询问</option>
+            <option value="bypassPermissions">完全放行</option>
+          </select>
+          <select id="sandboxSelect" title="文件沙箱">
+            <option value="read-only">只读</option>
+            <option value="workspace-write">工作区可写</option>
+            <option value="danger-full-access">完全放行</option>
+          </select>
+          <span class="cost mono" id="costLabel"></span>
+          <button class="ghost" id="settingsBtn" title="模型与权限设置">设置</button>
+          <button class="ghost" id="undoBtn" title="撤销最近一次文件修改">撤销</button>
+          <button class="ghost" id="compactBtn" title="压缩上下文">压缩</button>
+        </div>
+      </header>
+
+      <section class="transcript" id="transcript"></section>
+
+      <footer class="composer">
+        <div class="attachments hidden" id="attachments"></div>
+        <textarea id="input" rows="1" placeholder="给 Agent 发消息…   Enter 发送 · Shift+Enter 换行 · Ctrl+K 命令 · 可直接粘贴图片"></textarea>
+        <div class="composer-actions">
+          <button class="ghost" id="attachBtn" title="添加图片">图片</button>
+          <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+          <span class="meter" id="meter"></span>
+          <button class="primary" id="sendBtn">发送</button>
+          <button class="danger hidden" id="stopBtn">停止</button>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="drawer hidden" id="drawer">
+      <div class="drawer-head">
+        <span id="drawerTitle">文件</span>
+        <button class="icon-btn" id="drawerClose">×</button>
+      </div>
+      <pre class="drawer-body" id="drawerBody"></pre>
+    </aside>
+  </div>
+
+  <div class="modal-backdrop hidden" id="permModal">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="warn-icon">!</span>
+        <div>
+          <h3 id="permTitle">需要确认</h3>
+          <p id="permReason" class="muted"></p>
+        </div>
+      </div>
+      <pre class="perm-input" id="permInput"></pre>
+      <p class="muted small" id="permTip"></p>
+      <div class="modal-actions">
+        <button class="ghost" id="denyBtn">拒绝</button>
+        <button class="ghost" id="alwaysBtn">总是允许</button>
+        <button class="primary" id="allowBtn">允许一次</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="confirmModal">
+    <div class="modal confirm">
+      <h3 id="confirmTitle">确认</h3>
+      <p class="muted" id="confirmText"></p>
+      <div class="modal-actions">
+        <button class="ghost" id="confirmCancel">取消</button>
+        <button class="danger" id="confirmOk">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="wsModal">
+    <div class="modal ws-modal">
+      <div class="settings-head">
+        <h3>选择工作区</h3>
+        <button class="icon-btn" id="wsClose">×</button>
+      </div>
+      <div class="settings-body">
+        <div class="form-row">
+          <label>当前</label>
+          <div class="mono small" id="wsCurrent" style="word-break: break-all"></div>
+        </div>
+        <div class="form-row">
+          <label>路径</label>
+          <div class="form-inline">
+            <input type="text" id="wsInput" placeholder="D:\my-project，或点下面的目录逐层选择" />
+            <button class="primary" id="wsOpenBtn">打开</button>
+          </div>
+        </div>
+        <div id="wsMsg" class="muted small" style="margin: -2px 0 10px 118px"></div>
+        <div class="settings-section">
+          <h4>工作树（git worktree）</h4>
+          <div id="wsWorktrees"><div class="panel-empty">检测中…</div></div>
+          <div class="form-inline" style="margin-top: 8px">
+            <input type="text" id="wsWtName" placeholder="新任务名，如 fix-login" />
+            <button class="ghost" id="wsWtCreate">新建工作树</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h4>常用路径</h4>
+          <div id="wsFavorites"><div class="panel-empty">还没有固定路径</div></div>
+        </div>
+        <div class="settings-section">
+          <h4>最近项目</h4>
+          <div id="wsRecent"><div class="panel-empty">暂无</div></div>
+        </div>
+        <div class="settings-section">
+          <h4>浏览目录</h4>
+          <div class="file-crumbs" id="wsCrumbs"></div>
+          <div id="wsDirs"></div>
+        </div>
+      </div>
+      <div class="settings-foot">
+        <span class="muted small"></span>
+        <button class="ghost" id="wsPickBtn">选择当前目录</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="settingsModal">
+    <div class="modal settings">
+      <div class="settings-head">
+        <h3>设置</h3>
+        <button class="icon-btn" id="settingsClose">×</button>
+      </div>
+      <div class="settings-body" id="settingsBody"></div>
+      <div class="settings-foot">
+        <span class="muted small" id="settingsMsg"></span>
+        <button class="ghost" id="testConnBtn">测试连接</button>
+        <button class="primary" id="saveSettingsBtn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="palette-backdrop hidden" id="palette">
+    <div class="palette-box">
+      <input id="paletteInput" placeholder="输入命令…" autocomplete="off" />
+      <ul id="paletteList"></ul>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

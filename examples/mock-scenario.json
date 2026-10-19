@@ -1,0 +1,85 @@
+[
+  {
+    "text": "先规划一下。\n\n- 看看工作区里有什么\n- 写一份说明文件\n- 用命令验证一下",
+    "toolCalls": [
+      {
+        "name": "TodoWrite",
+        "input": {
+          "todos": [
+            {
+              "content": "查看工作区结构",
+              "status": "completed"
+            },
+            {
+              "content": "写入 notes/summary.md",
+              "status": "in_progress"
+            },
+            {
+              "content": "用命令验证",
+              "status": "pending"
+            }
+          ]
+        }
+      },
+      {
+        "name": "Glob",
+        "input": {
+          "pattern": "**/*.md"
+        }
+      }
+    ]
+  },
+  {
+    "text": "现在写说明文件。",
+    "toolCalls": [
+      {
+        "name": "Write",
+        "input": {
+          "file_path": "notes/summary.md",
+          "content": "# 演示说明\n\n这是一个用来端到端验证 harness 的小工作区。\n\n- Agent 主循环\n- 工具系统\n- 权限模型\n"
+        }
+      }
+    ]
+  },
+  {
+    "text": "把措辞改准确一点。",
+    "toolCalls": [
+      {
+        "name": "Edit",
+        "input": {
+          "file_path": "notes/summary.md",
+          "old_string": "这是一个用来端到端验证 harness 的小工作区。",
+          "new_string": "这是一个用来端到端验证完整 harness 能力的小工作区。"
+        }
+      }
+    ]
+  },
+  {
+    "text": "启动一个后台任务验证 shell。",
+    "toolCalls": [
+      {
+        "name": "Bash",
+        "input": {
+          "command": "node -e \"setTimeout(()=>console.log('构建通过'), 300)\"",
+          "run_in_background": true
+        }
+      }
+    ]
+  },
+  {
+    "text": "读取后台任务结果。",
+    "toolCalls": [
+      {
+        "name": "JobOutput",
+        "input": {
+          "job_id": "job_1",
+          "wait_ms": 3000
+        }
+      }
+    ]
+  },
+  {
+    "text": "完成了：读取了工作区，创建并修订了 `notes/summary.md`，并用后台任务验证了 shell 可用。",
+    "stopReason": "end_turn"
+  }
+]

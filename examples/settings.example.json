@@ -1,0 +1,46 @@
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "permissionMode": "default",
+  "sandboxMode": "workspace-write",
+  "maxTurns": 60,
+  "maxTokens": 8192,
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git status)",
+      "Bash(git diff *)"
+    ],
+    "ask": [
+      "Bash(npm install *)"
+    ],
+    "deny": [
+      "Read(.env*)",
+      "Bash(curl *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "command": "node examples/hooks/guard-secrets.mjs",
+        "timeoutMs": 5000
+      }
+    ]
+  },
+  "compaction": {
+    "softLimit": 60000,
+    "targetTokens": 30000,
+    "keepRecentMessages": 12
+  },
+  "mcpServers": {
+    "demo": {
+      "command": "node",
+      "args": [
+        "../tests/fixtures/mcp-echo.mjs"
+      ]
+    }
+  }
+}

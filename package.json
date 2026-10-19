@@ -1,0 +1,23 @@
+{
+  "name": "jysharness",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "JYSHarness - a Claude-Code-style agent harness built from scratch (zero runtime deps).",
+  "bin": {
+    "jys": "./src/cli/main.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/cli/main.ts",
+    "demo": "node src/cli/main.ts --provider mock --script examples/mock-scenario.json --workspace examples/demo-workspace -y -p \"summarise this workspace\"",
+    "test": "node --test tests/harness.test.ts tests/server.test.ts tests/features.test.ts tests/config.test.ts tests/workspace.test.ts tests/session-delete.test.ts tests/plugins.test.ts tests/worktrees.test.ts",
+    "serve": "node src/cli/main.ts serve",
+    "desktop": "node src/cli/main.ts desktop",
+    "install-desktop": "pwsh -File scripts/install-desktop.ps1",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
+    "install-shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop.ps1"
+  }
+}
