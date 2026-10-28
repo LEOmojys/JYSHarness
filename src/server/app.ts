@@ -12,9 +12,10 @@ import type { Session } from "../core/session.ts";
 import type { ApprovalOutcome, HarnessEvent } from "../core/query.ts";
 import type { PermissionDecision } from "../permissions/engine.ts";
 import { formatRule } from "../permissions/rules.ts";
-import { realResolve, isInside } from "../sandbox/paths.ts";
+import { realResolve, isInside, sandboxEnforcement } from "../sandbox/paths.ts";
 import { loadSettings } from "../core/config.ts";
 import { isValidRule, readRuleArrays, writeRuleArrays, type RuleArrays } from "../core/ruleStore.ts";
+import { describeHooks } from "../hooks/hooks.ts";
 import { describeConfig, resolveApiKey, saveAppConfig, type ConfigPatch, type McpServerView } from "../core/configStore.ts";
 import type { ModelProvider } from "../providers/types.ts";
 import type { Tool } from "../tools/types.ts";
@@ -62,7 +63,10 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", ".h
 export interface ServerOptions {
   session: Session;
   /** Factory for additional sessions (new tab / fork / another workspace). */
-  makeSession?: (workspaceRoot?: string) => Promise<Session>;
+  makeSession?: (
+    workspaceRoot?: string,
+    resume?: { sessionId: string; resumeMessages: import("../core/types.ts").Message[] },
+  ) => Promise<Session>;
   logger: Logger;
   host?: string;
   port?: number;
@@ -112,6 +116,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const sessions = new Map<string, Hosted>();
   let activeId = "";
   let approvalSeq = 0;
+
+  /**
+   * 转录存储。**不能**通过 current().session.store 去拿：
+   * 删掉最后那个活动会话后 sessions 会变空，current() 就返回 undefined，
+   * 于是删除接口自己 500（实测就是这个）。
+   */
+  const sessionStore = opts.session.store;
 
   function register(session: Session): Hosted {
     const hosted: Hosted = { session, running: false, abort: null, pending: new Map(), changes: [] };
@@ -166,6 +177,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       mode: s.mode,
       agentMode: s.agentMode,
       sandbox: s.sandboxMode,
+      // 模式只是"我想要什么"，这里给的是"实际有什么"：
+      // 沙箱不可用时会退化成纯路径/命令检查，用户必须看得见。
+      sandboxEnforcement: sandboxEnforcement(s.sandboxMode),
       workspace: s.workspaceRoot,
       // 还没开始过的会话用目录名区分，否则侧栏会堆一排"新会话"。
       title: displayTitle(s),
@@ -176,7 +190,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       contextTokens: s.contextTokens(),
       contextWindow: s.contextWindow,
       contextUsage: s.contextUsage(),
+      context: s.contextBreakdown(),
+      cache: s.cost(),
       running: h.running,
+      hooks: describeHooks(s.hooks),
+      // 技能/插件的问题必须可见：静默跳过会让人以为配置生效了
+      skillWarnings: s.skillWarnings,
+      persistWarnings: s.persistWarnings,
+      droppedTools: s.droppedTools,
+      agentTypes: s.agentTypes.map((t) => ({ name: t.name, description: t.description, tools: t.tools ?? null })),
       todos: s.todos.items,
       changes: h.changes.slice(-40),
       jobs: jobsFor(s),
@@ -207,9 +229,28 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     broadcast({ type: "state", sessionId: h.session.sessionId, state: await buildState(h) });
   }
 
+  /**
+   * 配置的对外形状：GET /api/config 与 POST 的 config 字段共用。
+   *
+   * 分开构造过一次，直接导致"设置里填了 API 却保存不了"：POST 少返回 active，
+   * 前端 renderSettings 抛错并清空表单。一个构造函数，两端不会再分叉。
+   */
+  function configPayload(h: Hosted) {
+    const cfg = describeConfig(h.session.workspaceRoot, {
+      provider: h.session.provider.id,
+      model: h.session.model,
+    });
+    return { ...cfg, active: { provider: h.session.provider.id, model: h.session.model }, workspace: h.session.workspaceRoot };
+  }
+
   function askApproval(
     h: Hosted,
-    request: { toolName: string; input: Record<string, unknown>; decision: PermissionDecision },
+    request: {
+      toolName: string;
+      input: Record<string, unknown>;
+      decision: PermissionDecision;
+      origin?: "subagent";
+    },
   ): Promise<ApprovalOutcome> {
     if (opts.autoApprove) return Promise.resolve("allow");
     const id = "perm_" + ++approvalSeq;
@@ -225,6 +266,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         toolName: request.toolName,
         input: request.input,
         decision: request.decision,
+        // 子 Agent 的审批必须能看出来源，否则用户不知道自己在替谁批准
+        origin: request.origin,
       });
     });
   }
@@ -257,7 +300,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     const sessionId = h.session.sessionId;
     broadcast({ type: "turn_start", sessionId });
     try {
-      for await (const ev of h.session.send(text, controller.signal, images)) {
+      // 旁路：子 Agent 的进度在运行中就能到前端，不必等这一轮结束。
+      const live = (ev: unknown) => broadcast({ ...(ev as Record<string, unknown>), sessionId });
+      for await (const ev of h.session.send(text, controller.signal, images, live)) {
         broadcast({ ...ev, sessionId });
         if (ev.type === "tool_end") {
           const meta = (ev.result.metadata ?? {}) as { todos?: unknown; changes?: { path: string; created: boolean; diff: unknown[] }[] };
@@ -369,9 +414,24 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         const action = body.action ?? "";
         if (action === "activate" && body.id) {
           const h = sessions.get(body.id);
-          if (!h) return json(res, 404, { error: "not loaded; restart with --resume " + body.id });
+          if (h) {
+            activeId = body.id;
+            return json(res, 200, await buildState(h));
+          }
+          // 只在磁盘上的历史会话：现场从转录恢复并注册。
+          // 以前这里直接 404（"restart with --resume"），于是会话列表里的历史项
+          // 点了也切不过去 —— 列表显示得出来，却用不了。
+          if (!opts.makeSession) return json(res, 404, { error: "not loaded; restart with --resume " + body.id });
+          const loaded = await sessionStore.load(body.id);
+          if (!loaded.meta) return json(res, 404, { error: "no such session: " + body.id });
+          const fresh = await opts.makeSession(loaded.meta.workspaceRoot, {
+            sessionId: body.id,
+            resumeMessages: loaded.messages,
+          });
+          await fresh.init();
+          const hosted = register(fresh);
           activeId = body.id;
-          return json(res, 200, await buildState(h));
+          return json(res, 200, await buildState(hosted));
         }
         if (action === "new" || action === "fork") {
           if (!opts.makeSession) return json(res, 400, { error: "session factory not configured" });
@@ -386,8 +446,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
         if (action === "delete" && body.id) {
           const live = sessions.get(body.id);
+          // 判据必须是"所有会话"：活动会话 + 磁盘上的历史会话。
+          // 只数活动会话会在"1 个活动 + N 个历史"时误判成"最后一个"而拒绝删除。
+          const onDisk = await sessionStore.ids();
+          const all = new Set<string>([...sessions.keys(), ...onDisk]);
+          if (all.size <= 1 && all.has(body.id)) {
+            return json(res, 400, { error: "不能删除最后一个会话" });
+          }
+          const wasActive = activeId === body.id;
           if (live) {
-            if (sessions.size === 1) return json(res, 400, { error: "不能删除最后一个会话" });
             live.abort?.abort();
             live.session.jobs.killAll();
             for (const [id, pending] of live.pending) {
@@ -399,8 +466,18 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             if (activeId === body.id) activeId = sessions.keys().next().value!;
           }
           // 历史会话（只存在于磁盘）也要能删，否则重启后又会冒出来。
-          const removed = await current().session.store.remove(body.id);
+          const removed = await sessionStore.remove(body.id);
           if (!live && !removed) return json(res, 404, { error: "会话不存在" });
+          // 删掉的若是最后一个活动会话，界面不能停在"没有会话"的状态：
+          // 直接开一个新的空会话，用户视角就是"删完自动给你一个新的"。
+          if (sessions.size === 0 && opts.makeSession) {
+            const fresh = await opts.makeSession(undefined);
+            await fresh.init();
+            register(fresh);
+          }
+          if (wasActive || !sessions.has(activeId)) {
+            activeId = sessions.keys().next().value ?? activeId;
+          }
           return json(res, 200, await buildState(current()));
         }
         return json(res, 400, { error: "unknown action" });
@@ -451,9 +528,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         const body = (await readJson(req)) as { command?: string; session?: string };
         const h = body.session ? sessions.get(body.session) : current();
         if (!h) return json(res, 404, { error: "no such session" });
-        const cmd = body.command ?? "";
-        if (cmd === "compact") {
-          const r = h.session.compactNow();
+        const cmd = (body.command ?? "").trim();
+        // /compact 可以带关注点：只切第一段当命令，剩下的原样传给摘要器。
+        const [name, ...args] = cmd.split(/\s+/);
+        if (name === "compact") {
+          const r = await h.session.compactNow(args.join(" ").trim() || undefined);
           broadcast({
             type: "compaction",
             sessionId: h.session.sessionId,
@@ -461,10 +540,10 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             tokensBefore: r.before,
             tokensAfter: r.after,
           });
-        } else if (cmd === "clear") {
+        } else if (name === "clear") {
           h.session.clear();
           h.changes = [];
-        } else if (cmd === "undo") {
+        } else if (name === "undo") {
           const undone = h.session.undoLast();
           broadcast({
             type: "notice",
@@ -476,9 +555,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
               ? "undid " + undone.id + ": restored " + undone.restored.length + " file(s)"
               : "nothing to undo",
           });
-        } else if (cmd === "skills") {
+        } else if (name === "skills") {
           h.session.refreshSkills();
-        } else if (cmd === "jobs") {
+        } else if (name === "jobs") {
           return json(res, 200, jobsFor(h.session));
         } else {
           return json(res, 400, { error: "unknown command" });
@@ -488,16 +567,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
 
       if (route === "/api/config" && req.method === "GET") {
-        const h = current();
-        const cfg = describeConfig(h.session.workspaceRoot, {
-          provider: h.session.provider.id,
-          model: h.session.model,
-        });
-        return json(res, 200, {
-          ...cfg,
-          active: { provider: h.session.provider.id, model: h.session.model },
-          workspace: h.session.workspaceRoot,
-        });
+        return json(res, 200, configPayload(current()));
       }
 
       if (route === "/api/config" && req.method === "POST") {
@@ -531,6 +601,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             maxTurns: body.maxTurns,
             maxTokens: body.maxTokens,
             temperature: body.temperature,
+            fallbackModel: body.fallbackModel,
           });
         }
 
@@ -568,7 +639,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
 
         for (const h of sessions.values()) await emitState(h);
-        const cfg = describeConfig(h0.session.workspaceRoot);
+        // POST 也要返回**和 GET 完全一样**的形状：前端保存后会拿它直接重渲染，
+        // 少了 active/workspace 就会在 renderSettings 里抛错，把表单炸成空白。
+        const cfg = configPayload(h0);
         if (swapError) return json(res, 400, { error: swapError, config: cfg });
         return json(res, 200, { ok: true, config: cfg });
       }
@@ -770,6 +843,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             ok: true,
             branch: created.branch,
             path: created.path,
+            copied: created.copied,
             state,
             worktrees: fresh.map((w) => ({
               ...w,

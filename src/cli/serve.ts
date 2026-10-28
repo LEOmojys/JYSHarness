@@ -41,9 +41,14 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
   const mcp = await connectMcpServers(runtime.settings, logger, args.workspace);
   if (mcp.tools.length) runtime.session.setExtensionTools(mcp.tools);
 
-  const makeSession = async (workspaceRoot?: string): Promise<Session> => {
+  const makeSession = async (
+    workspaceRoot?: string,
+    resume?: { sessionId: string; resumeMessages: import("../core/types.ts").Message[] },
+  ): Promise<Session> => {
     const fresh = new Session({
       workspaceRoot: workspaceRoot ?? runtime.session.workspaceRoot,
+      sessionId: resume?.sessionId,
+      resumeMessages: resume?.resumeMessages,
       settings: runtime.settings,
       rules: runtime.loaded.rules,
       provider: runtime.resolved.provider,
@@ -67,8 +72,10 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
       ...runtime.settings,
       provider: cfg.provider as HarnessSettings["provider"],
       model: cfg.model,
-      baseUrl: cfg.baseUrl,
-      apiKeyEnv: cfg.apiKeyEnv,
+      // 没传就不要覆盖：否则 baseUrl 会被写成 undefined，再遇上 ?? 回退就跳到
+      // 另一个厂商的默认地址（deepseek 的配置被当成 openai）。
+      baseUrl: cfg.baseUrl ?? runtime.settings.baseUrl,
+      apiKeyEnv: cfg.apiKeyEnv ?? runtime.settings.apiKeyEnv,
     };
     const resolved = createProvider({ settings, providerName: cfg.provider, model: cfg.model });
     return { provider: resolved.provider, model: resolved.model, note: resolved.note };
@@ -76,7 +83,8 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
 
   let liveMcp = mcp;
   const reloadMcp = async (servers: McpServerView[]) => {
-    for (const c of liveMcp.clients) c.close();
+    // 关宿主而不是关初始 client：重连后 client 已经换过，关旧的会漏掉新的进程。
+    for (const h of liveMcp.hosts) h.close();
     const map: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
     for (const server of servers) {
       if (!server.name || !server.command) continue;

@@ -53,9 +53,12 @@ export function createProvider(opts: {
           "。也可以先用 --provider mock 离线体验。",
       );
     }
+    // 空字符串要当成"没填"，否则 ?? 不会回退，请求会发到空 URL —— 表现为
+    // 一个毫无线索的 "fetch failed"。设置面板里把 Base URL 清空是很正常的操作。
+    const configured = (opts.settings.baseUrl ?? "").trim();
     const baseUrl =
-      opts.settings.baseUrl ?? (name === "deepseek" ? "https://api.deepseek.com/v1" : "https://api.openai.com/v1");
-    const provider = new OpenAIProvider({ apiKey, baseUrl, model: model || "gpt-4.1" });
+      configured || (name === "deepseek" ? "https://api.deepseek.com/v1" : "https://api.openai.com/v1");
+    const provider = new OpenAIProvider({ apiKey, baseUrl, model: model || "gpt-4.1", id: name });
     return { provider, model: provider.model, note: "openai-compatible " + baseUrl + " (key from " + keyInfo.from + ")" };
   }
 

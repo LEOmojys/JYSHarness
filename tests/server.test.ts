@@ -18,6 +18,8 @@ async function tempWorkspace(): Promise<string> {
 interface Harness {
   server: RunningServer;
   events: any[];
+  /** The boot session, so tests can reach its store (history sessions etc.). */
+  session: Session;
   stop: () => Promise<void>;
 }
 
@@ -35,6 +37,19 @@ async function boot(root: string, turns: MockTurn[], autoApprove: boolean): Prom
   const server = await startServer({
     session,
     logger,
+    // 与 serve.ts 一致：服务端要能新建会话，也要能从磁盘恢复历史会话。
+    makeSession: async (workspaceRoot?: string, resume?: { sessionId: string; resumeMessages: any[] }) =>
+      new Session({
+        workspaceRoot: workspaceRoot ?? root,
+        sessionId: resume?.sessionId,
+        resumeMessages: resume?.resumeMessages,
+        settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 8 },
+        rules: emptyRuleSet(),
+        provider: new MockProvider(turns),
+        model: "mock-1",
+        logger,
+        approve: async () => "deny",
+      }),
     port: 0,
     providerId: "mock",
     autoApprove,
@@ -70,6 +85,7 @@ async function boot(root: string, turns: MockTurn[], autoApprove: boolean): Prom
   return {
     server,
     events,
+    session,
     stop: async () => {
       controller.abort();
       await server.close();
@@ -331,3 +347,79 @@ test("server: workspace file API stays inside the workspace", async () => {
     await h.stop();
   }
 });
+
+test("server: POST /api/config returns the same shape as GET (active/workspace)", async () => {
+  const root = await tempWorkspace();
+  const h = await boot(root, [{ text: "hi" }], true);
+  try {
+    const get = await (await fetch(h.server.url + "api/config")).json();
+    assert.ok(get.active, "GET must expose active");
+    assert.ok(get.workspace, "GET must expose workspace");
+
+    const res = await fetch(h.server.url + "api/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scope: "workspace", provider: "mock", model: "mock-1", maxTurns: 12 }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    // 前端保存后会直接拿 config 重渲染；少了 active 就会抛错并把表单清空。
+    assert.ok(body.config, "POST must return config");
+    assert.deepEqual(Object.keys(body.config).sort(), Object.keys(get).sort(), "POST config shape must match GET");
+    assert.ok(body.config.active && body.config.active.model, "POST config must include active");
+    assert.equal(body.config.behavior.maxTurns, 12, "the patch must be applied");
+  } finally {
+    await h.stop();
+  }
+});
+
+
+test("server: deleting or switching to a disk-only session works", async () => {
+  const root = await tempWorkspace();
+  const h = await boot(root, [{ text: "hi" }], true);
+  try {
+    // 造两个"只在磁盘上"的历史会话
+    const store = h.session.store;
+    for (const id of ["hist-one", "hist-two"]) {
+      await store.create({
+        id,
+        createdAt: new Date().toISOString(),
+        cwd: root,
+        workspaceRoot: root,
+        model: "mock-1",
+        provider: "mock",
+        permissionMode: "default",
+        sandboxMode: "workspace-write",
+      });
+      await store.append(id, { role: "user", content: [{ type: "text", text: "历史 " + id }] });
+    }
+
+    // 1) 切到历史会话：以前会 404，现在应当从磁盘恢复并注册
+    const activate = await fetch(h.server.url + "api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "activate", id: "hist-one" }),
+    });
+    assert.equal(activate.status, 200, "history session must be resumable from the UI");
+    const state = await activate.json();
+    assert.equal(state.sessionId, "hist-one");
+    assert.ok(state.messages.length > 0, "the resumed transcript must be loaded");
+
+    // 2) 删除一个磁盘会话：以前因为"只数活动会话"会误判成最后一个而 400
+    const del = await fetch(h.server.url + "api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "delete", id: "hist-two" }),
+    });
+    assert.equal(del.status, 200, "deleting a disk-only session must work");
+    assert.equal((await (await fetch(h.server.url + "api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "activate", id: "hist-two" }),
+    })).json()).error !== undefined, true, "the deleted one is gone");
+  } finally {
+    await h.stop();
+  }
+});
+

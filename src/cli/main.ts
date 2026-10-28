@@ -4,11 +4,14 @@
  * Rendering is event-driven, which is why the loop can stream.
  */
 import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
 import { paint, Logger } from "../util/log.ts";
-import { describeSandbox } from "../sandbox/paths.ts";
+import { describeSandbox, describeSandboxBackend } from "../sandbox/paths.ts";
 import type { HarnessEvent } from "../core/query.ts";
-import type { PermissionDecision } from "../permissions/engine.ts";
+import type { Session } from "../core/session.ts";
+import { describeDecision, type PermissionDecision } from "../permissions/engine.ts";
 import { formatRule } from "../permissions/rules.ts";
+import { describeHooks } from "../hooks/hooks.ts";
 import { parseArgs, createRuntime, HELP } from "./bootstrap.ts";
 
 class Prompter {
@@ -81,7 +84,7 @@ async function main(): Promise<void> {
   //   main.ts --workspace <dir> serve --port 4317
   // Looking only at argv[2] silently turned "serve" into a one-shot prompt.
   const argv = process.argv.slice(2);
-  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin"]);
+  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check"]);
   const subIndex = argv.findIndex((a) => SUBCOMMANDS.has(a));
   const sub = subIndex >= 0 ? argv[subIndex] : undefined;
   const rest = subIndex >= 0 ? argv.filter((_, i) => i !== subIndex) : argv;
@@ -95,6 +98,12 @@ async function main(): Promise<void> {
   if (sub === "plugin") {
     const { runPlugin } = await import("./plugin.ts");
     await runPlugin(rest);
+    return;
+  }
+
+  if (sub === "check") {
+    const { runCheck } = await import("./check.ts");
+    await runCheck(rest);
     return;
   }
 
@@ -128,7 +137,9 @@ async function main(): Promise<void> {
     console.log("");
     console.log(paint.yellow("  permission required: ") + paint.bold(request.toolName));
     console.log(paint.dim("  " + preview));
-    console.log(paint.dim("  reason: " + request.decision.message + " [" + request.decision.reason + "]"));
+    // 统一的决策文本（ALLOW/DENY/ASK + reason），并在子 Agent 发起时标出来
+    const from = (request as { origin?: string }).origin === "subagent" ? paint.yellow(" · 子 Agent 发起") : "";
+    console.log(paint.dim("  " + describeDecision(request.decision)) + from);
     if (request.decision.suggestedRule) {
       console.log(paint.dim("  tip: add rule \"" + request.decision.suggestedRule + "\" to always allow this"));
     }
@@ -138,13 +149,13 @@ async function main(): Promise<void> {
     return "deny" as const;
   };
 
-  let runtime;
+  let runtime: Awaited<ReturnType<typeof createRuntime>>;
   try {
     runtime = await createRuntime({
       args,
       logger,
       approve,
-      onAlwaysAllow: (toolName, input) => {
+      onAlwaysAllow: (toolName: string, input: Record<string, unknown>) => {
         const content =
           typeof input.command === "string" ? input.command
           : typeof input.file_path === "string" ? input.file_path
@@ -177,7 +188,16 @@ async function main(): Promise<void> {
     process.on("SIGINT", onSigint);
     let printedText = false;
     try {
-      for await (const ev of session.send(text, controller.signal)) {
+      // 子 Agent 的进度走旁路，实时打印一行（每步一行，CLI 里够用了）。
+      const live = (ev: unknown) => {
+        const e = ev as { type: string; label?: string; tool?: string; step?: number; agentType?: string };
+        if (e.type === "subagent_progress") {
+          process.stdout.write(paint.dim("\n    [" + e.label + " · " + e.step + "] " + e.tool));
+        } else if (e.type === "subagent_start") {
+          process.stdout.write(paint.dim("\n    sub-agent " + e.label + " (" + e.agentType + ")"));
+        }
+      };
+      for await (const ev of session.send(text, controller.signal, undefined, live)) {
         handleEvent(ev);
       }
     } finally {
@@ -244,12 +264,14 @@ async function main(): Promise<void> {
     console.log(paint.bold("  JYSHarness") + paint.dim("  v0.2.0"));
     console.log(paint.dim("  model: " + resolved.model + " (" + resolved.provider.id + ")"));
     console.log(paint.dim("  " + describeSandbox({ mode: session.sandboxMode, workspaceRoot: session.workspaceRoot })));
+    console.log(paint.dim("  " + describeSandboxBackend(session.sandboxMode)));
     console.log(paint.dim("  permissions: " + session.mode + "  session: " + session.sessionId));
     console.log(paint.dim("  type /help for commands, /exit to quit"));
   }
 }
 
-async function handleSlash(
+/** 斜杠命令分发。导出是为了让测试能逐个命令调用 —— 这层以前完全没有覆盖。 */
+export async function handleSlash(
   text: string,
   session: Session,
   prompter: Prompter,
@@ -289,8 +311,15 @@ async function handleSlash(
       }
       return false;
     case "compact": {
-      const r = session.compactNow();
-      console.log(paint.dim("  compacted " + r.applied.join("+") + ": " + r.before + " -> " + r.after + " tokens"));
+      // /compact 可选关注点：/compact 保留 API 改动
+      // 这里原来写的是 line（不存在的变量）——REPL 里一敲 /compact 就 ReferenceError。
+      const focus = text.slice(text.indexOf("compact") + "compact".length).trim();
+      const r = await session.compactNow(focus || undefined);
+      if (!r.applied.length) {
+        console.log(paint.dim("  nothing to compact: context is already small (" + r.before + " tokens)"));
+      } else {
+        console.log(paint.dim("  compacted " + r.applied.join("+") + ": " + r.before + " -> " + r.after + " tokens"));
+      }
       return false;
     }
     case "context":
@@ -311,6 +340,33 @@ async function handleSlash(
       for (const r of all) console.log(paint.dim("  " + r.ruleBehavior.padEnd(5) + " " + formatRule(r) + "  <- " + r.source));
       return false;
     }
+    case "agents": {
+      if (!session.agentTypes.length) console.log(paint.dim("  no agent types"));
+      for (const t of session.agentTypes) {
+        const scope = t.tools ? t.tools.join(",") : "all tools";
+        console.log(paint.dim("  " + t.name.padEnd(10) + " " + t.source.padEnd(8) + " " + scope));
+      }
+      return false;
+    }
+    case "skills": {
+      if (!session.skills.length) console.log(paint.dim("  no skills installed"));
+      for (const s of session.skills) {
+        const tools = s.allowedTools?.length ? "  [allowed: " + s.allowedTools.join(",") + "]" : "";
+        console.log(paint.dim("  " + s.name.padEnd(18) + " " + s.source.padEnd(8) + " " + s.description + tools));
+      }
+      // 告警不能吞掉：重复名/缺简介是"改了没生效"的头号原因
+      for (const w of session.skillWarnings) console.log(paint.yellow("  ! " + w));
+      if (session.droppedTools.length) {
+        console.log(paint.yellow("  ! 工具名被内置工具挡住：" + session.droppedTools.join(", ")));
+      }
+      return false;
+    }
+    case "hooks": {
+      const lines = describeHooks(session.hooks);
+      if (!lines.length) console.log(paint.dim("  no hooks configured (settings.json 的 hooks 或插件注册)"));
+      for (const line of lines) console.log(paint.dim("  " + line));
+      return false;
+    }
     case "sessions": {
       const list = await session.store.list();
       if (!list.length) console.log(paint.dim("  no stored sessions"));
@@ -328,7 +384,15 @@ async function handleSlash(
   }
 }
 
-main().catch((err) => {
-  console.error(paint.red("fatal: " + (err instanceof Error ? err.stack ?? err.message : String(err))));
-  process.exitCode = 1;
-});
+// 只有"被当作程序执行"时才启动 CLI。
+// 之前这里是裸的 main()：任何 import 这个模块的代码（比如测试）都会真的把 REPL
+// 跑起来并挂在 stdin 上 —— 界面上表现为"测试永远不结束"。
+const invokedPath = process.argv[1];
+const isEntryPoint = Boolean(invokedPath) && pathToFileURL(invokedPath).href === import.meta.url;
+
+if (isEntryPoint) {
+  main().catch((err) => {
+    console.error(paint.red("fatal: " + (err instanceof Error ? err.stack ?? err.message : String(err))));
+    process.exitCode = 1;
+  });
+}

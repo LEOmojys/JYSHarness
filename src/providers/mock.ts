@@ -33,9 +33,21 @@ export class MockProvider implements ModelProvider {
   /** Recorded requests, for assertions in tests. */
   readonly requests: ModelRequest[] = [];
 
+  /** 测试用：让 countTokens 返回固定值（模拟服务商精确计数）。 */
+  tokensPerRequest?: number;
+  /** 测试用：模拟计数端点失败。 */
+  countTokensFails = false;
+
   constructor(turns: MockTurn[], model = "mock-1") {
     this.turns = turns;
     this.model = model;
+  }
+
+  async countTokens(req: ModelRequest): Promise<number | null> {
+    if (this.countTokensFails) return null;
+    if (typeof this.tokensPerRequest === "number") return this.tokensPerRequest;
+    const text = JSON.stringify(req.messages) + req.system;
+    return Math.max(1, Math.round(text.length / 3));
   }
 
   async *stream(req: ModelRequest): AsyncGenerator<StreamEvent> {

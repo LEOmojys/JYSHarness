@@ -3,7 +3,6 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 let state = null;
-let pendingPerm = null;
 let liveText = null;
 let activePanel = "files";
 let filesPath = "";
@@ -29,6 +28,7 @@ const REASON_LABEL = {
   prompt_too_long: "上下文超长",
   model_error: "模型错误",
   stop_hook_prevented: "被 Stop Hook 阻止",
+  max_output_tokens: "输出被截断（多次续写仍不够）",
 };
 
 function reasonLabel(reason) {
@@ -463,14 +463,22 @@ function renderMessages(messages) {
       frag.appendChild(node);
       continue;
     }
-    if (text.trim()) {
+    const thinking = blocks.filter((b) => b.type === "thinking").map((b) => b.text).join("");
+    if (text.trim() || thinking.trim()) {
       const node = el("div", "msg assistant");
       const head = el("div", "msg-head");
       head.appendChild(el("div", "avatar assistant", "A"));
       head.appendChild(el("span", "msg-role", "助手"));
       node.appendChild(head);
+      // 推理过程：默认折叠；只有推理没有正文时也保留这条消息（否则转录里会"消失一轮"）
+      if (thinking.trim()) {
+        const box = el("details", "thinking");
+        box.appendChild(el("summary", "thinking-head", "思考过程（" + thinking.length + " 字）"));
+        box.appendChild(el("div", "thinking-body", thinking));
+        node.appendChild(box);
+      }
       const body = el("div", "msg-body md");
-      body.innerHTML = md(text);
+      body.innerHTML = text.trim() ? md(text) : "（本轮只有推理，没有正文）";
       node.appendChild(body);
       frag.appendChild(node);
     }
@@ -549,10 +557,28 @@ function renderState(next) {
   $("modeSelect").value = next.mode;
   $("agentModeSelect").value = next.agentMode || "default";
   $("sandboxSelect").value = next.sandbox;
+  // 模式是"想要什么"，enforcement 是"实际有什么"：沙箱没装上时必须让人看见。
+  const enf = next.sandboxEnforcement;
+  const warnChip = $("sandboxWarn");
+  if (warnChip) {
+    const showWarning = enf && !enf.enforced && next.sandbox !== "danger-full-access";
+    warnChip.style.display = showWarning ? "" : "none";
+    if (enf) {
+      warnChip.title = "OS 沙箱未生效：" + enf.note;
+      $("sandboxSelect").title = "文件沙箱 — " + enf.note;
+    }
+  }
   $("statusDot").className = "dot" + (next.running ? " busy" : "");
   $("stopBtn").classList.toggle("hidden", !next.running);
   $("sendBtn").disabled = !!next.running;
+  renderStatsChip(next);
   $("costLabel").textContent = "$" + (next.cost ? next.cost.totalUsd.toFixed(4) : "0.0000");
+  if (next.cost && next.cost.cacheHitRate > 0) {
+    $("costLabel").title =
+      "提示缓存命中 " + (next.cost.cacheHitRate * 100).toFixed(0) + "%（读 " +
+      next.cost.cacheReadTokens + " / 写 " + next.cost.cacheCreationTokens + "）";
+    $("costLabel").textContent += " · 缓存 " + (next.cost.cacheHitRate * 100).toFixed(0) + "%";
+  }
   renderSessions();
   renderPanel();
   // 首次启动且没有模型凭据时，直接把设置面板弹出来。
@@ -607,8 +633,29 @@ function liveAssistant() {
   const empty = t.querySelector(".empty");
   if (empty) empty.remove();
   t.appendChild(node);
-  liveText = { node, body, text: "" };
+  liveText = { node, body, text: "", thinking: null, thinkingText: "" };
+  // 注意：live 节点在 stream 期间存在，state 重渲染后由 renderMessages 重新生成
+  void 0;
   return liveText;
+}
+
+/**
+ * 推理流（reasoning_content）的折叠块。
+ *
+ * 只在**本轮**存在：它不写进 transcript、不发给模型、也不计入上下文，
+ * 刷新后消失。默认折叠，标题显示字数 —— 用户想看细节就展开。
+ */
+function thinkingBlock(live) {
+  if (live.thinking) return live.thinking;
+  const box = el("details", "thinking");
+  const summary = el("summary", "thinking-head", "思考过程（0 字）");
+  const pre = el("div", "thinking-body");
+  box.appendChild(summary);
+  box.appendChild(pre);
+  // 插到正文之前
+  live.node.insertBefore(box, live.body);
+  live.thinking = { box, summary, pre };
+  return live.thinking;
 }
 
 function selForTool(id) {
@@ -629,6 +676,16 @@ function handleEvent(ev) {
       $("stopBtn").classList.remove("hidden");
       liveText = null;
       break;
+    case "thinking_delta": {
+      const keep = atBottom();
+      const live = liveAssistant();
+      const block = thinkingBlock(live);
+      live.thinkingText += ev.text;
+      block.pre.textContent = live.thinkingText;
+      block.summary.textContent = "思考过程（" + live.thinkingText.length + " 字）";
+      if (keep) scrollToBottom();
+      break;
+    }
     case "text_delta": {
       const keep = atBottom();
       const live = liveAssistant();
@@ -638,7 +695,13 @@ function handleEvent(ev) {
       break;
     }
     case "assistant_message":
-      if (liveText && liveText.text.trim()) liveText.body.innerHTML = md(liveText.text);
+      if (liveText) {
+        if (liveText.text.trim()) liveText.body.innerHTML = md(liveText.text);
+        // 光有思考没有正文时，保留折叠块并标记"（无正文）"，而不是留一条空白气泡
+        if (liveText.thinking && !liveText.text.trim()) {
+          liveText.body.textContent = "（本轮只有推理，没有正文）";
+        }
+      }
       liveText = null;
       break;
     case "tool_start":
@@ -670,11 +733,30 @@ function handleEvent(ev) {
     case "permission_resolved":
       hidePermission();
       break;
-    case "compaction":
+    case "compaction": {
+      const label = (ev.applied || []).length ? ev.applied.join("+") : "无需压缩";
       $("transcript").appendChild(
-        noticeLine("上下文已压缩（" + ev.applied.join("+") + "）：" + ev.tokensBefore + " → " + ev.tokensAfter + " tokens", "info"),
+        noticeLine("上下文已压缩（" + label + "）：" + ev.tokensBefore + " → " + ev.tokensAfter + " tokens", "info"),
       );
       break;
+    }
+    case "subagent_start": {
+      // 每个子 Agent 一行，后续进度原地更新，避免刷屏
+      const line = noticeLine("子 Agent " + ev.label + "（" + ev.agentType + "）启动", "info");
+      line.dataset.subId = ev.id;
+      $("transcript").appendChild(line);
+      break;
+    }
+    case "subagent_progress": {
+      const line = $("transcript").querySelector('[data-sub-id="' + ev.id + '"]');
+      if (line) line.textContent = "子 Agent " + ev.label + " · 第 " + ev.step + " 步 · " + ev.tool;
+      break;
+    }
+    case "subagent_end": {
+      const line = $("transcript").querySelector('[data-sub-id="' + ev.id + '"]');
+      if (line) line.textContent = "子 Agent " + ev.label + " 结束（" + ev.steps + " 步" + (ev.ok ? "" : "，中止") + "）";
+      break;
+    }
     case "notice":
       $("transcript").appendChild(noticeLine(noticeText(ev), ev.level));
       break;
@@ -718,32 +800,7 @@ async function runConfirm() {
   if (fn) await fn();
 }
 
-/* ---------------- permissions ---------------- */
-function showPermission(ev) {
-  pendingPerm = ev.id;
-  $("permTitle").textContent = "允许执行 " + ev.toolName + "？";
-  $("permReason").textContent = permissionReasonText(ev.decision) + "（" + ev.decision.reason + "）";
-  $("permInput").textContent = JSON.stringify(ev.input, null, 2);
-  $("permTip").textContent = ev.decision.suggestedRule
-    ? "提示：在 .jysharness/settings.json 中加入规则 " + ev.decision.suggestedRule + " 可不再询问。"
-    : "";
-  $("permModal").classList.remove("hidden");
-  $("allowBtn").focus();
-}
-function hidePermission() {
-  pendingPerm = null;
-  $("permModal").classList.add("hidden");
-}
-async function answer(decision) {
-  if (!pendingPerm) return;
-  const id = pendingPerm;
-  hidePermission();
-  await fetch("/api/permission", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id, decision }),
-  });
-}
+/* 审批弹窗与队列在 permission.js（独立脚本，和 settings.js 同一种拆法）。 */
 
 /* ---------------- drawer / files ---------------- */
 async function openFile(relPath) {
@@ -836,7 +893,8 @@ async function command(name) {
 
 async function runSlash(text) {
   const cmd = text.slice(1).split(/\s+/)[0];
-  if (cmd === "compact") return command("compact");
+  // /compact 支持追加关注点，原样透传给摘要器。
+  if (cmd === "compact") return command(text.slice(1).trim());
   if (cmd === "clear") return command("clear");
   if (cmd === "undo") return command("undo");
   if (cmd === "new") return newSession(false);
@@ -923,6 +981,35 @@ function connect() {
 document.addEventListener("DOMContentLoaded", () => {
   $("sendBtn").addEventListener("click", send);
   $("settingsBtn").addEventListener("click", openSettings);
+  // 窄窗口下侧栏是覆盖式抽屉：☰ 开关，状态记在 localStorage 里
+  const SIDEBAR_KEY = "jys.sidebarOpen";
+  const setSidebar = (open) => {
+    document.querySelector(".app").classList.toggle("sidebar-open", open);
+    try { localStorage.setItem(SIDEBAR_KEY, open ? "1" : "0"); } catch { /* 隐私模式 */ }
+  };
+  $("sidebarToggle").addEventListener("click", () => {
+    setSidebar(!document.querySelector(".app").classList.contains("sidebar-open"));
+  });
+  try {
+    if (localStorage.getItem(SIDEBAR_KEY) === "1") document.querySelector(".app").classList.add("sidebar-open");
+  } catch { /* 隐私模式 */ }
+  // 选中会话后自动收起，把宽度还给正文
+  $("sessionList").addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 768px)").matches) setSidebar(false);
+  });
+  $("statsChip").addEventListener("click", (e) => {
+    e.stopPropagation();
+    statsOpen = !statsOpen;
+    renderStatsChip(state || {});
+  });
+  document.addEventListener("click", (e) => {
+    if (!statsOpen) return;
+    const pop = $("statsPop");
+    if (pop && !pop.contains(e.target) && e.target !== $("statsChip")) {
+      statsOpen = false;
+      pop.classList.add("hidden");
+    }
+  });
   $("workspaceChip").addEventListener("click", () => void openWorkspacePicker());
   $("wsClose").addEventListener("click", closeWorkspacePicker);
   $("wsOpenBtn").addEventListener("click", () => void chooseWorkspace($("wsInput").value));
@@ -1013,7 +1100,7 @@ document.addEventListener("DOMContentLoaded", () => {
       else if (!$("wsModal").classList.contains("hidden")) closeWorkspacePicker();
       else if (!$("settingsModal").classList.contains("hidden")) closeSettings();
       else if (!$("palette").classList.contains("hidden")) closePalette();
-      else if (pendingPerm) answer("deny");
+      else if (hasPendingPermission()) answer("deny");
       else closeDrawer();
     }
   });
@@ -1024,6 +1111,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   const openSettingsHash = panelHash === "settings";
   const openWorkspaceHash = panelHash === "workspace";
+  if (panelHash === "stats") statsOpen = true;
 
   const params = new URLSearchParams(location.search);
   if (params.has("static")) {
@@ -1080,310 +1168,6 @@ const PROVIDER_LABEL = {
   compatible: "OpenAI 兼容端点",
   mock: "Mock（离线演示）",
 };
-
-function field(labelText, control) {
-  const row = el("div", "form-row");
-  row.appendChild(el("label", "", labelText));
-  row.appendChild(control);
-  return row;
-}
-
-function input(id, value, type, placeholder) {
-  const node = el("input");
-  node.id = id;
-  node.type = type || "text";
-  node.value = value === undefined || value === null ? "" : String(value);
-  if (placeholder) node.placeholder = placeholder;
-  return node;
-}
-
-async function openSettings() {
-  $("settingsModal").classList.remove("hidden");
-  $("settingsMsg").textContent = "加载中…";
-  $("settingsBody").innerHTML = "";
-  try {
-    const res = await fetch("/api/config");
-    appConfig = await res.json();
-    renderSettings(appConfig);
-    $("settingsMsg").textContent = "";
-  } catch (e) {
-    $("settingsMsg").textContent = "读取配置失败：" + (e.message || e);
-  }
-}
-
-function closeSettings() {
-  $("settingsModal").classList.add("hidden");
-}
-
-function renderSettings(cfg) {
-  const body = $("settingsBody");
-  body.innerHTML = "";
-
-  // ---- 当前生效 ----
-  const active = el("div", "form-hint");
-  active.style.margin = "0 0 12px 0";
-  active.textContent = "当前生效：" + cfg.active.model + "（" + (PROVIDER_LABEL[cfg.active.provider] || cfg.active.provider) + "）";
-  body.appendChild(active);
-
-  // ---- 模型接入 ----
-  const modelSection = el("div", "settings-section");
-  modelSection.appendChild(el("h4", "", "模型接入"));
-
-  const providerSel = el("select");
-  providerSel.id = "cfgProvider";
-  for (const [value, label] of Object.entries(PROVIDER_LABEL)) {
-    const opt = el("option", "", label);
-    opt.value = value;
-    providerSel.appendChild(opt);
-  }
-  providerSel.value = cfg.model.provider;
-  modelSection.appendChild(field("服务商", providerSel));
-
-  const modelInput = input("cfgModel", cfg.model.model);
-  const list = el("datalist");
-  list.id = "cfgModelList";
-  modelInput.setAttribute("list", "cfgModelList");
-  const listWrap = el("div", "form-inline");
-  listWrap.appendChild(modelInput);
-  listWrap.appendChild(list);
-  modelSection.appendChild(field("模型", listWrap));
-
-  modelSection.appendChild(field("Base URL", input("cfgBaseUrl", cfg.model.baseUrl)));
-
-  const windowInput = input("cfgWindow", cfg.model.contextWindow, "number");
-  windowInput.placeholder = "自动按模型推断";
-  modelSection.appendChild(field("上下文窗口", windowInput));
-  const windowHint = el("div", "form-hint");
-  windowHint.textContent =
-    "单位 token。当前 " + cfg.model.contextWindow + "，超过 75% 自动压缩到 40%；改动后立即重算压缩阈值。";
-  modelSection.appendChild(windowHint);
-
-  const keyInput = input("cfgApiKey", "", "password");
-  keyInput.placeholder = cfg.key.present
-    ? "已配置 " + cfg.key.hint + "（留空表示不修改）"
-    : "粘贴 API Key";
-  modelSection.appendChild(field("API Key", keyInput));
-
-  const keyHint = el("div", "form-hint");
-  if (cfg.key.present) {
-    keyHint.textContent =
-      "密钥来源：" +
-      (cfg.key.from === "secrets" ? "本机 secrets.json" : "环境变量") +
-      "。密钥只保存在 ~/.jysharness/secrets.json，不会写进项目文件。";
-  } else {
-    keyHint.textContent = "未检测到密钥。填写后保存到本机，不会写进项目文件。";
-  }
-  modelSection.appendChild(keyHint);
-
-  const scopeSel = el("select");
-  scopeSel.id = "cfgScope";
-  const scopeUser = el("option", "", "本机（推荐，不进版本库）");
-  scopeUser.value = "user";
-  const scopeWs = el("option", "", "当前项目（.jysharness/settings.json）");
-  scopeWs.value = "workspace";
-  scopeSel.appendChild(scopeUser);
-  scopeSel.appendChild(scopeWs);
-  modelSection.appendChild(field("保存位置", scopeSel));
-  body.appendChild(modelSection);
-
-  // ---- 行为 ----
-  const behavior = el("div", "settings-section");
-  behavior.appendChild(el("h4", "", "权限与行为"));
-
-  const modeSel = el("select");
-  modeSel.id = "cfgMode";
-  for (const [v, l] of [["default", "默认（敏感操作询问）"], ["acceptEdits", "自动接受编辑"], ["plan", "计划（只读）"], ["dontAsk", "不询问（自动拒绝）"], ["bypassPermissions", "完全放行（危险）"]]) {
-    const o = el("option", "", l);
-    o.value = v;
-    modeSel.appendChild(o);
-  }
-  modeSel.value = cfg.behavior.permissionMode;
-  behavior.appendChild(field("权限模式", modeSel));
-
-  const sbSel = el("select");
-  sbSel.id = "cfgSandbox";
-  for (const [v, l] of [["read-only", "只读"], ["workspace-write", "工作区可写"], ["danger-full-access", "完全放行"]]) {
-    const o = el("option", "", l);
-    o.value = v;
-    sbSel.appendChild(o);
-  }
-  sbSel.value = cfg.behavior.sandboxMode;
-  behavior.appendChild(field("文件沙箱", sbSel));
-
-  behavior.appendChild(field("最大轮次", input("cfgMaxTurns", cfg.behavior.maxTurns, "number")));
-  behavior.appendChild(field("单次输出上限", input("cfgMaxTokens", cfg.behavior.maxTokens, "number")));
-  behavior.appendChild(field("temperature", input("cfgTemp", cfg.behavior.temperature, "number")));
-
-  const subCb = el("input");
-  subCb.type = "checkbox";
-  subCb.id = "cfgSubagent";
-  subCb.checked = cfg.behavior.enableSubagent;
-  const subWrap = el("div", "form-inline");
-  subWrap.appendChild(subCb);
-  subWrap.appendChild(el("span", "small muted", "允许模型派生子 Agent"));
-  behavior.appendChild(field("子 Agent", subWrap));
-  body.appendChild(behavior);
-
-  // ---- MCP ----
-  const mcpSection = el("div", "settings-section");
-  mcpSection.appendChild(el("h4", "", "MCP 服务器"));
-  const mcpList = el("div");
-  mcpList.id = "cfgMcpList";
-  for (const server of cfg.mcpServers) mcpList.appendChild(mcpRow(server));
-  mcpSection.appendChild(mcpList);
-  const addBtn = button("ghost", "+ 添加服务器", () => {
-    mcpList.appendChild(mcpRow({ name: "", command: "", args: [], env: {} }));
-  });
-  mcpSection.appendChild(addBtn);
-  body.appendChild(mcpSection);
-
-  // ---- 插件 ----
-  const pluginSection = el("div", "settings-section");
-  pluginSection.appendChild(el("h4", "", "插件"));
-  const pluginNote = el("div", "form-hint");
-  pluginNote.style.margin = "0 0 8px 0";
-  pluginNote.textContent =
-    "项目插件放在 .harness/plugins/ 下。启用/停用或重新加载后立即对当前会话生效；修改 index.ts 后需要点「重新加载」。";
-  pluginSection.appendChild(pluginNote);
-
-  const pluginList = el("div", "plugin-list");
-  pluginList.id = "pluginList";
-  pluginList.appendChild(el("div", "panel-empty", "加载中…"));
-  pluginSection.appendChild(pluginList);
-
-  const pluginRow = el("div", "form-inline");
-  const scaffoldInput = el("input");
-  scaffoldInput.id = "pluginNewName";
-  scaffoldInput.placeholder = "新插件名，如 acme";
-  pluginRow.appendChild(scaffoldInput);
-  pluginRow.appendChild(
-    button("ghost", "新建", () => {
-      void scaffoldPlugin();
-    }),
-  );
-  pluginRow.appendChild(
-    button("ghost", "重新加载", () => {
-      void reloadPlugins();
-    }),
-  );
-  pluginSection.appendChild(pluginRow);
-  body.appendChild(pluginSection);
-
-  void refreshPluginList();
-
-  const refreshModels = () => {
-    const provider = providerSel.value;
-    list.innerHTML = "";
-    for (const m of MODEL_PRESETS[provider] || []) {
-      const opt = el("option");
-      opt.value = m;
-      list.appendChild(opt);
-    }
-    const defaults = cfg.defaults[provider] || {};
-    if (!modelInput.value.trim() && defaults.model) modelInput.value = defaults.model;
-    if (defaults.baseUrl) $("cfgBaseUrl").value = defaults.baseUrl;
-  };
-  providerSel.addEventListener("change", () => {
-    modelInput.value = "";
-    refreshModels();
-  });
-  refreshModels();
-}
-
-function mcpRow(server) {
-  const row = el("div", "mcp-row");
-  const name = input("", server.name, "text", "名称");
-  name.className = "mcp-name";
-  const command = input("", server.command, "text", "命令，如 npx");
-  command.className = "mcp-command";
-  const args = input("", (server.args || []).join(" "), "text", "参数，空格分隔");
-  args.className = "mcp-args";
-  row.appendChild(name);
-  row.appendChild(command);
-  row.appendChild(args);
-  row.appendChild(
-    button("icon-btn", "×", () => {
-      row.remove();
-    }),
-  );
-  return row;
-}
-
-function collectSettings() {
-  const rows = [...document.querySelectorAll("#cfgMcpList .mcp-row")].map((row) => ({
-    name: row.querySelector(".mcp-name").value.trim(),
-    command: row.querySelector(".mcp-command").value.trim(),
-    args: row.querySelector(".mcp-args").value.trim() ? row.querySelector(".mcp-args").value.trim().split(/\s+/) : [],
-    env: {},
-  }));
-  const payload = {
-    scope: $("cfgScope").value,
-    provider: $("cfgProvider").value,
-    model: $("cfgModel").value.trim(),
-    baseUrl: $("cfgBaseUrl").value.trim(),
-    permissionMode: $("cfgMode").value,
-    sandboxMode: $("cfgSandbox").value,
-    maxTurns: Number($("cfgMaxTurns").value),
-    maxTokens: Number($("cfgMaxTokens").value),
-    temperature: Number($("cfgTemp").value),
-    contextWindow: Number($("cfgWindow").value) || 0,
-    enableSubagent: $("cfgSubagent").checked,
-    mcpServers: rows.filter((r) => r.name && r.command),
-  };
-  const apiKey = $("cfgApiKey").value.trim();
-  if (apiKey) payload.apiKey = apiKey;
-  return payload;
-}
-
-async function saveSettings(silent) {
-  const payload = collectSettings();
-  $("settingsMsg").textContent = "保存中…";
-  const res = await fetch("/api/config", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    $("settingsMsg").textContent = "保存失败：" + (data.error || res.status);
-    $("settingsMsg").style.color = "var(--red)";
-    return false;
-  }
-  $("settingsMsg").style.color = "var(--green)";
-  $("settingsMsg").textContent = silent ? "" : "已保存，立即生效";
-  if (data.config) {
-    appConfig = data.config;
-    if (!silent) renderSettings(data.config);
-  }
-  return true;
-}
-
-async function testConnection() {
-  const payload = collectSettings();
-  $("settingsMsg").style.color = "var(--muted)";
-  // 新填的 Key 需要先落盘，测试才能用到它。
-  if (payload.apiKey) {
-    const ok = await saveSettings(true);
-    if (!ok) return;
-  }
-  $("settingsMsg").textContent = "测试中…";
-  const res = await fetch("/api/config/test", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (data.ok) {
-    $("settingsMsg").style.color = "var(--green)";
-    $("settingsMsg").textContent = "连接正常（" + data.ms + "ms）：" + (data.sample || "");
-  } else {
-    $("settingsMsg").style.color = "var(--red)";
-    $("settingsMsg").textContent = "连接失败：" + (data.error || res.status);
-  }
-}
-/* ---------------- 工作区切换 ---------------- */
-let wsBrowsePath = "";
-let lastWorkspace = null;
 
 function baseName(p) {
   const parts = String(p || "").split(/[\\/]/).filter(Boolean);
@@ -1647,6 +1431,12 @@ async function refreshWorktrees() {
       badge.style.marginLeft = "6px";
       title.appendChild(badge);
     }
+    if (wt.dirty) {
+      const badge = el("span", "pill", "未提交 " + wt.dirty);
+      badge.style.marginLeft = "6px";
+      badge.style.color = "var(--red)";
+      title.appendChild(badge);
+    }
     main.appendChild(title);
     main.appendChild(el("div", "ws-path", wt.path));
     main.addEventListener("click", () => void chooseWorkspace(wt.path));
@@ -1668,7 +1458,7 @@ async function createWorktreeFromPicker() {
   const res = await fetch("/api/worktrees", {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ action: "create", name }),
+    body: JSON.stringify({ action: "create", name, base: (($("wsWtBase") || {}).value || "").trim() || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -1678,30 +1468,127 @@ async function createWorktreeFromPicker() {
   input.value = "";
   closeWorkspacePicker();
   if (data.state) renderState(data.state);
-  notice("已创建并切换到工作树 " + data.branch);
+  notice("已创建并切换到工作树 " + data.branch + (data.copied && data.copied.length ? "（已复制 " + data.copied.join(", ") + "）" : ""));
+}
+
+async function postRemove(wt, force) {
+  const res = await fetch("/api/worktrees", {
+    method: "POST",
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ action: "remove", path: wt.path, force }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, data };
+}
+
+function afterRemoved(wt, data) {
+  if (data.state) renderState(data.state);
+  notice("已删除工作树 " + wt.branch);
+  void refreshWorktrees();
 }
 
 async function removeWorktreeFromPicker(wt) {
   confirmDialog({
     title: "删除工作树",
-    text:
-      "确定删除工作树「" + wt.branch + "」？目录 " + wt.path + " 会被移除，" +
-      "未提交的改动会丢失（已提交到分支的不会）。",
+    text: "确定删除工作树「" + wt.branch + "」？目录会被移除，已提交到分支的内容不受影响。",
     okLabel: "删除",
     onOk: async () => {
-      const res = await fetch("/api/worktrees", {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ action: "remove", path: wt.path, force: true }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        notice("删除失败：" + (data.error || res.status));
+      // 先按"干净删除"走：有未提交改动时 git 会拒绝，而不是静默丢弃。
+      const first = await postRemove(wt, false);
+      if (first.ok) {
+        afterRemoved(wt, first.data);
         return;
       }
-      if (data.state) renderState(data.state);
-      notice("已删除工作树 " + wt.branch);
-      void refreshWorktrees();
+      const reason = String(first.data.error || "");
+      const dirty = /modified|untracked|clean|dirty|改动|未跟踪/i.test(reason);
+      if (!dirty) {
+        notice("删除失败：" + (reason || "未知错误"));
+        return;
+      }
+      // 只有确认了"确实要丢弃改动"才走 force。
+      confirmDialog({
+        title: "工作树有未提交的改动",
+        text:
+          "「" + wt.branch + "」里有未提交或未跟踪的文件（含 .harness 运行数据）。" +
+          "继续删除会丢失这些改动；已提交到分支的内容不受影响。",
+        okLabel: "仍然删除",
+        onOk: async () => {
+          const forced = await postRemove(wt, true);
+          if (!forced.ok) {
+            notice("删除失败：" + (forced.data.error || "未知错误"));
+            return;
+          }
+          afterRemoved(wt, forced.data);
+        },
+      });
     },
   });
+}
+
+/* ---------------- 统计浮层 ---------------- */
+let statsOpen = false;
+
+function renderStatsPop(state) {
+  const pop = $("statsPop");
+  if (!pop) return;
+  pop.classList.toggle("hidden", !statsOpen);
+  if (!statsOpen) return;
+  const c = state.context || { used: 0, max: 0, system: 0, tools: 0, messages: 0 };
+  const k = state.cost || {};
+  const total = (k.cacheReadTokens || 0) + (k.cacheCreationTokens || 0) + (state.stats ? state.stats.inputTokens : 0) + (state.stats ? state.stats.outputTokens : 0);
+  const pct = (n) => (total > 0 ? ((n / total) * 100).toFixed(0) : "0") + "%";
+  const seg = (n, cls) => {
+    const w = c.used > 0 ? (n / c.used) * 100 : 0;
+    return "<span class=\"" + cls + "\" style=\"width:" + w.toFixed(2) + "%\"></span>";
+  };
+  const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+  const dur = (ms) => {
+    if (!ms || ms < 1000) return (ms || 0) + "ms";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + " 秒";
+    const m = Math.floor(s / 60);
+    const rest = s % 60;
+    if (m < 60) return m + " 分 " + rest + " 秒";
+    return Math.floor(m / 60) + " 小时 " + (m % 60) + " 分";
+  };
+  const st = state.stats || {};
+  pop.innerHTML =
+    "<h5><span>会话统计</span><span>" + (st.turns || 0) + " 轮 " + (st.steps || 0) + " 步</span></h5>" +
+    "<div class=\"stats-row\"><span>模型用时</span><b>" + dur(st.modelMs) + "</b></div>" +
+    "<div class=\"stats-row\"><span>工具调用用时</span><b>" + dur(st.toolMs) + "</b></div>" +
+    "<div class=\"stats-row\"><span>首 token 平均（TTFT）</span><b>" + dur(st.ttftAvgMs) + "</b></div>" +
+    "<div class=\"stats-row\"><span>输出速度（TPS）</span><b>" + (k.tps || 0) + " tok/s</b></div>" +
+    "<div class=\"stats-sep\"></div>" +
+    "<h5><span>Token 用量</span><span>" + fmt(total) + " tok</span></h5>" +
+    "<div class=\"stats-row\"><span>缓存命中</span><b>" + pct(k.cacheReadTokens || 0) + "</b></div>" +
+    "<div class=\"stats-row\"><span>缓存读取</span><b>" + fmt(k.cacheReadTokens || 0) + "</b></div>" +
+    "<div class=\"stats-row\"><span>未缓存输入</span><b>" + fmt(state.stats ? state.stats.inputTokens : 0) + "</b></div>" +
+    "<div class=\"stats-row\"><span>输出</span><b>" + fmt(state.stats ? state.stats.outputTokens : 0) + "</b></div>" +
+    "<div class=\"stats-sep\"></div>" +
+    "<h5><span>上下文已用</span><span>" + (c.max ? ((c.used / c.max) * 100).toFixed(0) + "%" : "—") + " · " + fmt(c.used) + " / " + fmt(c.max) + "</span></h5>" +
+    "<div class=\"stats-bar\">" + seg(c.system, "s-system") + seg(c.tools, "s-tools") + seg(c.messages, "s-msg") + "</div>" +
+    "<div class=\"stats-row\"><span>系统提示词</span><b>" + fmt(c.system) + "</b></div>" +
+    "<div class=\"stats-row\"><span>工具定义</span><b>" + fmt(c.tools) + "</b></div>" +
+    "<div class=\"stats-row\"><span>对话消息</span><b>" + fmt(c.messages) + "</b></div>" +
+    "<div class=\"stats-sep\"></div>" +
+    "<div class=\"stats-row\"><span>轮次 / 工具调用</span><b>" + (state.stats ? state.stats.turns : 0) + " / " + (state.stats ? state.stats.toolCalls : 0) + "</b></div>" +
+    (() => {
+      // 工具失败画像：哪个工具最不靠谱，比总数更有用
+      const byTool = (st.toolStats || {});
+      const entries = Object.entries(byTool).filter(([, v]) => v && v.errors > 0);
+      if (!entries.length) return "";
+      entries.sort((a, b) => b[1].errors - a[1].errors);
+      const worst = entries[0];
+      return "<div class=\"stats-row\"><span>失败最多的工具</span><b>" + worst[0] + " " + worst[1].errors + "/" + worst[1].calls + "</b></div>";
+    })();
+}
+
+function renderStatsChip(state) {
+  const chip = $("statsChip");
+  if (!chip) return;
+  const c = state.context || { used: 0, max: 0 };
+  const hit = state.cost && state.cost.cacheHitRate ? Math.round(state.cost.cacheHitRate * 100) : 0;
+  const used = c.max ? Math.round((c.used / c.max) * 100) : 0;
+  chip.textContent = "上下文 " + used + "% · 缓存 " + hit + "%";
+  renderStatsPop(state);
 }

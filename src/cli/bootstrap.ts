@@ -76,6 +76,7 @@ export const HELP = [
   "  jys serve [--port 4317]      web UI in a browser (--open to launch it)",
   "  jys repl                     interactive terminal session",
   "  jys plugin <new|list|test>   project plugins (tools / hooks / skills)",
+  "  jys check [--entropy]        architecture + entropy checks (--json, --install-hook)",
   "  jys \"fix the failing test\"   one-shot prompt, then exit",
   "",
   "Options:",
@@ -93,7 +94,7 @@ export const HELP = [
   "  --max-turns <n>              hard cap on loop iterations",
   "  --no-subagent                disable the Agent tool",
   "",
-  "Slash commands: /help /status /mode /sandbox /compact /context /cost /clear /sessions /resume /rules /exit",
+  "Slash commands: /help /status /mode /sandbox /compact /context /cost /clear /sessions /resume /rules /hooks /agents /skills /exit",
 ].join("\n");
 
 export interface Runtime {
@@ -122,6 +123,8 @@ export async function createRuntime(opts: RuntimeOptions): Promise<Runtime> {
   if (args.sandbox) cliSettings.sandboxMode = args.sandbox as never;
 
   const loaded = loadSettings(args.workspace, cliSettings);
+  // 配置里的问题（写错的 hook 等）在启动时就告诉用户，而不是运行时才炸。
+  for (const warning of loaded.warnings ?? []) logger.warn("settings: " + warning);
   const settings: HarnessSettings = { ...defaultSettings(), ...loaded.settings };
 
   const mockTurns = args.script

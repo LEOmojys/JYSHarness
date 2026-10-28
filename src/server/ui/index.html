@@ -38,6 +38,7 @@
     <main class="main">
       <header class="topbar">
         <div class="topbar-left">
+          <button class="ghost sidebar-toggle" id="sidebarToggle" title="会话列表">☰</button>
           <span class="dot" id="statusDot"></span>
           <span class="title" id="sessionTitle">新会话</span>
           <button class="ghost ws-chip" id="workspaceChip" title="切换工作区">📁 <span id="wsName">workspace</span></button>
@@ -53,6 +54,7 @@
             <option value="default">默认</option>
             <option value="acceptEdits">自动接受编辑</option>
             <option value="plan">计划</option>
+            <option value="auto">自动（只放行只读命令）</option>
             <option value="dontAsk">不询问</option>
             <option value="bypassPermissions">完全放行</option>
           </select>
@@ -61,12 +63,16 @@
             <option value="workspace-write">工作区可写</option>
             <option value="danger-full-access">完全放行</option>
           </select>
+          <span class="chip warn" id="sandboxWarn" title="OS 沙箱未生效" style="display:none">⚠ 沙箱未强制</span>
+          <span class="chip mono" id="statsChip" title="点击查看 Token 与上下文明细">—</span>
           <span class="cost mono" id="costLabel"></span>
           <button class="ghost" id="settingsBtn" title="模型与权限设置">设置</button>
           <button class="ghost" id="undoBtn" title="撤销最近一次文件修改">撤销</button>
           <button class="ghost" id="compactBtn" title="压缩上下文">压缩</button>
         </div>
       </header>
+
+      <div class="stats-pop hidden" id="statsPop"></div>
 
       <section class="transcript" id="transcript"></section>
 
@@ -146,6 +152,7 @@
           <div id="wsWorktrees"><div class="panel-empty">检测中…</div></div>
           <div class="form-inline" style="margin-top: 8px">
             <input type="text" id="wsWtName" placeholder="新任务名，如 fix-login" />
+            <input type="text" id="wsWtBase" placeholder="基线分支（默认当前 HEAD）" />
             <button class="ghost" id="wsWtCreate">新建工作树</button>
           </div>
         </div>
@@ -192,6 +199,8 @@
     </div>
   </div>
 
+  <script src="/permission.js"></script>
   <script src="/app.js"></script>
+  <script src="/settings.js"></script>
 </body>
 </html>
