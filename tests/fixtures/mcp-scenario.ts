@@ -1,7 +1,7 @@
 /** Standalone MCP integration scenario: run as a child process by the test suite. */
 import path from "node:path";
 import { connectMcpServers } from "../../src/mcp/index.ts";
-import { mcpToolsFor } from "../../src/mcp/tools.ts";
+import { McpHost, mcpToolsFor } from "../../src/mcp/tools.ts";
 import { Logger } from "../../src/util/log.ts";
 
 const logger = new Logger("error");
@@ -42,7 +42,11 @@ const results = {
   addReadOnly: add.isReadOnly,
   brokenServers: broken.errors.map((e) => e.server),
   brokenTools: broken.tools.length,
-  adapterCount: mcpToolsFor(good.clients[0]).length,
+  // 传的必须是 host（带重连能力），不是裸 client —— 类型检查发现原来这里传错了，
+  // 只是靠鸭子类型侥幸能跑。
+  adapterCount: mcpToolsFor(
+    new McpHost("echo", good.clients[0], async () => good.clients[0], logger),
+  ).length,
 };
 
 process.stdout.write("RESULT " + JSON.stringify(results) + "\n");
