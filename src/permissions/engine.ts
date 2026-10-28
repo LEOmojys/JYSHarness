@@ -37,6 +37,8 @@ export type PermissionReason =
   | "mode_plan_deny"
   | "mode_dont_ask"
   | "read_only_default"
+  | "auto_safe_command"
+  | "auto_needs_review"
   | "default_ask";
 
 export interface PermissionDecision {
@@ -66,6 +68,9 @@ export interface DecisionContext {
   workspaceRoot: string;
 }
 
+import { classifyCommand, splitShellSegments } from "./classify.ts";
+import { contentCandidates, ruleMatches } from "./rules.ts";
+
 /** Layer 6: unoverridable denials. Not configurable by design. */
 const HARDCODED_DENY: { pattern: RegExp; why: string }[] = [
   { pattern: /\brm\s+(-[a-zA-Z]*\s+)*-?[a-zA-Z]*[rf][a-zA-Z]*\s+\/(\s|$)/, why: "recursive delete of /" },
@@ -76,6 +81,17 @@ const HARDCODED_DENY: { pattern: RegExp; why: string }[] = [
   { pattern: /\b(shutdown|reboot|halt)\b/i, why: "system power state change" },
   { pattern: /\bformat\s+[a-z]:/i, why: "drive format" },
   { pattern: /\bgit\s+push\s+(-f|--force)\b/, why: "history-rewriting force push" },
+  // "+refspec" 是 force push 的另一种写法，容易被漏掉
+  { pattern: /\bgit\s+push\b[^;&|]*\s\+[A-Za-z0-9_]/, why: "force push via +refspec" },
+  // 删 / 和 /*（后者比 "/" 更彻底），以及绕过保护的 flag
+  { pattern: /\brm\s+(-[^\s]+\s+)*\/\*(\s|$)/, why: "delete everything under /" },
+  { pattern: /--no-preserve-root/, why: "bypassing the root-delete guard" },
+  // Windows 原生等价物：之前完全没覆盖
+  { pattern: /\b(Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition)\b/i, why: "disk formatting" },
+  { pattern: /\b(Stop-Computer|Restart-Computer)\b/i, why: "system power state change" },
+  { pattern: /\b(Remove-Item|del|rd|rmdir)\b[^;&|]*-[Rr]ecurse[^;&|]*\b[a-zA-Z]:\\?(Windows|Users|Program Files|ProgramData)?(\s|$|[^A-Za-z0-9])/i, why: "recursive delete of a system directory or drive root" },
+  { pattern: /\b(del|rd|rmdir)\s+\/[sq][^;&|]*\b[a-zA-Z]:\\?(\s|$)/i, why: "recursive delete of a drive root" },
+  { pattern: /\bdel\s+\/[sq]\b[^;&|]*\b[a-zA-Z]:\\?(Windows|Users|Program Files|ProgramData)?(\s|$|[^A-Za-z0-9])/i, why: "recursive delete of a system directory" },
 ];
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
@@ -84,6 +100,9 @@ export function decidePermission(
   req: PermissionRequest,
   ctx: DecisionContext,
 ): PermissionDecision {
+  // Defensive: a caller without a rule set should behave like "no rules",
+  // never crash the tool call.
+  if (!ctx.rules) ctx = { ...ctx, rules: { allow: [], deny: [], ask: [] } };
   const content = permissionContentFor(req.toolName, req.input, ctx.workspaceRoot);
   // A rule written with an absolute path must still work.
   const absoluteContent = permissionContentFor(req.toolName, req.input);
@@ -102,10 +121,31 @@ export function decidePermission(
   }
 
   // --- Declarative rules (deny > ask > allow) ---
-  const candidates = absoluteContent && absoluteContent !== content ? [content, absoluteContent] : [content];
-  const hits = candidates
+  // 路径类工具要同时试几种等价写法（./x、x、x\y），否则 deny 规则能被换个写法绕开。
+  const PATH_TOOLS = new Set(["Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep"]);
+  const baseCandidates = PATH_TOOLS.has(req.toolName) ? contentCandidates(content) : [content];
+  const candidates = [...new Set([...baseCandidates, ...(absoluteContent && absoluteContent !== content ? [absoluteContent] : [])])];
+  let hits = candidates
     .map((c) => matchRules(ctx.rules, req.toolName, c))
     .filter((h): h is NonNullable<typeof h> => Boolean(h));
+
+  // deny / ask 规则也要逐段看：`Bash(rm *)` 必须能挡住 `git status && rm -rf build`。
+  // 不这样做，拒绝规则只对"整条命令恰好长得像"的情况生效，等于形同虚设。
+  // 注意：这里**不**提升逐段的 allow —— 允许必须覆盖整条命令（见下面的处理）。
+  if ((req.toolName === "Bash" || req.toolName === "PowerShell") && !hits.some((h) => h.behavior === "deny")) {
+    for (const segment of splitShellSegments(content)) {
+      const segHit = matchRules(ctx.rules, req.toolName, segment);
+      if (!segHit) continue;
+      if (segHit.behavior === "deny") {
+        hits = [segHit, ...hits];
+        break;
+      }
+      if (segHit.behavior === "ask" && !hits.some((h) => h.behavior === "ask")) {
+        hits = [segHit, ...hits];
+      }
+    }
+  }
+
   const match =
     hits.find((h) => h.behavior === "deny") ??
     hits.find((h) => h.behavior === "ask") ??
@@ -134,6 +174,24 @@ export function decidePermission(
   if (toolDecision && toolDecision.behavior !== "allow") return toolDecision;
 
   if (match?.behavior === "allow") {
+    // 允许规则必须覆盖**整条**命令，而不只是其中一段。
+    // 否则 `Bash(git *)` 会连带放行 `git status && rm -rf ~` —— 前缀匹配把
+    // 后面追加的任意命令一起洗白了。逐段匹配是这里唯一安全的判据。
+    const shell = req.toolName === "Bash" || req.toolName === "PowerShell";
+    if (shell && match.rule.ruleValue.ruleContent) {
+      const segments = splitShellSegments(content);
+      const everySegmentAllowed = segments.length > 0 && segments.every((seg) => ruleMatches(match.rule, req.toolName, seg));
+      if (!everySegmentAllowed) {
+        return {
+          behavior: "ask",
+          reason: "rule_ask",
+          message:
+            "允许规则只匹配了复合命令的一部分，需要确认整条命令：" +
+            segments.filter((seg) => !ruleMatches(match.rule, req.toolName, seg)).map((s) => s.slice(0, 60)).join(" | "),
+          matchedRule: match.rule,
+        };
+      }
+    }
     return {
       behavior: "allow",
       reason: "rule_allow",
@@ -172,7 +230,30 @@ export function decidePermission(
         reason: "mode_dont_ask",
         message: "dontAsk mode: operations needing approval are auto-denied.",
       };
-    case "auto":
+    case "auto": {
+      // 风险分类器（ch.5.7）：只放行"能证明安全"的，其余一律升到 ask。
+      // 它绝不越过前面的 hardcoded deny 与 deny 规则 —— 位置就在这条链的末尾。
+      if (req.toolName === "Bash") {
+        const command = String((req.input as { command?: unknown }).command ?? "");
+        const verdict = classifyCommand(command);
+        if (verdict.risk === "safe") {
+          return { behavior: "allow", reason: "auto_safe_command", message: "auto: " + verdict.why };
+        }
+        return {
+          behavior: "ask",
+          reason: "auto_needs_review",
+          message: "auto 模式需要确认（" + verdict.why + "）：" + command.slice(0, 120),
+        };
+      }
+      if (req.isReadOnly) {
+        return { behavior: "allow", reason: "auto_safe_command", message: "auto: 只读工具" };
+      }
+      return {
+        behavior: "ask",
+        reason: "auto_needs_review",
+        message: "auto 模式：写操作需要确认（" + req.toolName + "）",
+      };
+    }
     case "default":
       break;
   }

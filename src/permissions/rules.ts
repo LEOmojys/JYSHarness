@@ -59,6 +59,13 @@ export function ruleMatches(rule: PermissionRule, toolName: string, content: str
   if (rt.endsWith("*")) {
     if (!toolName.toLowerCase().startsWith(rt.slice(0, -1).toLowerCase())) return false;
   } else if (rt.toLowerCase() !== toolName.toLowerCase()) {
+    // MCP 工具的命名是 mcp__<server>__<tool>：写成 mcp__github(*) 时，
+    // 规则里的 toolName 是 mcp__github（命名空间），必须按前缀匹配到整族工具。
+    if (rt.toLowerCase().startsWith("mcp__") && toolName.toLowerCase().startsWith(rt.toLowerCase() + "__")) {
+      const pattern = rule.ruleValue.ruleContent;
+      if (pattern === undefined) return true;
+      return globToRegExp(pattern).test(content);
+    }
     return false;
   }
   const pattern = rule.ruleValue.ruleContent;
@@ -109,6 +116,27 @@ export function matchRules(
 
 /** Derive the "content" a rule is matched against, per tool family. */
 import path from "node:path";
+
+/**
+ * 路径类工具的"同一含义的不同写法"：`./secrets/a`、`secrets/a`、`secrets\\a`。
+ *
+ * 规则是给人写的，写 `secrets/**` 的人不会想到要再加一条 `./secrets/**`。
+ * 如果判定只认其中一种写法，拒绝规则就能被换个写法绕过去 —— 这是真实可绕过的口子。
+ */
+export function contentCandidates(content: string): string[] {
+  if (!content) return [];
+  const out = new Set<string>();
+  out.add(content);
+  const normalized = content
+    .split(String.fromCharCode(92)).join("/")
+    .replace(/^\.\//, "")
+    .replace(/\/{2,}/g, "/");
+  if (normalized) {
+    out.add(normalized);
+    out.add("./" + normalized);
+  }
+  return [...out];
+}
 
 export function permissionContentFor(
   toolName: string,

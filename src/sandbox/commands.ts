@@ -6,6 +6,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { truncateOutput } from "../util/truncate.ts";
 import type { SandboxPolicy } from "./paths.ts";
 import { buildSpawnPlan } from "./policy.ts";
 
@@ -136,10 +137,8 @@ export async function runCommand(
 
 /** Render a command result in the shape the model expects to read. */
 export function formatCommandResult(r: CommandResult, maxChars = 30_000): string {
-  const clip = (s: string): string =>
-    s.length > maxChars
-      ? s.slice(0, maxChars) + "\n...[truncated " + (s.length - maxChars) + " chars]"
-      : s;
+  // 头尾都留：命令报错几乎总在最后几行，只截头会把最有用的部分丢掉。
+  const clip = (s: string): string => truncateOutput(s, maxChars).content;
   const parts: string[] = ["exit_code=" + r.exitCode];
   if (r.timedOut) parts.push("timed_out=true");
   if (r.stdout.trim()) parts.push(clip(r.stdout));
@@ -147,7 +146,4 @@ export function formatCommandResult(r: CommandResult, maxChars = 30_000): string
   return parts.join("\n");
 }
 
-export function workspaceRelative(root: string, p: string): string {
-  const rel = path.relative(root, p);
-  return rel && !rel.startsWith("..") ? rel.split(path.sep).join("/") : p;
-}
+

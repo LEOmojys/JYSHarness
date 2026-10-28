@@ -15,6 +15,7 @@ export const BashTool: Tool = {
       command: { type: "string", description: "The command line to execute." },
       description: { type: "string", description: "Short human-readable purpose (shown to the user)." },
       timeout_ms: { type: "number", description: "Timeout in milliseconds (default 120000)." },
+      timeout: { type: "number", description: "Alias of timeout_ms." },
       run_in_background: { type: "boolean", description: "Start as a background job and return its id immediately (use JobOutput to read it)." },
     },
     required: ["command"],
@@ -22,6 +23,8 @@ export const BashTool: Tool = {
   isReadOnly: false,
   isDestructive: true,
   isConcurrencySafe: () => false,
+  // 命令输出最容易失控（cat 一个日志就几百 KB）：30k 字符 ≈ 8k token
+  maxOutputChars: 30_000,
   validate(input) {
     const cmd = str(input, "command");
     if (!cmd.trim()) return "command must not be empty";
@@ -47,7 +50,8 @@ export const BashTool: Tool = {
         metadata: { jobId: job.id },
       };
     }
-    const timeoutMs = num(input, "timeout_ms", 120_000);
+    // 模型有时会按 Claude Code 的习惯传 timeout（毫秒）；两个名字都接受。
+    const timeoutMs = num(input, "timeout_ms", num(input, "timeout", 120_000));
     const result = await runCommand(command, {
       cwd: ctx.cwd,
       timeoutMs,
