@@ -28,7 +28,7 @@ if (Test-Path $app) { Remove-Item -Recurse -Force $app }
 New-Item -ItemType Directory -Force -Path $app | Out-Null
 
 # application files (the project has zero runtime deps, so no node_modules)
-foreach ($name in @("src", "examples", "scripts\templates", "jys.cmd", "jys.ps1", "package.json", "README.md", "QUICKSTART.md", "ARCHITECTURE.md", "DESKTOP.md", "PLUGINS.md")) {
+foreach ($name in @("src", "docs", "examples", "scripts\templates", "scripts\sandbox", "jys.cmd", "jys.ps1", "package.json", "README.md", "QUICKSTART.md", "ARCHITECTURE.md", "DESKTOP.md", "PLUGINS.md")) {
   $from = Join-Path $root $name
   if (-not (Test-Path $from)) { continue }
   Copy-Item -Recurse -Force $from (Join-Path $app $name)

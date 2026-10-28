@@ -52,10 +52,21 @@
 | --- | --- |
 | `api.registerTool(tool)` | 注册工具，接口与内置工具完全一致（`name/description/inputSchema/isReadOnly/isConcurrencySafe/call`） |
 | `api.addPromptSection(text)` | 追加稳定的系统提示段落（项目约定） |
-| `api.on(event, handler)` | 进程内 hook：`PreToolUse` `PostToolUse` `Stop` `UserPromptSubmit` `SessionStart` |
+| `api.on(event, handler)` | 进程内 hook：`PreToolUse` `PostToolUse` `PostToolUseFailure` `PreCompact` `Stop` `UserPromptSubmit` `SessionStart`；payload 见下 |
 | `api.addSkill({name, description, content})` | 内存技能，不进文件 |
 | `api.log(message)` | 写日志（`--debug` 可见） |
 | `api.name` / `api.version` / `api.workspaceRoot` | 元信息 |
+
+**hook payload 的字段名（容易踩坑）：** 进程内 handler 和 shell 钩子的 stdin JSON 用的是**同一套 camelCase 字段**：
+
+```jsonc
+{ "event": "PreToolUse", "sessionId": "...", "cwd": "...",
+  "toolName": "Write", "toolInput": { "file_path": "..." },
+  "toolResult": "…",   // PostToolUse / PostToolUseFailure
+  "prompt": "…" }      // UserPromptSubmit
+```
+
+是 `toolName` / `toolInput`，**不是** `tool_name` / `tool_input`。写错字段名的钩子不会报错，只会永远不匹配 —— 所以脚手架模板里直接给了可用写法。
 
 hook handler 返回 `{ decision: "deny", reason }` 可以拦住工具调用，返回 `{ updatedInput }` 可以改参数，返回 `{ additionalContext }` 会给模型补一句话。
 

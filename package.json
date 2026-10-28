@@ -13,11 +13,20 @@
   "scripts": {
     "start": "node src/cli/main.ts",
     "demo": "node src/cli/main.ts --provider mock --script examples/mock-scenario.json --workspace examples/demo-workspace -y -p \"summarise this workspace\"",
-    "test": "node --test tests/harness.test.ts tests/server.test.ts tests/features.test.ts tests/config.test.ts tests/workspace.test.ts tests/session-delete.test.ts tests/plugins.test.ts tests/worktrees.test.ts",
+    "test": "node --test \"tests/*.test.ts\"",
     "serve": "node src/cli/main.ts serve",
+    "e2e": "node scripts/e2e-acceptance.ts",
+    "real": "node scripts/real-scenario.ts",
     "desktop": "node src/cli/main.ts desktop",
     "install-desktop": "pwsh -File scripts/install-desktop.ps1",
     "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
-    "install-shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop.ps1"
+    "install-shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop.ps1",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "node src/cli/main.ts check --entropy --types",
+    "verify": "node scripts/verify-crash.ts && node scripts/verify-concurrency.ts && node scripts/verify-images.ts && node scripts/verify-long-session.ts && node scripts/verify-sandbox.ts && node scripts/verify-cost.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3"
   }
 }

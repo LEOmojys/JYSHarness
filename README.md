@@ -4,6 +4,9 @@
 
 **零运行时依赖**：只用 Node 内置模块，Node 24 直接运行 .ts，不需要 npm install。
 
+> 开发期有 **两个** devDependency（`typescript` + `@types/node`）用于类型检查 —— 发布包里不含 `node_modules`，
+> 用户侧仍然是"双击即用、无需安装"。开发者只需 `npm install && npm run typecheck`。
+
 ```
 模型（LLM）是那匹马，harness 是围栏、缰绳和跑道。
 ```
@@ -52,30 +55,59 @@ cd harness
 
 | 能力 | 说明 |
 | --- | --- |
-| **Agent Loop** | Async Generator + continue 站点：413 反应式压缩、max_tokens 续写、429/5xx 退避、Stop Hook 阻断 |
-| **工具系统** | 13 个内置工具 + MCP 动态工具；Schema 校验 → 权限 → Hook → 执行 → 事后审计 |
+| **Agent Loop** | Async Generator + continue 站点：413 反应式压缩、max_tokens 升上限+续写、429/5xx 退避、空回复重试、Stop Hook 阻断 |
+| **备用模型** | `fallbackModel`：主模型认证失败/限流耗尽/5xx 时切一次（同一 provider 内换模型），切换有提示、不来回横跳 |
+| **错误恢复** | 遵循服务端 `Retry-After`；网络抖动（ECONNRESET/超时）按瞬时错误重试并带抖动；其余每个失败都有明确终止原因：`max_output_tokens`（续写耗尽，不再假装成功）、`stop_hook_prevented`（钩子连续拦 3 次）、`prompt_too_long`、`model_error`（认证失败附带可操作提示） |
+| **工具系统** | 14 个内置工具 + MCP 动态工具；Schema 校验 → 权限 → Hook → 执行 → 事后审计 |
+| **输出治理** | 单次输出上限（默认 50k 字符，Bash 30k / WebFetch 60k），截断保头也保尾并标明省略量；单工具超时（WebFetch 30s、MCP 120s） |
+| **工具调度** | 只读批量并行（**并发上限 6**）、**同批相同调用去重**、**只读工具失败自动重试 1 次**（写操作永不重试）；按工具统计调用/失败数 |
+| **熔断与恢复** | 同一工具连续失败 3 次 → 短路 60s 并在错误里说明"别重试，换办法"；MCP server 崩溃后**自动重启并重试一次** |
+| **读缓存** | Read 按「路径 + 窗口 + mtime + size」缓存，改文件即失效，LRU 上限 32 项 / 8MB |
 | **并发编排** | 只读工具并行、写入工具串行；审批与 Hook 在分区之前串行完成 |
 | **权限模型** | 6 段管道（硬编码拒绝 → deny → ask → 工具自检 → allow → 模式），每条决策带 reason |
+| **安全边界** | 允许规则必须覆盖**整条**命令（含 `$(...)`、反引号、`bash -c` 的内联脚本，防 `git status $(rm -rf x)` 洗白）；deny/ask 同样逐段生效；毁灭性命令（含 Windows 原生）硬拒绝不可覆盖 |
+| **文件写保护** | **硬编码拒绝**（不依赖配置）：`.git`、`node_modules`、`.harness/settings.json`、`.harness/skills`、`.harness/sessions`、`.jysharness/settings*.json` —— 文件工具由 `guardPath` 拦，**shell 由内核完整性级别拦**；`AGENTS.md`、`CLAUDE.md`、`.harness/plugins/**` 需确认 |
+| **SSRF 防护** | 字面黑名单 + **DNS 解析后 IP 校验** + **重定向逐跳校验**（最多 3 跳）；provider 密钥永不下发子进程 |
+| **Auto 模式** | 命令风险分类器：只读命令免询问，未知/写操作/解释器一律升到 ask；deny 规则永远优先 |
+| **配置层级** | 用户全局 < 项目共享 < 项目本地 < CLI < 机器策略（`ProgramData\jysharness\settings.json`），机器策略可钉死本地 flag |
 | **沙箱** | 真实路径包含检查（`..`/符号链接/Windows 8.3 短路径）、只读模式双处拦截 |
 | **多会话** | 新建 / 切换 / **fork** / 删除，每个会话独立的循环、审批队列、后台任务 |
-| **MCP** | stdio JSON-RPC 客户端：initialize → tools/list → tools/call，工具以 `mcp__server__tool` 注册 |
+| **崩溃安全** | JSONL 追加写 + **串行化**（并发 append 不会写坏行）；轮次结束时 flush，`send()` 返回即已落盘；半行/坏行在恢复时跳过；**写盘失败只告警不杀轮次**；压缩检查点取代前缀 |
+| **MCP** | stdio JSON-RPC 客户端：initialize → **分页 tools/list** → tools/call；工具以 `mcp__server__tool` 注册；UTF-8 用 `StringDecoder` 跨分帧解码；每调用超时可配（默认 120s）；单行缓冲 8MB 上限；崩溃自动重启 |
 | **Skills** | `.harness/skills/*/SKILL.md` 按需加载：系统提示只放名字+描述，正文调用时才进上下文 |
 | **后台任务** | `Bash run_in_background` + `JobOutput/JobKill/JobList`，长任务不阻塞循环 |
 | **待办** | `TodoWrite` 工具 + 侧栏实时面板 |
 | **检查点/撤销** | 每次写文件前快照，`undo` 回滚；UI 内联显示真实 diff |
-| **上下文压缩** | 三级：microcompact → snip → LLM 摘要；压缩后仍超长才终止（防烧钱死循环） |
-| **子 Agent** | 独立上下文、独立预算、只回传摘要；权限完全继承（不给提权） |
-| **Hooks** | PreToolUse / PostToolUse / Stop / UserPromptSubmit，可阻断、可改参数、可加注 |
+| **上下文压缩** | 三级：microcompact → LLM 摘要（只压老前缀，尾部原样保留）→ snip 兜底；压缩写检查点，resume 不重摘 |
+| **子 Agent 类型** | 内置 `explore`（只有 Read/Grep/Glob）/ `plan` / `general`；项目可在 `.harness/agents/*.md` 用 frontmatter 声明 `tools` / `model` / `maxTurns` / 专用提示 —— **工具集就是能力边界**，不是靠提示词自觉 |
+| **并发编排** | 同一条消息里的多个 `Agent` 调用**并行执行**；检查点按异步上下文分帧（并发写不互相覆盖）、待办各自独立、单个子 Agent 失败不影响兄弟（并如实标记 `isError`） |
+| **子 Agent 进度** | 运行中通过旁路事件实时上报（启动 / 第 N 步执行了什么工具 / 结束），CLI 逐行打印、桌面端原地更新一行，不必等整轮结束 |
+| **子 Agent** | 从**空消息列表**起步、独立轮次预算、只回传**截断后**的摘要；权限/Hook/沙箱完全继承（不提权）；**父 abort 连带取消** + 独立硬超时；token 按增量计入统计；**审批弹窗标注"子 Agent 发起"**；可用 `subagentModel` 指定更便宜的模型 |
+| **Hooks** | 7 个事件（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / Stop），**配置在 settings.json 里（数据驱动，不改代码）**；可阻断、可改参数、可加注；支持 `async` 旁路钩子；配置写错只告警不崩 |
+| **Hooks 语义** | 多钩子按 **deny > ask > allow** 合并（后写的 allow 不能取消前面的 deny）；matcher 编译失败只影响该条；超时夹在 0.1–60s |
 | **成本核算** | 按模型定价估算 USD，顶栏实时显示 |
 | **WebFetch** | 抓取网页转文本，阻断 loopback/私网地址（SSRF） |
 | **图片输入** | 粘贴/选择图片，base64 走 Anthropic image block 或 OpenAI image_url |
-| **沙箱后端** | 子进程环境清洗（剥离 API key/token）+ bwrap/sandbox-exec 自动探测 |
+| **沙箱后端** | 子进程环境清洗 + **Windows 低完整性令牌 + Job Object**（内核强制：写隔离 + 内存/进程上限）/ Linux bwrap / macOS seatbelt |
+| **强制可见性** | 顶栏显示「⚠ 沙箱未强制」：模式是意图，`sandboxEnforcement` 报告实际后端；沙箱不可用时绝不假装有内核保护 |
 | **规则编辑器** | 侧栏直接增删 allow/deny/ask 规则，写回 settings.json 并立即对所有会话生效 |
 | **桌面安装器** | 一条命令在桌面创建快捷方式，双击即开 |
-| **插件模式** | `.harness/plugins/` 下的项目插件：注册专属工具、进程内 hook、提示段落与内存技能 |
+| **插件模式** | `.harness/plugins/` 下的项目插件：注册专属工具、进程内 hook、提示段落与内存技能；坏插件只隔离不致命，entry 不能逃出插件目录；**与内置工具重名会被报告**（不是静默丢弃） |
+| **技能索引预算** | 系统提示只列**最多 40 个**技能（简介截断 140 字），其余折叠一行；未列出的技能仍可按精确名字加载 —— 索引是每轮固定成本，必须封顶 |
+| **思考过程** | 推理模型（deepseek-flash / r1 / Anthropic thinking）的推理流以折叠块展示，默认收起、显示字数；**不发回模型、不计入上下文**，但保留在转录里（刷新后仍在） |
+| **真模型验证** | 已用 DeepSeek 兼容端点（`deepseek-flash`）跑通：`HARNESS_E2E_REAL=1 npm run e2e` **24/24**；桌面端 4 秒完成 Write→Read，成本 $0.0021、缓存命中 39% |
+| **响应式布局** | 桌面窗口可任意缩放（Chromium app 模式，尺寸由 profile 记住）；≤1280 隐藏冗余标签、≤920 侧栏收窄、≤768 侧栏变 ☰ 抽屉、≤560 控件紧凑 |
 | **项目快捷入口** | 常用路径（★ 固定）+ 最近项目（含类型徽标与相对时间），空会话上一键直达 |
+| **项目约定注入** | 从仓库根到当前目录逐级读取 `AGENTS.md`/`CLAUDE.md`（总预算 32k 字符）；**系统提示每轮重建**，改完当轮生效 |
+| **提示词稳定性** | 系统提示**只放整个会话不变的内容**；日期与 git 状态作为临时后缀拼在最新一条消息上（不落盘），因此 git 变化**不会打断缓存前缀** |
+| **精确计数** | 接近阈值时调用服务商的 `count_tokens`（Anthropic 官方端点）拿到**真实** token 数；`HARNESS_COUNT_TOKENS=off` 可关闭；失败自动回退估算 |
+| **估算校准** | 用服务端回报的真实 `inputTokens`（以及精确计数）校准本地估算（EMA，夹在 0.5–2×），压缩阈值按校准后的值判断 |
+| **记忆系统** | `.harness/memory.md` 跨会话事实，`Memory` 工具增删，注入系统提示（8k 字符上限，超了淘汰最旧） |
+| **端到端验收** | `npm run e2e`：一次真实任务串起工具/权限/沙箱/插件/技能/MCP/子 Agent/压缩/恢复/撤销/服务端冒烟，**24 项断言**；`HARNESS_E2E_REAL=1` 可换成真模型（无 Key 时明确跳过，exit 2） |
+| **约束检查** | `jys check`：import 解析、分层许可、零依赖、文档链接、密钥扫描；`--entropy` 加大文件 / TODO / 版本漂移 / 测试数量漂移 / **死导出**；`--types` 加 **TypeScript 严格类型检查**；`--install-hook` 挂 pre-commit |
+| **类型闸门** | `npm run typecheck`（`tsc --strict`，**src + tests + scripts 零错误**）；`erasableSyntaxOnly` 提前拦住 Node 剥离模式跑不起来的写法（enum / 参数属性 / namespace）；`src` 里 **0 处 `as any`** |
 
-## 工具（13 个 + MCP）
+## 工具（14 个 + MCP）
 
 | 工具 | 作用 | 只读 |
 | --- | --- | --- |
@@ -155,6 +187,10 @@ cd harness
 
 窗口决定压缩阈值：**超过 75% 自动压缩，目标压到 40%**（200k 窗口 → 150k 触发 / 80k 目标；8k 小模型 → 6k 触发 / 3.2k 目标）。界面底部实时显示 `上下文 ~1.0k / 128k（0.8%）`。
 
+压缩顺序是 **microcompact（削老工具输出）→ LLM 摘要（只压老前缀，最近几条和首条任务原样保留）→ snip（摘要不可用时的兜底）**。摘要会写成 transcript 里的 `compact` 检查点，resume 时直接用压缩后的视图，不会把上百 k 的历史重新摘一遍。
+
+也可以手动触发：`/compact`，或带上关注点 `/compact 保留 API 签名改动`，和 Claude Code 的用法一致。输入框上方的「压缩」按钮等价于 `/compact`。
+
 **密钥怎么存**：API Key 只写入 `~/.jysharness/secrets.json`（权限 600），**不会**写进项目里的 settings.json，接口也永远不回传明文（只回 `sk-m…3456` 这样的提示）。要便携/隔离，可以设 `HARNESS_HOME` 换配置目录。
 
 ![settings](docs/settings.png)
@@ -190,9 +226,9 @@ jys plugin test                # 加载校验，出错返回非 0
 
 | 元素 | 说明 |
 | --- | --- |
-| 列表 | 仓库下所有 worktree：分支名、路径、是否主工作树、该工作树的会话数 |
-| 新建 | 填任务名（如 `fix-login`）→ 创建 `jys/fix-login` 分支 + `.harness/worktrees/fix-login` 目录，并**立即切过去** |
-| 删除 | 非主工作树可删，二次确认后连目录一起移除 |
+| 列表 | 仓库下所有 worktree：分支名、路径、是否主工作树、该工作树的会话数、未提交改动数（`未提交 N` 徽标） |
+| 新建 | 填任务名（如 `fix-login`）+ 可选**基线分支**（留空 = 当前 `HEAD`）→ 创建 `jys/fix-login` 分支 + `.harness/worktrees/fix-login` 目录，并**立即切过去** |
+| 删除 | 非主工作树可删。默认**不** `--force`：有未提交改动会被 git 拒绝，UI 提示后再确认一次才强制删 |
 | 点击 | 切换到该工作树（没有会话就新建一个） |
 
 **为什么这样就互不干扰**：会话是存在 `<workspace>/.harness/sessions` 下的，而每个 worktree 就是独立的 workspace —— 因此转录、规则快照、检查点、后台任务天然按任务隔离。两个任务同时改代码，各自的分支、各自的 Agent 上下文、各自的 diff 记录。
@@ -200,10 +236,12 @@ jys plugin test                # 加载校验，出错返回非 0
 约束与约定：
 
 - 只有 git 仓库能建工作树；非仓库会提示不可用
-- 工作树放在 `<repo>/.harness/worktrees/<name>`，并自动写进 `.git/info/exclude`（不会污染 `git status`）
+- 工作树放在 `<repo>/.harness/worktrees/<name>`。整个 `.harness/` 会被写进排除文件，位置用 `git rev-parse --git-path info/exclude` 让 git 自己算（工作树里 `.git` 是个文件，硬拼 `.git/info/exclude` 永远写不到），所以 `git status` 始终干净
 - 分支名固定 `jys/<name>`，方便回头 `git log jys/fix-login` 看这个任务的提交
-- 删除是 `--force` 的：**未提交的改动会丢**（分支上已提交的不会），确认框里有提示
+- 新工作树是"干净检出"，跑不起来通常是因为缺本地配置：会自动把主工作树的 `.env`、`.env.local`、`.env.development`、`.env.test` 复制过去（只补缺失的文件，不覆盖已有文件），复制了哪几个会在提示里列出来
+- 删除默认不带 `--force`，因此**未提交的改动不会静默丢失**；强制删除需要再确认一次。删除成功后会顺带 `git worktree prune`，清理残留元数据
 - 删除当前正在使用的工作树时，会先切回主工作树，再清理它的会话
+- **写隔离**：沙箱模式下，一个 workspace 不能写另一个任务的工作树目录（`guardPath` 直接 deny），并行任务不会互相踩
 
 ## 架构
 
@@ -239,7 +277,7 @@ jys plugin test                # 加载校验，出错返回非 0
 | `src/core/checkpoints.ts` | 快照、undo、行级 diff |
 | `src/core/skills.ts` | 技能发现与按需加载 |
 | `src/core/cost.ts` | 价格表与成本估算 |
-| `src/tools/*` | 13 个工具 + 注册表 + 分区并发 |
+| `src/tools/*` | 14 个工具 + 注册表 + 分区并发 |
 | `src/permissions/*` | 规则解析与决策管道 |
 | `src/sandbox/*` | 路径包含、命令执行、超时截断 |
 | `src/mcp/*` | MCP 客户端、工具适配、批量连接 |
@@ -251,16 +289,43 @@ jys plugin test                # 加载校验，出错返回非 0
 ## 测试
 
 ```bash
-npm test
+npm install       # 只为开发期工具链（运行时零依赖）
+npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
+npm test          # 286 个单元/集成测试（自动发现 tests/*.test.ts）
+npm run typecheck # tsc --strict，src 必须 0 error
+npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
+npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**61 个测试**，分五组：
+**286 个测试**，分二十三组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销
 - 服务层：SSE 全流程、审批往返（allow/deny）、多会话 new/fork/delete、Origin 校验、文件 API 越界
 - 集成：**真实 MCP 服务器**（stdio 子进程）握手、列工具、调用、错误降级、坏服务器不影响会话
 - 运维面：工作区切换/收藏、会话删除（**连磁盘文件一起删**）、配置热切换、上下文窗口换算
+- 上下文：压缩阶梯（阈值/截断方向/尾部保留/配对修复）、工具配对协议、摘要失败降级
+- 约束：分层许可、import 解析、零依赖（运行时）、文档链接、密钥扫描、熵检查、死导出、类型检查、pre-commit 安装
+- 记忆：跨会话事实的增删、去重、预算淘汰、手工编辑解析、注入系统提示
+- 权限与配置：auto 分类器（安全/写操作/解释器/管道洗白）、配置五层优先级、机器策略钉死 CLI
+- 错误恢复：413 单次反应式压缩、限流重试上限、**Retry-After 采用**、**备用模型切换**、空回复重试、续写耗尽、Stop Hook 死循环、落盘失败隔离、工具抛异常
+- 端到端：24 项跨模块断言（真实文件改动、沙箱内真实执行、硬拒绝、插件钩子、MCP、子 Agent、压缩检查点、恢复续跑、撤销回滚、Web 冒烟）
+- CLI：斜杠命令逐条调用（曾因 `/compact` 引用未定义变量而崩，现在 12 条命令全覆盖）
+- 工程质量：并发闸门（上限、顺序、失败传播）、稳定序列化、**死导出检查**（`jys check --entropy` 会报"导出了但没人用"）
+- 会话恢复：转录 round-trip（含复用 session id）、压缩检查点取代前缀、半行/坏行跳过、**写盘失败不杀轮次**、空会话不进列表、删除不留残渣
+- MCP：tools/list 分页合并、UTF-8 跨分帧不乱码、每调用超时可配（不被握手超时架空）、provider key 不泄漏、崩溃后自动重启、工具命名空间与只读提示
+- 插件与技能：allowed-tools 只是声明不放权、技能发现问题会报告（缺简介/重名）、插件工具与内置重名会被报告并保留内置、插件工具真的能跑、坏插件隔离并上报、钩子能拦截工具调用、manifest 开关、entry 不能逃出插件目录、技能索引封顶但隐藏技能仍可加载、用户级技能跟随 HARNESS_HOME、未知技能名列出可用项
+- 并发编排：并发检查点互不覆盖（2 次 undo 各自生效）、两个子 Agent 并行都回来、子 Agent 待办不污染父会话、兄弟失败隔离且子 Agent 失败标记为 error
+- 子 Agent 进度：start/progress/end 三类事件顺序、每步工具名、步数统计、旁路（不污染父生成器事件流）
+- 子 Agent 类型：explore 类型物理上拿不到写工具、未知类型报错并列出可用项、项目定义的类型生效（工具/模型/提示）、坏定义只跳过不致命、agent 定义目录不可被 Agent 改写
+- 子 Agent：父转录/落盘文件不被污染、子上下文看不到父指令、用量计入统计、父 abort 连带取消、超时提示
+- 上下文工程：中途改 AGENTS.md/加记忆当轮生效、**系统提示跨轮逐字节稳定**（易变信息走消息后缀且不落盘）、压缩触发计入 system+tools 开销、**精确 token 计数（服务商端点）**、估算校准（EMA+夹取）、记忆去重/预算淘汰
+- 沙箱：内核级写隔离（工作区外拒绝、只读模式拒绝）、读不设限的显式边界、Job Object 内存上限、spawn 计划携带 --memory/--procs/--low-integrity、强制状态上报
+- Hooks：配置驱动加载与校验（未知事件、非数组、非法 matcher、超时夹取）、deny 优先合并、shell 钩子端到端阻断、纯文本输出转上下文
+- 安全：规则洗白（复合命令）、毁灭性命令硬拒绝（Unix + Windows）、路径逃逸（`..`/符号链接/系统目录）、只读沙箱、密钥环境清洗、SSRF（字面/DNS 重绑定/重定向）
+- 工具系统：Schema 校验（缺字段/类型错/多余字段/enum/长度/范围/pattern/数组元素/**嵌套对象与数组元素递归**）、未知工具、重复注册、装配去重、并发分区与真并行、**同批去重**、**只读重试**、输出截断（头尾保留）、单工具超时、命令输出尾部保留、**按工具失败统计**
+
+这个数字本身也被检查器盯着：`jys check --entropy` 会比对 README 声明的用例数与 `tests/*.test.ts` 里的实际数量，对不上就报警。文档漂移最常见的就是这种"数字幻觉"。
 
 ## 打包与分发
 
@@ -331,7 +396,7 @@ Tauri 方案不会重写 UI：Rust 只负责拉起 Node 服务、开 webview、�
 - **多模态只有图片**：PDF/音频/视频未接，图片也不做缩放压缩。
 - **单进程**：一个服务进程管理所有会话，没有跨设备/远程。
 - **Tauri 未预编译**：需要 Rust 工具链才能出 .exe；当前用 Chromium app 模式 + 快捷方式。
-- **Windows 没有进程级沙箱**：环境变量清洗 + 路径/命令约束是硬限制，真正的隔离需要 Job Object 或受限令牌（Linux 上 bwrap 后端已经是真隔离）。
+- **Windows 沙箱管"写"不管"读"**：低完整性令牌让子进程能读一切、只能写低完整性对象。工作区在 `workspace-write` 下被标为低完整性（可写），用户目录 / Program Files / 其它仓库是中等完整性（写不进去）。代价：首次使用会用 `csc.exe` 编译 10 KB 启动器；工作区的完整性标签会被改（用户自己的编辑器仍可写）；`npm` 之类往用户目录写缓存的工具会失败——那是沙箱在起作用。
 - **没有插件市场**：Skills/MCP 仍是文件配置（规则已有 GUI）。
 
 ## 参考
