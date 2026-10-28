@@ -40,6 +40,10 @@ export interface BehaviorConfig {
   maxTurns: number;
   maxTokens: number;
   temperature: number;
+  /** 主模型不可用时切过去的模型（空 = 不切换）。 */
+  fallbackModel?: string;
+  /** 子 Agent 用的模型（空 = 跟随主模型）。 */
+  subagentModel?: string;
   enableSubagent: boolean;
 }
 
@@ -73,6 +77,10 @@ export interface ConfigPatch {
   maxTurns?: number;
   maxTokens?: number;
   temperature?: number;
+  fallbackModel?: string;
+  subagentMaxTurns?: number;
+  subagentModel?: string;
+  subagentTimeoutMs?: number;
   enableSubagent?: boolean;
   mcpServers?: McpServerView[];
 }
@@ -109,6 +117,19 @@ export function configHome(): string {
     }
   }
   return next;
+}
+
+/** 机器级策略层：企业/管理员下发，优先级最高。 */
+export function managedSettingsPath(): string {
+  const override = process.env.JYS_MANAGED_SETTINGS;
+  if (override && override.trim()) return path.resolve(override);
+  const base = process.platform === "win32" ? process.env.ProgramData || "C:/ProgramData" : "/etc";
+  return path.join(base, "jysharness", "settings.json");
+}
+
+/** 项目本地覆盖层：不进版本库的个人覆盖（.gitignore 里通常忽略）。 */
+export function localSettingsPath(workspaceRoot: string): string {
+  return path.join(workspaceRoot, CONFIG_DIR, "settings.local.json");
 }
 
 export function userSettingsPath(): string {
@@ -193,15 +214,27 @@ export interface ReadConfigOptions {
 }
 
 export function readAppConfig(opts: ReadConfigOptions): AppConfig {
+  // 优先级（低 -> 高）：用户全局 < 项目共享 < 项目本地 < CLI 参数 < 机器策略。
+  // 机器策略放最后是刻意的：企业下发的东西不该被本地 flag 绕开。
   const user = readJson(userSettingsPath());
-  const workspace = readJson(resolveWorkspaceSettingsPath(opts.workspaceRoot));
+  const project = readJson(resolveWorkspaceSettingsPath(opts.workspaceRoot));
+  const local = readJson(localSettingsPath(opts.workspaceRoot));
+  const managed = readJson(managedSettingsPath());
+  const overrides = opts.overrides ?? {};
+  const cli: Record<string, unknown> = {};
+  if (overrides.provider) cli.provider = overrides.provider;
+  if (overrides.model) cli.model = overrides.model;
+  if (overrides.baseUrl) cli.baseUrl = overrides.baseUrl;
+  if (overrides.apiKeyEnv) cli.apiKeyEnv = overrides.apiKeyEnv;
+
   const sources: string[] = [];
   if (Object.keys(user).length) sources.push(userSettingsPath());
-  if (Object.keys(workspace).length) sources.push(resolveWorkspaceSettingsPath(opts.workspaceRoot));
-  const merged = { ...user, ...workspace } as Record<string, any>;
-  const overrides = opts.overrides ?? {};
+  if (Object.keys(project).length) sources.push(resolveWorkspaceSettingsPath(opts.workspaceRoot));
+  if (Object.keys(local).length) sources.push(localSettingsPath(opts.workspaceRoot));
+  if (Object.keys(managed).length) sources.push(managedSettingsPath());
+  const merged = { ...user, ...project, ...local, ...cli, ...managed } as Record<string, any>;
 
-  const provider = (overrides.provider ?? merged.provider ?? "anthropic") as ProviderName;
+  const provider = (merged.provider ?? "anthropic") as ProviderName;
   const defaults = PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.anthropic;
 
   const mcpRaw = (merged.mcpServers ?? {}) as Record<string, any>;
@@ -215,13 +248,13 @@ export function readAppConfig(opts: ReadConfigOptions): AppConfig {
   return {
     model: {
       provider,
-      model: overrides.model ?? merged.model ?? defaults.model,
-      baseUrl: overrides.baseUrl ?? merged.baseUrl ?? defaults.baseUrl,
-      apiKeyEnv: overrides.apiKeyEnv ?? merged.apiKeyEnv ?? defaults.keyEnv,
+      model: merged.model ?? defaults.model,
+      baseUrl: merged.baseUrl ?? defaults.baseUrl,
+      apiKeyEnv: merged.apiKeyEnv ?? defaults.keyEnv,
       contextWindow: (() => {
         const explicit = Number(merged.contextWindow);
         if (explicit > 0) return explicit;
-        return inferContextWindow(String(overrides.model ?? merged.model ?? defaults.model));
+        return inferContextWindow(String(merged.model ?? defaults.model));
       })(),
     },
     behavior: {
@@ -230,6 +263,8 @@ export function readAppConfig(opts: ReadConfigOptions): AppConfig {
       maxTurns: Number(merged.maxTurns ?? 60),
       maxTokens: Number(merged.maxTokens ?? 8192),
       temperature: Number(merged.temperature ?? 0.2),
+      fallbackModel: typeof merged.fallbackModel === "string" ? merged.fallbackModel : undefined,
+      subagentModel: typeof merged.subagentModel === "string" ? merged.subagentModel : undefined,
       enableSubagent: merged.enableSubagent !== false,
     },
     mcpServers,
@@ -257,6 +292,7 @@ export function saveAppConfig(workspaceRoot: string, patch: ConfigPatch): AppCon
   if (patch.maxTurns !== undefined) current.maxTurns = patch.maxTurns;
   if (patch.maxTokens !== undefined) current.maxTokens = patch.maxTokens;
   if (patch.temperature !== undefined) current.temperature = patch.temperature;
+  if (patch.fallbackModel !== undefined) current.fallbackModel = patch.fallbackModel;
   if (patch.enableSubagent !== undefined) current.enableSubagent = patch.enableSubagent;
 
   if (patch.mcpServers) {

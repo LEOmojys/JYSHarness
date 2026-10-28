@@ -114,13 +114,15 @@ test("unknown tool becomes an error result, not a crash", () => {
 });
 
 test("microcompact stubs old tool output, snip keeps the head", () => {
-  const messages: Message[] = [];
+  // 真实形状：一条用户任务 + 若干 (assistant tool_use → user tool_result) 配对。
+  const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "TASK: fix login" }] }];
   for (let i = 0; i < 10; i++) {
+    messages.push({ role: "assistant", content: [{ type: "tool_use", id: "t" + i, name: "Read", input: { file: "f" + i } }] });
     messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "t" + i, content: "x".repeat(2000) }] });
   }
   const micro = microcompact(messages, 2);
   assert.ok(micro.stubbed > 0);
-  assert.match(String((micro.messages[0].content[0] as { content: string }).content), /elided/);
+  assert.match(String((micro.messages[2].content[0] as { content: string }).content), /elided/);
 
   const snipped = snip(messages, 3);
   assert.ok(snipped.dropped > 0);

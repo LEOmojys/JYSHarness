@@ -4,6 +4,7 @@
  * show a real diff instead of "trust me, it changed".
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
 export interface Checkpoint {
@@ -50,31 +51,52 @@ export interface FileChange {
   created: boolean;
 }
 
+/**
+ * 一次工具调用对应的检查点帧。
+ *
+ * 为什么不能放在实例字段里：两个子 Agent 并发写文件时，beginCall() 会把
+ * 对方的帧直接清掉 —— 结果一个文件的改动**没有任何检查点**，undo 恢复不了。
+ * 实测（修复前）：两个并发 Write 只产生 1 个检查点，第一个调用的 changes 是 null。
+ *
+ * 所以帧跟着**异步上下文**走（AsyncLocalStorage），而不是跟着 store 实例走。
+ */
+export type CheckpointFrame = Checkpoint[];
+
+const frames = new AsyncLocalStorage<CheckpointFrame>();
+
 export class CheckpointStore {
   private stack: { files: Checkpoint[]; id: string }[] = [];
-  private current: Checkpoint[] | null = null;
+  private current: CheckpointFrame | null = null;
   private seq = 0;
 
-  beginCall(): void {
-    this.current = [];
+  /** 开一帧（只是一个新数组，不碰任何共享状态）。 */
+  beginCall(): CheckpointFrame {
+    return [];
+  }
+
+  /** 在该帧的异步上下文里执行工具：并发调用各自独立，嵌套调用也能正确分层。 */
+  track<T>(frame: CheckpointFrame, fn: () => Promise<T>): Promise<T> {
+    return frames.run(frame, fn);
   }
 
   /** Called by a tool *before* it writes. Idempotent per path per call. */
   record(absPath: string): void {
-    if (!this.current) return;
-    if (this.current.some((c) => c.path === absPath)) return;
+    // 优先用异步上下文里的帧；兼容没有走 track() 的调用。
+    const frame = frames.getStore() ?? this.current;
+    if (!frame) return;
+    if (frame.some((c) => c.path === absPath)) return;
     let before: string | null = null;
     try {
       before = existsSync(absPath) ? readFileSync(absPath, "utf8") : null;
     } catch {
       before = null;
     }
-    this.current.push({ path: absPath, before, at: Date.now() });
+    frame.push({ path: absPath, before, at: Date.now() });
   }
 
-  /** Close the current call and return the realized file changes. */
-  commitCall(): FileChange[] {
-    const files = this.current ?? [];
+  /** Close the given call frame and return the realized file changes. */
+  commitCall(frame?: CheckpointFrame): FileChange[] {
+    const files = frame ?? frames.getStore() ?? this.current ?? [];
     this.current = null;
     if (!files.length) return [];
     this.stack.push({ files, id: "ck_" + ++this.seq });

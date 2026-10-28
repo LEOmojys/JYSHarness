@@ -13,7 +13,7 @@ import type { PermissionMode } from "../permissions/engine.ts";
 import { addRules, emptyRuleSet, parseRule, type RuleSet, type RuleSource } from "../permissions/rules.ts";
 import type { SandboxMode } from "../sandbox/paths.ts";
 import type { CompactionConfig } from "../context/compaction.ts";
-import type { HookDefinition, HookEvent } from "../hooks/hooks.ts";
+import { validateHooks, type HookDefinition, type HookEvent } from "../hooks/hooks.ts";
 import { CONFIG_DIR, LEGACY_CONFIG_DIR, configHome } from "./configStore.ts";
 
 export interface HarnessSettings {
@@ -28,6 +28,14 @@ export interface HarnessSettings {
   /** Model context window; 0/undefined = infer from the model name. */
   contextWindow?: number;
   temperature?: number;
+  /** 备用模型：主模型认证失败/限流耗尽/5xx 时切一次（同一 provider）。 */
+  fallbackModel?: string;
+  /** 子 Agent 的轮次上限（默认 25）。 */
+  subagentMaxTurns?: number;
+  /** 子 Agent 使用的模型（留空 = 与主 Agent 相同）。 */
+  subagentModel?: string;
+  /** 子 Agent 的硬超时毫秒数（默认 600000 = 10 分钟）。 */
+  subagentTimeoutMs?: number;
   enableSubagent?: boolean;
   permissions?: { allow?: string[]; deny?: string[]; ask?: string[] };
   hooks?: Partial<Record<HookEvent, HookDefinition[]>>;
@@ -43,6 +51,8 @@ export interface LoadedSettings {
   settings: HarnessSettings;
   rules: RuleSet;
   sources: string[];
+  /** 配置里的问题（例如写错的 hook）：加载时就告诉用户，而不是运行时炸。 */
+  warnings: string[];
 }
 
 function readJson(abs: string): HarnessSettings | null {
@@ -103,18 +113,30 @@ export function loadSettings(workspaceRoot: string, cliOverrides: HarnessSetting
   }
   if (cliOverrides.permissions) sources.push("<cli>");
 
-  return { settings: final, rules, sources };
+  // 钩子是数据驱动的扩展点：配置写错必须在这里暴露，而不是等第一次工具调用才炸。
+  const validated = validateHooks(final.hooks);
+  final.hooks = validated.hooks;
+  const warnings = validated.problems.map((msg) => "hooks:" + msg);
+
+  return { settings: final, rules, sources, warnings };
 }
 
 function mergeHooks(
   a: Partial<Record<HookEvent, HookDefinition[]>> | undefined,
   b: Partial<Record<HookEvent, HookDefinition[]>> | undefined,
 ): Partial<Record<HookEvent, HookDefinition[]>> {
-  const out: Partial<Record<HookEvent, HookDefinition[]>> = { ...(a ?? {}) };
-  for (const [event, defs] of Object.entries(b ?? {}) as [HookEvent, HookDefinition[]][]) {
-    out[event] = [...(out[event] ?? []), ...defs];
+  const out = { ...(a ?? {}) } as Record<string, unknown>;
+  for (const [event, defs] of Object.entries(b ?? {})) {
+    // 非数组（例如把数组写成了字符串）原样保留，交给 validateHooks 报错。
+    // 直接展开字符串会把 "abc" 变成 ["a","b","c"]，症状完全看不出病因。
+    if (!Array.isArray(defs)) {
+      out[event] = defs;
+      continue;
+    }
+    const existing = Array.isArray(out[event]) ? (out[event] as HookDefinition[]) : [];
+    out[event] = [...existing, ...defs];
   }
-  return out;
+  return out as Partial<Record<HookEvent, HookDefinition[]>>;
 }
 
 export function defaultSettings(): HarnessSettings {

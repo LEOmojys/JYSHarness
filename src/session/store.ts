@@ -5,6 +5,7 @@
  * *is* the transcript, and a truncated tail is simply the last valid line.
  */
 import { appendFile, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Message } from "../core/types.ts";
 
@@ -22,7 +23,9 @@ export interface SessionMeta {
 type Line =
   | ({ type: "meta" } & SessionMeta)
   | { type: "message"; message: Message }
-  | { type: "note"; text: string; at: string };
+  | { type: "note"; text: string; at: string }
+  /** 压缩检查点：之后的历史以 messages 为准，之前的行只作为审计留档。 */
+  | { type: "compact"; messages: Message[]; before: number; at: string };
 
 export class SessionStore {
   private dir: string;
@@ -39,9 +42,19 @@ export class SessionStore {
     return path.join(this.dir, id + ".jsonl");
   }
 
-  async create(meta: SessionMeta): Promise<void> {
+  /**
+   * 创建会话文件。
+   *
+   * **绝不覆盖已有文件**：这里以前是 writeFile（截断），于是"用同一个 id 打开一个
+   * 已存在的会话、但没加载历史"（比如 --resume 忘传 resumeMessages、或某个入口只传了
+   * sessionId）会把整段历史清空。转录是 append-only 的，create 也必须遵守这条。
+   */
+  async create(meta: SessionMeta): Promise<boolean> {
     await this.init();
-    await writeFile(this.file(meta.id), JSON.stringify({ type: "meta", ...meta }) + "\n", "utf8");
+    const file = this.file(meta.id);
+    if (existsSync(file)) return false;
+    await writeFile(file, JSON.stringify({ type: "meta", ...meta }) + "\n", "utf8");
+    return true;
   }
 
   async append(sessionId: string, message: Message): Promise<void> {
@@ -51,6 +64,16 @@ export class SessionStore {
 
   async note(sessionId: string, text: string): Promise<void> {
     const line: Line = { type: "note", text, at: new Date().toISOString() };
+    await appendFile(this.file(sessionId), JSON.stringify(line) + "\n", "utf8");
+  }
+
+  /**
+   * 把压缩后的上下文写成一条检查点。
+   * 追加写、不改旧行：原文仍然是可审计的，但 resume 时以检查点为准，
+   * 免得一重新打开会话就把一百多 k 的原始历史重新摘要一遍。
+   */
+  async appendCompact(sessionId: string, messages: Message[], before: number): Promise<void> {
+    const line: Line = { type: "compact", messages, before, at: new Date().toISOString() };
     await appendFile(this.file(sessionId), JSON.stringify(line) + "\n", "utf8");
   }
 
@@ -67,6 +90,10 @@ export class SessionStore {
           meta = rest as SessionMeta;
         } else if (parsed.type === "message") {
           messages.push(parsed.message);
+        } else if (parsed.type === "compact") {
+          // 检查点之后，历史从压缩后的快照重新开始。
+          messages.length = 0;
+          messages.push(...parsed.messages);
         }
       } catch {
         // A torn final line after a crash is expected: skip it.
@@ -90,6 +117,18 @@ export class SessionStore {
       out.push({ id, createdAt: meta?.createdAt ?? "", preview: text });
     }
     return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /**
+   * 磁盘上存在的会话 id（含只有 meta 的空会话）。
+   *
+   * 和 list() 的区别：list() 会过滤掉"还没有第一条用户消息"的会话（列表里不该出现），
+   * 但**删除判据**必须看到它们 —— 否则"还有别的会话"这件事会被低估。
+   */
+  async ids(): Promise<string[]> {
+    await this.init();
+    const files = await readdir(this.dir).catch(() => [] as string[]);
+    return files.filter((f) => f.endsWith(".jsonl")).map((f) => f.replace(/\.jsonl$/, ""));
   }
 
   /**

@@ -30,7 +30,14 @@ export type ImageBlock = {
   name?: string;
 };
 
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ImageBlock;
+/** 推理过程（DeepSeek 的 reasoning_content / Anthropic 的 thinking）。
+ *  只用于展示：**不发回模型、不计入上下文估算**，但会保留在转录里（刷新后仍能看到）。 */
+export interface ThinkingBlock {
+  type: "thinking";
+  text: string;
+}
+
+export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ImageBlock | ThinkingBlock;
 
 export type Role = "user" | "assistant";
 
@@ -53,7 +60,10 @@ export type StopReason =
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
+  /** Tokens served from the provider's prompt cache (billed at a discount). */
   cacheReadTokens?: number;
+  /** Tokens written into the cache this turn (billed at a premium). */
+  cacheCreationTokens?: number;
 }
 
 export interface AssistantMessage extends Message {
@@ -95,20 +105,3 @@ export function getText(content: ContentBlock[]): string {
     .join("");
 }
 
-export function getToolUses(content: ContentBlock[]): ToolUseBlock[] {
-  return content.filter((b): b is ToolUseBlock => b.type === "tool_use");
-}
-
-/** Serialise any block array into a compact one-line preview (for logs / UI). */
-export function previewContent(content: ContentBlock[], max = 120): string {
-  const s = content
-    .map((b) => {
-      if (b.type === "text") return b.text;
-      if (b.type === "tool_use") return `${b.name}(${JSON.stringify(b.input)})`;
-      if (b.type === "image") return `[image ${b.mediaType}]`;
-      return `=> ${b.content}`;
-    })
-    .join(" ");
-  const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > max ? flat.slice(0, max) + "…" : flat;
-}
