@@ -5,7 +5,7 @@
  * worktree isolates transcripts, rules and checkpoints for free.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from "node:fs";
 import path from "node:path";
 
 export interface WorktreeInfo {
@@ -16,6 +16,8 @@ export interface WorktreeInfo {
   isMain: boolean;
   /** Sessions stored under this worktree (filled by the server). */
   sessions?: number;
+  /** Uncommitted / untracked entries（删除前的风险提示）。 */
+  dirty?: number;
 }
 
 interface GitResult {
@@ -44,10 +46,6 @@ export async function repositoryRoot(dir: string): Promise<string | null> {
   return root ? path.resolve(root) : null;
 }
 
-export async function isGitRepo(dir: string): Promise<boolean> {
-  return (await repositoryRoot(dir)) !== null;
-}
-
 /**
  * The *main* checkout's root. Inside a linked worktree, --show-toplevel returns
  * the worktree itself, so resolved worktree paths looked like "main" and
@@ -62,6 +60,8 @@ export async function mainRepositoryRoot(dir: string): Promise<string | null> {
 
 /** Parse `git worktree list --porcelain`. */
 export async function listWorktrees(repoRoot: string): Promise<WorktreeInfo[]> {
+  // 老版本建的仓库只排除了 .harness/worktrees/，列一次就顺手补齐（每个仓库只做一次）。
+  await ensureExcludedOnce(repoRoot);
   const res = await git(repoRoot, ["worktree", "list", "--porcelain"]);
   if (res.code !== 0) return [];
   const out: WorktreeInfo[] = [];
@@ -91,6 +91,18 @@ export async function listWorktrees(repoRoot: string): Promise<WorktreeInfo[]> {
     else if (current && key === "branch") current.branch = value.replace(/^refs\/heads\//, "");
   }
   flush();
+  // 并行统计每个工作树的未提交改动，删除前能一眼看到风险。
+  await Promise.all(
+    out.map(async (w) => {
+      if (!existsSync(w.path)) {
+        w.dirty = 0;
+        return;
+      }
+      const st = await git(w.path, ["status", "--porcelain"]);
+      const lines = st.stdout.split("\n").filter((l) => l.trim());
+      w.dirty = lines.length;
+    }),
+  );
   return out;
 }
 
@@ -100,41 +112,80 @@ export function validateWorktreeName(name: string): string | null {
   return null;
 }
 
-/** Keep worktrees out of `git status` without touching tracked files. */
-function ensureExcluded(repoRoot: string): void {
+/**
+ * Keep harness runtime data out of `git status` without touching tracked files.
+ *
+ * 两个坑（都已修）：
+ *   1. 只排除 .harness/worktrees/ 不够 —— .harness/sessions/ 每次跑都会变成未跟踪文件；
+ *   2. 在工作树里，.git 是一个文件（gitdir: ...），拼 .git/info/exclude 永远找不到 ——
+ *      必须用 `git rev-parse --git-path info/exclude` 让 git 自己算。
+ */
+async function ensureExcluded(repoRoot: string): Promise<void> {
   try {
-    const gitDir = path.join(repoRoot, ".git");
-    const infoDir = existsSync(gitDir) && existsSync(path.join(gitDir, "info")) ? path.join(gitDir, "info") : null;
-    if (!infoDir) return;
-    const file = path.join(infoDir, "exclude");
+    const res = await git(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
+    if (res.code !== 0) return;
+    const file = path.resolve(repoRoot, res.stdout.trim());
     const current = existsSync(file) ? readFileSync(file, "utf8") : "";
-    if (current.includes(".harness/worktrees")) return;
-    mkdirSync(infoDir, { recursive: true });
-    writeFileSync(file, current + (current.endsWith("\n") || current === "" ? "" : "\n") + ".harness/worktrees/\n", "utf8");
+    if (current.split(/\r?\n/).some((line) => line.trim() === ".harness/")) return;
+    // 清掉旧版本写进去的窄规则，避免同一目录两条规则互相矛盾。
+    const cleaned = current.replace(/^\.harness\/worktrees\/?\s*\r?\n/gm, "");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, cleaned + (cleaned.endsWith("\n") || cleaned === "" ? "" : "\n") + ".harness/\n", "utf8");
   } catch {
-    /* best effort: an unexcluded worktree dir is cosmetic */
+    /* best effort: an unexcluded data dir is cosmetic */
   }
+}
+
+const excludeChecked = new Set<string>();
+async function ensureExcludedOnce(repoRoot: string): Promise<void> {
+  const key = path.resolve(repoRoot).toLowerCase();
+  if (excludeChecked.has(key)) return;
+  excludeChecked.add(key);
+  await ensureExcluded(repoRoot);
 }
 
 export async function createWorktree(
   repoRoot: string,
   name: string,
   base?: string,
-): Promise<{ ok: true; path: string; branch: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; path: string; branch: string; copied: string[] } | { ok: false; error: string }> {
   const problem = validateWorktreeName(name);
   if (problem) return { ok: false, error: problem };
   const branch = "jys/" + name.trim();
   const target = path.join(repoRoot, ".harness", "worktrees", name.trim());
   if (existsSync(target)) return { ok: false, error: "目录已存在：" + target };
 
-  ensureExcluded(repoRoot);
+  await ensureExcluded(repoRoot);
   mkdirSync(path.dirname(target), { recursive: true });
 
   const res = await git(repoRoot, ["worktree", "add", "-b", branch, target, base ?? "HEAD"]);
   if (res.code !== 0) {
     return { ok: false, error: (res.stderr || res.stdout).trim() || "git worktree add 失败" };
   }
-  return { ok: true, path: target, branch };
+  return { ok: true, path: target, branch, copied: copyLocalConfig(repoRoot, target) };
+}
+
+/** 新工作树默认是"干净检出"，跑不起来通常是因为缺少本地未跟踪的配置。 */
+export const LOCAL_CONFIG_FILES = [".env", ".env.local", ".env.development", ".env.test"];
+
+function copyLocalConfig(repoRoot: string, target: string): string[] {
+  const copied: string[] = [];
+  for (const rel of LOCAL_CONFIG_FILES) {
+    const src = path.join(repoRoot, rel);
+    const dst = path.join(target, rel);
+    try {
+      if (existsSync(src) && !existsSync(dst)) {
+        copyFileSync(src, dst);
+        copied.push(rel);
+      }
+    } catch (err) {
+      // 没权限只警告；但别让编程错误（比如忘了 import）静默变成"什么都没复制"。
+      const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof ReferenceError || err instanceof TypeError) throw err;
+      process.emitWarning("跳过复制 " + rel + "：" + msg);
+    }
+  }
+  return copied;
 }
 
 export async function removeWorktree(
@@ -149,5 +200,7 @@ export async function removeWorktree(
   if (force) args.push("--force");
   const res = await git(root, args);
   if (res.code !== 0) return { ok: false, error: (res.stderr || res.stdout).trim() || "删除失败" };
+  // 清掉已失效的 worktree 元数据（目录被手动删掉时 git 会一直记着）。
+  await git(root, ["worktree", "prune"]);
   return { ok: true };
 }

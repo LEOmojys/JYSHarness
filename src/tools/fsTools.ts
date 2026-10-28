@@ -1,8 +1,9 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { globSync, readdirSync } from "node:fs";
+import { globSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { guardPath, isInside, realResolve } from "../sandbox/paths.ts";
 import { num, str, bool, type Tool, type ToolContext } from "./types.ts";
+import { lookupRead, storeRead } from "../util/readCache.ts";
 import type { PermissionDecision } from "../permissions/engine.ts";
 
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", ".harness", ".next", "target", "__pycache__"]);
@@ -45,11 +46,18 @@ export const ReadTool: Tool = {
     if (info.size > 5_000_000) {
       return { content: "Error: file too large (" + info.size + " bytes); use Grep to locate the region.", isError: true };
     }
+    const offset = Math.max(1, num(input, "offset", 1));
+    const limit = Math.max(1, num(input, "limit", MAX_READ_LINES));
+
+    // 同一文件 + 同样的窗口 + 同样的 mtime/size 才算命中，改过就重读。
+    const cached = lookupRead(abs, offset, limit, info.mtimeMs, info.size);
+    if (cached) {
+      return { content: cached.content, metadata: { lines: cached.total, cached: true } };
+    }
+
     const text = (await readFile(abs, "utf8")).replace(/^\uFEFF/, "");
     const lines = text.split("\n");
     const total = lines.length;
-    const offset = Math.max(1, num(input, "offset", 1));
-    const limit = Math.max(1, num(input, "limit", MAX_READ_LINES));
     const start = Math.min(offset, total);
     const end = Math.min(start + limit - 1, total);
     const out: string[] = [];
@@ -58,7 +66,9 @@ export const ReadTool: Tool = {
     }
     const header = "<file path=\"" + abs + "\" lines=" + start + "-" + end + " of " + total + ">";
     const footer = end < total ? "</file>\n(truncated: " + (total - end) + " more lines; continue with offset=" + (end + 1) + ")" : "</file>";
-    return { content: header + "\n" + out.join("\n") + "\n" + footer, metadata: { lines: total } };
+    const content = header + "\n" + out.join("\n") + "\n" + footer;
+    storeRead({ path: abs, offset, limit, mtimeMs: info.mtimeMs, size: info.size, total, content });
+    return { content, metadata: { lines: total } };
   },
 };
 
@@ -194,7 +204,9 @@ export const GlobTool: Tool = {
   isConcurrencySafe: () => true,
   async call(input, ctx) {
     const pattern = str(input, "pattern");
-    const base = realResolve(str(input, "path") || ctx.cwd);
+    // 相对路径必须相对会话 cwd，而不是服务进程的 cwd（否则会扫错目录）。
+    const rawBase = str(input, "path");
+    const base = realResolve(rawBase ? (path.isAbsolute(rawBase) ? rawBase : path.resolve(ctx.cwd, rawBase)) : ctx.cwd);
     let matches: string[] = [];
     try {
       const found = globSync(pattern, { cwd: base }) as string[];
@@ -228,6 +240,7 @@ export const GrepTool: Tool = {
       path: { type: "string" },
       include: { type: "string", description: "Glob filter such as *.ts" },
       max_results: { type: "number" },
+      ignore_case: { type: "boolean", description: "Case-insensitive match (default false)." },
     },
     required: ["pattern"],
   },
@@ -237,15 +250,24 @@ export const GrepTool: Tool = {
     const source = str(input, "pattern");
     let re: RegExp;
     try {
-      re = new RegExp(source, "i");
+      re = new RegExp(source, bool(input, "ignore_case", false) ? "i" : "");
     } catch (e) {
       return { content: "Error: invalid regular expression: " + source, isError: true };
     }
-    const base = realResolve(str(input, "path") || ctx.workspaceRoot);
+    const rawBase = str(input, "path");
+    const base = realResolve(rawBase ? (path.isAbsolute(rawBase) ? rawBase : path.resolve(ctx.cwd, rawBase)) : ctx.workspaceRoot);
     const include = str(input, "include");
     const maxResults = num(input, "max_results", 100);
     const files: string[] = [];
-    walk(base, base, files, 20000);
+    // grep 的 path 允许是文件（模型经常这么用），此时不要递归整个目录。
+    let isFileTarget = false;
+    try {
+      isFileTarget = statSync(base).isFile();
+    } catch {
+      return { content: "Error: path not found: " + base, isError: true };
+    }
+    if (isFileTarget) files.push(base);
+    else walk(base, base, files, 20000);
     const hits: string[] = [];
     for (const file of files) {
       if (hits.length >= maxResults) break;

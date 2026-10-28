@@ -43,9 +43,16 @@ function readRecentRaw(): { path: string; at: number }[] {
   if (!Array.isArray(raw)) return [];
   const out: { path: string; at: number }[] = [];
   for (const item of raw) {
-    if (typeof item === "string") out.push({ path: item, at: 0 });
-    else if (item && typeof item === "object" && typeof (item as any).path === "string") {
-      out.push({ path: String((item as any).path), at: Number((item as any).at) || 0 });
+    if (typeof item === "string") {
+      out.push({ path: item, at: 0 });
+      continue;
+    }
+    if (item && typeof item === "object") {
+      // 读的是用户可编辑的 settings.json：一处收窄，避免每个字段都强转
+      const record = item as Record<string, unknown>;
+      if (typeof record.path === "string") {
+        out.push({ path: record.path, at: Number(record.at) || 0 });
+      }
     }
   }
   return out.filter((e) => e.path);
@@ -126,10 +133,6 @@ export function setFavorite(absPath: string, favorite: boolean): boolean {
   settings.favoriteWorkspaces = next;
   writeUserSettings(settings);
   return favorite;
-}
-
-export function isFavorite(absPath: string): boolean {
-  return readFavoritePaths().includes(path.resolve(absPath));
 }
 
 export interface WorkspaceCheck {

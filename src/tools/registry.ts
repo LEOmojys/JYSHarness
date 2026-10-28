@@ -6,7 +6,7 @@
  * MCP/extension tools are added or removed.
  */
 import type { Tool, ToolResult, ToolContext } from "./types.ts";
-import { validateAgainstSchema } from "./types.ts";
+import { DEFAULT_MAX_OUTPUT_CHARS, truncateOutput, validateAgainstSchema } from "./types.ts";
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
@@ -119,6 +119,33 @@ export function partitionCalls(calls: PreparedCall[]): CallBatch[] {
   return batches;
 }
 
+/**
+ * 只给"可能永远不返回"的工具加超时（WebFetch、MCP）。
+ * 到点先 abort 让它自己收尾，再兜底 reject —— 尊重 signal 的工具会干净退出，
+ * 不尊重的也不会把整个循环挂死。
+ */
+async function runWithTimeout(tool: Tool, input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  if (!tool.timeoutMs || tool.timeoutMs <= 0) return tool.call(input, ctx);
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  ctx.signal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(), tool.timeoutMs);
+  try {
+    return await Promise.race([
+      tool.call(input, { ...ctx, signal: controller.signal }),
+      new Promise<ToolResult>((resolve) => {
+        setTimeout(
+          () => resolve({ content: "timed out after " + tool.timeoutMs + "ms: " + tool.name, isError: true }),
+          tool.timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    ctx.signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function executeCall(
   call: PreparedCall,
   ctx: ToolContext,
@@ -132,18 +159,49 @@ export async function executeCall(
   }
   const tool = call.tool!;
   const checkpoints = ctx.checkpoints;
-  checkpoints?.beginCall();
+  // 检查点帧跟着这次调用走：并发（比如两个子 Agent 同时写文件）各自一帧，
+  // 不会互相清空。修复前这里是实例级单帧，会导致某个文件的改动直接不可 undo。
+  const frame = checkpoints?.beginCall();
+  // 只读工具允许自动重试：超时 / 抛错都是一次就放弃太脆。
+  const attempts = 1 + (tool.isReadOnly ? Math.max(0, tool.retries ?? 0) : 0);
+  const runTool = () => runWithTimeout(tool, call.request.input, ctx);
+  const runInFrame = frame && checkpoints ? () => checkpoints.track(frame, runTool) : runTool;
   try {
-    const result = await tool.call(call.request.input, ctx);
-    const changes = checkpoints?.commitCall() ?? [];
+    let attempt = 0;
+    let result: ToolResult = await runInFrame().catch((err: unknown): ToolResult => ({
+      content: "Tool threw an error: " + (err instanceof Error ? err.message : String(err)),
+      isError: true,
+    }));
+    while (result.isError && attempt + 1 < attempts) {
+      attempt++;
+      await new Promise((r) => setTimeout(r, 120 * attempt));
+      result = await runInFrame().catch((err: unknown): ToolResult => ({
+        content: "Tool threw an error: " + (err instanceof Error ? err.message : String(err)),
+        isError: true,
+      }));
+    }
+    if (attempt > 0 && !result.isError) {
+      result = { ...result, metadata: { ...(result.metadata ?? {}), retriedAfterError: attempt } };
+    }
+    const changes = checkpoints?.commitCall(frame) ?? [];
     if (changes.length) {
       // Tag with the call id so the UI can re-attach diffs after a reload.
       const tagged = changes.map((c) => ({ ...c, toolUseId: call.request.id }));
       result.metadata = { ...(result.metadata ?? {}), changes: tagged };
     }
+    // 单一出口做输出截断：任何工具（含 MCP、插件）都逃不掉。
+    const cap = tool.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+    const clipped = truncateOutput(result.content, cap);
+    if (clipped.truncated) {
+      return {
+        ...result,
+        content: clipped.content,
+        metadata: { ...(result.metadata ?? {}), truncated: { limit: cap, original: result.content.length } },
+      };
+    }
     return result;
   } catch (err) {
-    checkpoints?.commitCall();
+    checkpoints?.commitCall(frame);
     const message = err instanceof Error ? err.message : String(err);
     if (message.toLowerCase().includes("abort")) {
       return { content: "Tool execution aborted by user.", isError: true };

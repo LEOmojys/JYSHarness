@@ -366,12 +366,14 @@ test("sandbox: child environment is scrubbed of credentials", async () => {
   assert.equal(env.GITHUB_TOKEN, undefined);
   assert.equal(env.MY_PASSWORD, undefined);
 
-  // danger-full-access opts out (documented escape hatch).
-  const full = scrubEnv({ ANTHROPIC_API_KEY: "k" }, "danger-full-access");
-  assert.equal(full.ANTHROPIC_API_KEY, "k");
+  // danger-full-access 保留用户自己的凭据，但 harness 的 provider key 仍不下发：
+  // 子进程不需要"我用来思考的那把钥匙"，而 printenv 会把它写进转录。
+  const full = scrubEnv({ AWS_SECRET_ACCESS_KEY: "aws", ANTHROPIC_API_KEY: "k" }, "danger-full-access");
+  assert.equal(full.AWS_SECRET_ACCESS_KEY, "aws");
+  assert.equal(full.ANTHROPIC_API_KEY, undefined);
 
   const backend = detectBackend();
-  assert.ok(["bwrap", "sandbox-exec", "none"].includes(backend.kind));
+  assert.ok(["bwrap", "sandbox-exec", "win-lowil", "none"].includes(backend.kind), backend.kind);
   assert.match(backend.note, /\S/);
 
   const plan = buildSpawnPlan("echo hi", {

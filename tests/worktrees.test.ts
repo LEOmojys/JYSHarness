@@ -46,7 +46,9 @@ function makeSession(root: string): Session {
 
 test("worktree: repository detection and name validation", async () => {
   const repo = await makeRepo();
-  assert.equal(real(await repositoryRoot(repo)!), real(repo));
+  const detected = await repositoryRoot(repo);
+  assert.ok(detected, "a real repo must be detected");
+  assert.equal(real(detected), real(repo));
 
   const plain = await mkdtemp(path.join(os.tmpdir(), "jys-wt-plain-"));
   assert.equal(await repositoryRoot(plain), null);
