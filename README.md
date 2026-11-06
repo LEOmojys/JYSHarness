@@ -58,7 +58,7 @@ cd harness
 | **Agent Loop** | Async Generator + continue 站点：413 反应式压缩、max_tokens 升上限+续写、429/5xx 退避、空回复重试、Stop Hook 阻断 |
 | **备用模型** | `fallbackModel`：主模型认证失败/限流耗尽/5xx 时切一次（同一 provider 内换模型），切换有提示、不来回横跳 |
 | **错误恢复** | 遵循服务端 `Retry-After`；网络抖动（ECONNRESET/超时）按瞬时错误重试并带抖动；其余每个失败都有明确终止原因：`max_output_tokens`（续写耗尽，不再假装成功）、`stop_hook_prevented`（钩子连续拦 3 次）、`prompt_too_long`、`model_error`（认证失败附带可操作提示） |
-| **工具系统** | 14 个内置工具 + MCP 动态工具；Schema 校验 → 权限 → Hook → 执行 → 事后审计 |
+| **工具系统** | 15 个内置工具 + MCP 动态工具；Schema 校验 → 权限 → Hook → 执行 → 事后审计 |
 | **输出治理** | 单次输出上限（默认 50k 字符，Bash 30k / WebFetch 60k），截断保头也保尾并标明省略量；单工具超时（WebFetch 30s、MCP 120s） |
 | **工具调度** | 只读批量并行（**并发上限 6**）、**同批相同调用去重**、**只读工具失败自动重试 1 次**（写操作永不重试）；按工具统计调用/失败数 |
 | **熔断与恢复** | 同一工具连续失败 3 次 → 短路 60s 并在错误里说明"别重试，换办法"；MCP server 崩溃后**自动重启并重试一次** |
@@ -86,6 +86,7 @@ cd harness
 | **Hooks** | 7 个事件（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / Stop），**配置在 settings.json 里（数据驱动，不改代码）**；可阻断、可改参数、可加注；支持 `async` 旁路钩子；配置写错只告警不崩 |
 | **Hooks 语义** | 多钩子按 **deny > ask > allow** 合并（后写的 allow 不能取消前面的 deny）；matcher 编译失败只影响该条；超时夹在 0.1–60s |
 | **成本核算** | 按模型定价估算 USD，顶栏实时显示 |
+| **WebSearch** | 按关键词搜网页。后端有序降级：Tavily/Brave/Serper（配 key）→ Bing RSS → DuckDuckGo；**自己按查询词打分过滤**、**本地实现 site: 过滤**（免 key 后端会忽略它），零相关结果时先给警告再列原文 |
 | **WebFetch** | 抓取网页转文本，阻断 loopback/私网地址（SSRF） |
 | **图片输入** | 粘贴/选择图片，base64 走 Anthropic image block 或 OpenAI image_url |
 | **沙箱后端** | 子进程环境清洗 + **Windows 低完整性令牌 + Job Object**（内核强制：写隔离 + 内存/进程上限）/ Linux bwrap / macOS seatbelt |
@@ -117,6 +118,7 @@ cd harness
 | `Agent` | 派生子 Agent | ❌ |
 | `TodoWrite` | 维护任务清单 | ❌ |
 | `JobOutput` `JobKill` `JobList` | 后台任务读取/终止/列表 | ✅/❌ |
+| `WebSearch` | 搜网页（后端可配） | ✅ |
 | `WebFetch` | 抓网页 | ✅ |
 | `Skill` | 加载技能正文 | ✅ |
 | `mcp__<server>__<tool>` | 任意 MCP 工具，启动时自动发现 | 由 `readOnlyHint` 决定 |
@@ -192,6 +194,14 @@ cd harness
 也可以手动触发：`/compact`，或带上关注点 `/compact 保留 API 签名改动`，和 Claude Code 的用法一致。输入框上方的「压缩」按钮等价于 `/compact`。
 
 **密钥怎么存**：API Key 只写入 `~/.jysharness/secrets.json`（权限 600），**不会**写进项目里的 settings.json，接口也永远不回传明文（只回 `sk-m…3456` 这样的提示）。要便携/隔离，可以设 `HARNESS_HOME` 换配置目录。
+
+**联网检索**：`WebSearch` 免 key 就能用（Bing RSS + DuckDuckGo 自动降级），也可以用环境变量换成更稳更准的 API：
+
+```bash
+HARNESS_TAVILY_KEY=tvly-xxx     # 或 HARNESS_BRAVE_KEY / HARNESS_SERPER_KEY
+```
+
+免 key 后端精度有限（实测 Bing RSS 会忽略 `site:`，长查询可能返回无关内容），所以工具自己按查询词**打分过滤**、**本地实现 site 过滤**；一条相关结果都没有时会先给警告再照列原文，并明确"不要当作检索结果引用"。搜到 URL 之后用 `WebFetch` 抓正文，是「检索 → 抓取」的两步链路。
 
 ![settings](docs/settings.png)
 
@@ -291,13 +301,13 @@ jys plugin test                # 加载校验，出错返回非 0
 ```bash
 npm install       # 只为开发期工具链（运行时零依赖）
 npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
-npm test          # 286 个单元/集成测试（自动发现 tests/*.test.ts）
+npm test          # 299 个单元/集成测试（自动发现 tests/*.test.ts）
 npm run typecheck # tsc --strict，src 必须 0 error
 npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
 npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**286 个测试**，分二十三组：
+**299 个测试**，分二十四组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销

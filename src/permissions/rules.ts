@@ -166,6 +166,8 @@ export function permissionContentFor(
       return pick("description") || pick("prompt");
     case "WebFetch":
       return pick("url");
+    case "WebSearch":
+      return pick("query");
     default:
       return pick("command") || pick("file_path") || pick("path") || pick("url") || "";
   }

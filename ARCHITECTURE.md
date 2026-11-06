@@ -1285,6 +1285,47 @@ if (data.config) { appConfig = data.config; if (!silent) renderSettings(data.con
 - **成本未与服务商账单对账**：用的是本地价格表，只保证"内部一致"。
 - **图片/PDF 的视觉能力未验证**：`deepseek-flash` 是纯文本模型，这里只验证了**管线**（消息、wire、存储、恢复），没有验证"模型真的看懂了图"。
 - **崩溃恢复只覆盖"被杀"**：断电（未落盘的页缓存丢失）无法在测试里模拟；这也是没有 fsync 的已知代价。
+## 16.13 联网检索：WebSearch（多后端降级 + 相关性过滤）
+
+之前项目只有 `WebFetch`（抓已知 URL）。**模型不知道 URL**，所以它只能凭记忆回答 —— 这是"能抓页面"和"能查资料"的差别。补上 `WebSearch` 之后形成「检索 → 抓取」链路。
+
+### 为什么要有后端降级
+
+这台机器实测（同一个查询、逐个直连）：
+
+| 端点 | 结果 |
+| --- | --- |
+| `cn.bing.com/search?format=rss` | **200，结果与查询相关** |
+| `www.bing.com/search?format=rss` | 200，但被地域降级成无关内容 |
+| `html.duckduckgo.com` / `lite.duckduckgo.com` | `fetch failed`（网络不可达） |
+| `google.com` / `searx.be` / `mojeek` / `wikipedia api` | 不可达或 403 |
+
+所以后端按"能用 → 更准"排序：**Tavily / Brave / Serper**（有 key，稳定精确）→ **cn.bing RSS** → **www.bing RSS** → **DuckDuckGo HTML**。每个后端单独 8s 超时（并上 `ctx.signal`，按 Esc 能立刻停），失败原因逐条累计，全失败时一次性告诉用户"是网络还是没配 key"。
+
+### 免 key 后端不可信，所以加了两道自查
+
+实测 `cn.bing.com` 的 RSS 会**忽略 `site:` 操作符**，长查询还会返回完全无关的内容（查 `zzzzqqq nonsense token` 返回毛主席选集）。把这种东西直接交给模型当事实，比搜不到更糟。所以：
+
+1. **按查询词打分**：标题命中记 2 分、正文/URL 命中记 1 分，只保留得分 > 0 的结果；跨后端选总分最高的那个（命中够多就提前停止，省一次往返）。
+2. **本地实现 `site:` 过滤**：拿结果 URL 的 host 自己比对（`host === site || host.endsWith("." + site)`）；被后端忽略时，退一步把域名当普通词再搜一次，仍不行就明确报告"加了域名重试仍 0 条"。
+3. **零相关结果不装成功**：警告放在最前面（`⚠ 没有找到与查询词相关的结果…不要当作检索结果引用`），`isError: true`，并把原文照列供人工判断。
+
+### 数据（本机实测）
+
+| 用例 | 结果 |
+| --- | --- |
+| `python asyncio gather vs wait` | 223ms，4 条，backend=bing-cn-rss |
+| `typescript satisfies operator example` | 272ms，5 条 |
+| `site:nodejs.org` 过滤 | 8.9s 后明确失败：`bing-cn-rss: 加了域名重试仍 0 条` / `duckduckgo-html: timeout` |
+| `zzzzqqq nonsense token` | 警告在前 + `isError: true`（不把垃圾当结果） |
+
+离线测试 13 项（解析器、实体解码、跳转还原、后端顺序、降级、打分、site 过滤、零相关告警），全部不联网。
+
+### 已知限制
+
+- **免 key 后端的精度就是它的上限**：Bing RSS 常常只给"入口页"（查 asyncio 给出 python.org 首页）。要精确结果请配 Tavily/Brave/Serper key。
+- 不做结果页正文抓取：那是 `WebFetch` 的职责，两步分开才能让模型自己决定"哪条值得读"。
+- 没有做分页/翻页（`count` 上限 10）。
 ## 17. 下一步
 
 按收益/成本排序：

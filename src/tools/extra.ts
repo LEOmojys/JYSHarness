@@ -1,5 +1,6 @@
-/** Tools added in the product build: jobs, todos, web fetch, skills. */
+/** Tools added in the product build: jobs, todos, web search/fetch, skills. */
 import { loadSkillBody } from "../core/skills.ts";
+import { WebSearchTool } from "./webSearch.ts";
 import { addMemory, forgetMemory, MAX_MEMORY_CHARS, readMemoryEntries } from "../core/memory.ts";
 import { checkUrl, MAX_REDIRECTS } from "../util/net.ts";
 import { formatJob } from "../core/jobs.ts";
@@ -275,4 +276,13 @@ export const MemoryTool: Tool = {
 };
 
 
-export const extraTools: Tool[] = [JobOutputTool, JobKillTool, JobListTool, TodoWriteTool, WebFetchTool, SkillTool, MemoryTool];
+export const extraTools: Tool[] = [
+  JobOutputTool,
+  JobKillTool,
+  JobListTool,
+  TodoWriteTool,
+  WebSearchTool,
+  WebFetchTool,
+  SkillTool,
+  MemoryTool,
+];
