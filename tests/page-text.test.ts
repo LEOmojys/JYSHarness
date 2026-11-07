@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractMainText, fetchReadableText, htmlToText } from "../src/util/pageText.ts";
+import { extractMainText, fetchReadableText, htmlToText, sliceForBudget } from "../src/util/pageText.ts";
+import { WebFetchTool } from "../src/tools/extra.ts";
 
 // 结构仿真实文档页：一大段导航 + article 正文
 const PAGE = [
@@ -81,3 +82,83 @@ test("pageText: private hosts are blocked before any request", async () => {
     globalThis.fetch = previous;
   }
 });
+
+// 造一篇"有段落、有句子"的长文，方便验证边界切分
+const PARA = "这是一段用来测试截断行为的正文，句子之间用句号分隔。第二句继续补充内容，确保每段足够长。";
+const LONG = Array.from({ length: 60 }, (_, i) => PARA + "（第" + (i + 1) + "段）").join(String.fromCharCode(10) + String.fromCharCode(10));
+
+test("slice: a slice never ends mid-sentence when a boundary exists", () => {
+  const part = sliceForBudget(LONG, 0, 500);
+  assert.ok(part.slice.length > 0);
+  // 切点应落在句子或段落边界上（段落优先，所以可能以换行结尾）
+  const tail = part.slice.slice(-12);
+  assert.ok(
+    /[。！？]|段）|\n\n$|\n$/.test(tail),
+    "切片应以句子或段落结束，实际结尾: " + JSON.stringify(tail),
+  );
+});
+
+test("slice: offsets chain back to the full text with nothing lost", () => {
+  const budget = 400;
+  let offset = 0;
+  let rebuilt = "";
+  let rounds = 0;
+  for (;;) {
+    const part = sliceForBudget(LONG, offset, budget);
+    rebuilt += part.slice;
+    rounds++;
+    if (part.nextOffset == null || rounds > 100) break;
+    offset = part.nextOffset;
+  }
+  assert.equal(rebuilt, LONG, "分段拼接必须还原全文（不能丢字符）");
+  assert.ok(rounds > 1, "长文应分多次取回");
+});
+
+test("slice: no boundary nearby falls back to the hard limit instead of returning nothing", () => {
+  const noPunct = "a".repeat(5000);
+  const part = sliceForBudget(noPunct, 0, 300);
+  assert.equal(part.slice.length, 300);
+  assert.equal(part.nextOffset, 300);
+});
+
+test("slice: offset past the end returns empty and no next offset", () => {
+  const part = sliceForBudget("short", 999, 100);
+  assert.equal(part.slice, "");
+  assert.equal(part.nextOffset, null);
+});
+
+test("webfetch: truncated output tells how to continue, and the next call returns the rest", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => "text/html" },
+    text: async () => "<html><body><article><p>" + LONG.replace(/\n\n/g, "</p><p>") + "</p></article></body></html>",
+  })) as never as typeof fetch;
+  try {
+    const first = await WebFetchTool.call({ url: "https://example.com/long", max_chars: 600 }, { signal: new AbortController().signal } as never);
+    const firstText = String(first.content);
+    assert.match(firstText, /已截断/, "必须提示被截断");
+    const m = /offset=(\d+)\]/.exec(firstText);
+    assert.ok(m, "必须给出下一次的 offset，实际: " + firstText.slice(-120));
+    const next = Number(m![1]);
+
+    const second = await WebFetchTool.call({ url: "https://example.com/long", max_chars: 600, offset: next }, { signal: new AbortController().signal } as never);
+    assert.ok(String(second.content).length > 300, "续读必须拿到内容");
+    assert.notEqual(String(second.content), firstText, "续读不能重复同一段");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("webfetch: a page shorter than the budget has no truncation hint", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async () => ({ ok: true, status: 200, headers: { get: () => "text/plain" }, text: async () => "短文本" })) as never as typeof fetch;
+  try {
+    const res = await WebFetchTool.call({ url: "https://example.com/s", max_chars: 1000 }, { signal: new AbortController().signal } as never);
+    assert.doesNotMatch(String(res.content), /已截断/);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+

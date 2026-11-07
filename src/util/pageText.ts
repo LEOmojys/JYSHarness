@@ -17,6 +17,12 @@ export interface PageTextResult {
   url?: string;
   text?: string;
   bytes?: number;
+  /** 正文总长度（截断前）。用来告诉调用方"还有多少没给"。 */
+  totalChars?: number;
+  /** 本次返回的起始偏移。 */
+  offset?: number;
+  /** 下一次该传的 offset；null 表示已经取完。 */
+  nextOffset?: number | null;
 }
 
 /**
@@ -68,9 +74,41 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * 按预算切片，但**不切在句子/段落中间**。
+ *
+ * 以前的硬切（text.slice(0, max)）会把句子拦腰砍断，模型看到半句话会误判内容完整性。
+ * 现在在预算的最后 20% 窗口里往回找段落/行/句号边界；找不到边界才退回硬边界。
+ * 同时返回 nextOffset：长页面可以分段取回，一点内容都不丢。
+ */
+export function sliceForBudget(
+  text: string,
+  offset: number,
+  budget: number,
+): { slice: string; nextOffset: number | null; total: number } {
+  const total = text.length;
+  const start = Math.max(0, Math.min(offset, total));
+  if (start >= total) return { slice: "", nextOffset: null, total };
+  const hardEnd = Math.min(total, start + budget);
+  if (hardEnd >= total) return { slice: text.slice(start), nextOffset: null, total };
+
+  // 只在实际预算靠后处找边界，避免切得过短
+  const floor = start + Math.max(200, Math.floor(budget * 0.8));
+  let cut = -1;
+  const separators = ["\n\n", "\n", "。", ". ", "！", "？"];
+  for (const sep of separators) {
+    const idx = text.lastIndexOf(sep, hardEnd);
+    if (idx >= floor) {
+      cut = idx + sep.length;
+      break;
+    }
+  }
+  if (cut < 0) cut = hardEnd;
+  return { slice: text.slice(start, cut), nextOffset: cut < total ? cut : null, total };
+}
 export async function fetchReadableText(
   rawUrl: string,
-  opts: { maxChars?: number; signal?: AbortSignal; main?: boolean } = {},
+  opts: { maxChars?: number; signal?: AbortSignal; main?: boolean; offset?: number } = {},
 ): Promise<PageTextResult> {
   let parsed: URL;
   try {
@@ -106,8 +144,18 @@ export async function fetchReadableText(
     const type = res.headers.get("content-type") ?? "";
     const body = await res.text();
     const text = /html/i.test(type) ? (opts.main ? extractMainText(body) : htmlToText(body)) : body;
-    const clipped = text.length > maxChars ? text.slice(0, maxChars) + "\n...[truncated]" : text;
-    return { ok: true, status: res.status, url: current.href, text: clipped, bytes: body.length };
+    // 不再硬切：按段落/句子边界切，并给出下一次的 offset，让调用方可以分段取回全文。
+    const part = sliceForBudget(text, Math.max(0, opts.offset ?? 0), maxChars);
+    return {
+      ok: true,
+      status: res.status,
+      url: current.href,
+      text: part.slice,
+      bytes: body.length,
+      totalChars: part.total,
+      offset: Math.max(0, opts.offset ?? 0),
+      nextOffset: part.nextOffset,
+    };
   } catch (err) {
     return { ok: false, reason: "fetch failed: " + (err instanceof Error ? err.message : String(err)) };
   }

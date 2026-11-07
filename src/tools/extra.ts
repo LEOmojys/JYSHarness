@@ -116,7 +116,16 @@ export const WebFetchTool: Tool = {
     type: "object",
     properties: {
       url: { type: "string" },
-      max_chars: { type: "number", description: "Cap on returned characters (default 20000)." },
+      max_chars: {
+        type: "number",
+        description: "Characters per call (default 20000, max 50000). Never cuts mid-sentence.",
+      },
+      offset: {
+        type: "number",
+        description:
+          "Start offset in characters (default 0). When output ends with a next-offset hint, " +
+          "call again with that offset to read the rest — nothing is lost.",
+      },
       full: {
         type: "boolean",
         description:
@@ -138,14 +147,34 @@ export const WebFetchTool: Tool = {
   },
   async call(input, ctx) {
     const raw = str(input, "url");
-    const maxChars = Math.min(80_000, Math.max(1000, num(input, "max_chars", 20_000)));
+    // 上限收到 50000：工具层还有 60000 的硬上限，超出会二次截断且不给提示，等于静默丢内容
+    const maxChars = Math.min(50_000, Math.max(1_000, num(input, "max_chars", 20_000)));
+    const offset = Math.max(0, num(input, "offset", 0));
     // 抓取与正文提取在 util/pageText.ts：WebSearch 抓检索结果正文用的是同一套逻辑
     // 默认只取正文区：实测文档站整页文本里正文在第 2637 字符，前 700 字符全是导航，
     // 模型会以为页面没有内容。要整页就显式 full=true。
-    const page = await fetchReadableText(raw, { maxChars, signal: ctx.signal, main: !bool(input, "full", false) });
+    const page = await fetchReadableText(raw, {
+      maxChars,
+      signal: ctx.signal,
+      offset,
+      main: !bool(input, "full", false),
+    });
     if (!page.ok) return { content: page.reason ?? "fetch failed", isError: true };
+    // 截断时必须告诉模型"还有多少、怎么继续拿"，否则它会以为页面就这么多
+    const more =
+      page.nextOffset != null
+        ? "\n\n[已截断：全文 " +
+          page.totalChars +
+          " 字符，本次返回 " +
+          (page.offset ?? 0) +
+          "–" +
+          page.nextOffset +
+          "；继续读取请传 offset=" +
+          page.nextOffset +
+          "]"
+        : "";
     return {
-      content: "status=" + page.status + " url=" + page.url + "\n" + (page.text ?? ""),
+      content: "status=" + page.status + " url=" + page.url + "\n" + (page.text ?? "") + more,
       metadata: { status: page.status, bytes: page.bytes },
     };
   },

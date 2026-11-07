@@ -393,7 +393,12 @@ export const WebSearchTool: Tool = {
           const signal = AbortSignal.any ? AbortSignal.any([ctx.signal, budget]) : budget;
           const page = await fetchReadableText(hit.url, { maxChars: perPage, signal, main: true });
           if (!page.ok) return "   [正文抓取失败: " + (page.reason ?? "unknown").slice(0, 60) + "]";
-          const text = (page.text ?? "").trim();
+          const raw = (page.text ?? "").trim();
+          // 搜索侧不续读：只提示"被截断了、全文多长、可用 WebFetch offset 继续"
+          const text =
+            page.nextOffset != null
+              ? raw + "\n   [正文已截断：全文 " + page.totalChars + " 字符，可用 WebFetch 传 offset=" + page.nextOffset + " 继续读取]"
+              : raw;
           // 少于 200 字基本是 JS 渲染页或反爬页：明说，别让模型以为页面就这么短
           if (text.length < 200)
             return "   [正文过短 " + text.length + " 字，可能是 JS 渲染页或需要登录；可用 WebFetch 自行重试]";
