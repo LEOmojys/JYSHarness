@@ -14,6 +14,7 @@
  */
 import type { Tool, ToolResult, ToolContext } from "./types.ts";
 import { num, str } from "./types.ts";
+import { fetchReadableText } from "../util/pageText.ts";
 
 export interface SearchHit {
   title: string;
@@ -281,12 +282,18 @@ export function freeBackends(): SearchBackend[] {
   ];
 }
 
-export function formatHits(hits: SearchHit[], backend: string, query: string): string {
+/** bodies[i] 是第 i 条结果的正文（自动抓取的），没有就跳过。 */
+export function formatHits(hits: SearchHit[], backend: string, query: string, bodies: string[] = []): string {
   const lines = ["query: " + query + "  (backend: " + backend + ", " + hits.length + " 条)"];
   hits.forEach((h, i) => {
     lines.push(i + 1 + ". " + (h.title || "(无标题)"));
     lines.push("   " + h.url);
     if (h.snippet) lines.push("   " + h.snippet);
+    const body = bodies[i];
+    if (body) {
+      lines.push("   --- 正文 ---");
+      lines.push(body);
+    }
   });
   return lines.join("\n");
 }
@@ -304,13 +311,20 @@ export const WebSearchTool: Tool = {
       query: { type: "string", description: "Search keywords (natural language works)." },
       count: { type: "number", description: "How many results (default 5, max 10)." },
       site: { type: "string", description: "Optional domain filter, e.g. github.com." },
+      read: {
+        type: "number",
+        description:
+          "How many of the top results to fetch and read (default 1, max 3, 0 = titles/snippets only). " +
+          "Each page adds latency but gives real content instead of a snippet.",
+      },
+      max_chars_per_page: { type: "number", description: "Per-page text cap (default 1200, max 4000)." },
     },
     required: ["query"],
   },
   isReadOnly: true,
   isConcurrencySafe: () => true,
   maxOutputChars: 20_000,
-  timeoutMs: 30_000,
+  timeoutMs: 45_000,  // 检索 + 最多 3 页正文（每页 10s）
   retries: 1,
   validate(input) {
     const q = str(input, "query").trim();
@@ -331,7 +345,8 @@ export const WebSearchTool: Tool = {
       try {
         // 每个后端单独限时：不可达的后端（如被墙的 DDG）不该把整次搜索拖到 10 秒以上。
         // 同时并上 ctx.signal —— 用户按 Esc 要能立刻停。
-        const budget = AbortSignal.timeout(8_000);
+        // 6s：实测不可达的后端（DDG）会一直挂到超时，8s 让整体变得很慢
+        const budget = AbortSignal.timeout(6_000);
         const signal = AbortSignal.any ? AbortSignal.any([ctx.signal, budget]) : budget;
         let raw = await backend.run(query, count, signal, jsonFetch);
         let hits = filterBySite(raw, site);
@@ -349,8 +364,9 @@ export const WebSearchTool: Tool = {
         const total = scored.reduce((acc, x) => acc + x.s, 0);
         const relevant = scored.filter((x) => x.s > 0).length;
         if (!best || total > best.score) best = { backend: backend.name, hits, score: total };
-        // 命中够多就采用，不再试后面的后端（省一次网络往返）
-        if (relevant >= Math.min(3, count) && total > 0) {
+        // 有关键词命中就别再往下试了：后面的后端通常是"更差且更慢"的兜底，
+        // 继续试只会多付一次网络往返（实测 read=3 因为多试了 DDG 拖到 10.7s）。
+        if (relevant >= Math.min(2, count) && total > 0) {
           best = { backend: backend.name, hits, score: total };
           break;
         }
@@ -363,12 +379,34 @@ export const WebSearchTool: Tool = {
       const scored = best.hits.map((h) => ({ h, s: scoreHit(h, terms) }));
       const keep = scored.filter((x) => x.s > 0).map((x) => x.h);
       const use = keep.length ? keep : best.hits;
+
+      // ---- 自动抓正文：把结果页真的读回来，让模型基于内容判断而不是摘要 ----
+      // 并发抓取：串行时 read=2 要 17s，并发后约等于最慢那一页。
+      // 零相关时不要抓正文：那些页本身是垃圾，抓回来既慢又污染上下文
+      const readCount = keep.length === 0 ? 0 : Math.min(3, Math.max(0, num(input, "read", 1)));
+      const perPage = Math.min(4_000, Math.max(300, num(input, "max_chars_per_page", 1_200)));
+      const bodies = await Promise.all(
+        use.slice(0, readCount).map(async (hit) => {
+          // 每页 4s：正常页面 1s 内返回，慢的（实测 python.org）就别等了 —— 抓不到正文
+          // 比整体卡 6 秒更好，模型看到"抓取失败"会自己决定要不要 WebFetch 重试
+          const budget = AbortSignal.timeout(4_000);
+          const signal = AbortSignal.any ? AbortSignal.any([ctx.signal, budget]) : budget;
+          const page = await fetchReadableText(hit.url, { maxChars: perPage, signal, main: true });
+          if (!page.ok) return "   [正文抓取失败: " + (page.reason ?? "unknown").slice(0, 60) + "]";
+          const text = (page.text ?? "").trim();
+          // 少于 200 字基本是 JS 渲染页或反爬页：明说，别让模型以为页面就这么短
+          if (text.length < 200)
+            return "   [正文过短 " + text.length + " 字，可能是 JS 渲染页或需要登录；可用 WebFetch 自行重试]";
+          return "   " + text.replace(/\n/g, "\n   ");
+        }),
+      );
+
       const warn = keep.length
         ? ""
         : "⚠ 没有找到与查询词相关的结果。后端返回的内容与查询无关（可能忽略了查询），" +
           "下面是原文照列，**不要当作检索结果引用**；请改用更具体的关键词、或直接 WebFetch 已知 URL。\n\n";
       return {
-        content: warn + formatHits(use, best.backend, query),
+        content: warn + formatHits(use, best.backend, query, bodies),
         metadata: { backend: best.backend, hits: use.length, relevant: keep.length, terms },
         isError: keep.length === 0 && best.score === 0,
       };

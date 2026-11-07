@@ -135,3 +135,110 @@ test("websearch: irrelevant backend results are flagged, not silently trusted", 
   }
 });
 
+
+test("websearch: read=1 fetches the top result and inlines its body", async () => {
+  const previous = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    calls.push(String(url));
+    if (String(url).includes("format=rss")) {
+      return {
+        ok: true, status: 200,
+        text: async () =>
+          '<rss><channel><item><title>Streams guide</title><link>https://example.com/a</link><description>snip</description></item>' +
+          '<item><title>Streams second</title><link>https://example.com/b</link><description>snip2</description></item></channel></rss>',
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => "text/html" }, text: async () => "<html><body><p>" + "正文内容".repeat(120) + "</p></body></html>" };
+  }) as never as typeof fetch;
+  try {
+    const res = await WebSearchTool.call(
+      { query: "streams guide", count: 2, read: 1 },
+      { signal: new AbortController().signal } as never,
+    );
+    const text = String(res.content);
+    assert.match(text, /--- 正文 ---/, "必须把正文贴出来");
+    assert.match(text, /正文内容正文内容/, "正文要真的来自页面");
+    const pageCalls = calls.filter((u) => !u.includes("format=rss"));
+    assert.equal(pageCalls.length, 1, "read=1 只该抓 1 个页面，实际: " + pageCalls.length);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("websearch: read=0 does not fetch any page", async () => {
+  const previous = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    calls.push(String(url));
+    return {
+      ok: true, status: 200,
+      text: async () => '<rss><channel><item><title>x</title><link>https://example.com/a</link><description>d</description></item></channel></rss>',
+    };
+  }) as never as typeof fetch;
+  try {
+    const res = await WebSearchTool.call({ query: "x", count: 1, read: 0 }, { signal: new AbortController().signal } as never);
+    assert.equal(calls.filter((u) => !u.includes("format=rss")).length, 0, "read=0 不该抓页面");
+    assert.doesNotMatch(String(res.content), /--- 正文 ---/);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("websearch: a failing page fetch is reported, results still returned", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async (url: string) => {
+    if (String(url).includes("format=rss")) {
+      return {
+        ok: true, status: 200,
+        text: async () => '<rss><channel><item><title>node streams</title><link>https://example.com/blocked</link><description>node streams</description></item></channel></rss>',
+      };
+    }
+    return { ok: false, status: 403, headers: { get: () => "text/html" }, text: async () => "denied" };
+  }) as never as typeof fetch;
+  try {
+    const res = await WebSearchTool.call({ query: "node streams", count: 1, read: 1 }, { signal: new AbortController().signal } as never);
+    const text = String(res.content);
+    assert.match(text, /https:\/\/example.com\/blocked/, "检索结果本身不能丢");
+    assert.match(text, /正文抓取失败|正文过短/, "抓取失败要明说");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("websearch: per-page cap is enforced", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async (url: string) => {
+    if (String(url).includes("format=rss")) {
+      return { ok: true, status: 200, text: async () => '<rss><channel><item><title>long page content</title><link>https://example.com/long</link><description>long page content</description></item></channel></rss>' };
+    }
+    return { ok: true, status: 200, headers: { get: () => "text/html" }, text: async () => "<p>" + "长".repeat(5000) + "</p>" };
+  }) as never as typeof fetch;
+  try {
+    const res = await WebSearchTool.call({ query: "long page content", count: 1, read: 1, max_chars_per_page: 400 }, { signal: new AbortController().signal } as never);
+    const text = String(res.content);
+    assert.ok(text.length < 1500, "每页上限 400 字，总输出不该爆: " + text.length);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+
+test("websearch: no page is fetched when nothing is relevant", async () => {
+  const previous = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    calls.push(String(url));
+    return { ok: true, status: 200, text: async () => '<rss><channel><item><title>无关标题</title><link>https://example.com/junk</link><description>无关</description></item></channel></rss>' };
+  }) as never as typeof fetch;
+  try {
+    const res = await WebSearchTool.call({ query: "qzxvbnmkl kjhgfdsa", count: 1, read: 2 }, { signal: new AbortController().signal } as never);
+    assert.equal(res.isError, true);
+    // 注意：要排除的是"抓结果页"，不是"试下一个搜索后端"（DDG 的 URL 也不含 format=rss）
+    assert.equal(calls.filter((u) => u.includes("example.com")).length, 0, "零相关时不该抓正文");
+    assert.doesNotMatch(String(res.content), /--- 正文 ---/);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+

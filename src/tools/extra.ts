@@ -2,7 +2,7 @@
 import { loadSkillBody } from "../core/skills.ts";
 import { WebSearchTool } from "./webSearch.ts";
 import { addMemory, forgetMemory, MAX_MEMORY_CHARS, readMemoryEntries } from "../core/memory.ts";
-import { checkUrl, MAX_REDIRECTS } from "../util/net.ts";
+import { fetchReadableText } from "../util/pageText.ts";
 import { formatJob } from "../core/jobs.ts";
 import { bool, num, str, type Tool } from "./types.ts";
 
@@ -130,71 +130,16 @@ export const WebFetchTool: Tool = {
   },
   async call(input, ctx) {
     const raw = str(input, "url");
-    let parsed: URL;
-    try {
-      parsed = new URL(raw);
-    } catch {
-      return { content: "invalid url: " + raw, isError: true };
-    }
-    const start = await checkUrl(parsed);
-    if (!start.ok) return { content: start.reason ?? "blocked url", isError: true };
-
     const maxChars = Math.min(80_000, Math.max(1000, num(input, "max_chars", 20_000)));
-    try {
-      // 自己跟重定向：只校验初始 URL 是假的，一个 302 就能把请求引到内网。
-      let current = parsed;
-      let res: Response | null = null;
-      for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-        res = await fetch(current, {
-          signal: ctx.signal,
-          headers: { "user-agent": "JYSHarness/0.2 (+https://localhost)", accept: "text/html,text/plain,*/*" },
-          redirect: "manual",
-        });
-        if (res.status < 300 || res.status >= 400) break;
-        const location = res.headers.get("location");
-        if (!location) break;
-        const next = new URL(location, current);
-        const check = await checkUrl(next);
-        if (!check.ok) {
-          return { content: "redirect blocked: " + (check.reason ?? "unsafe target") + " (from " + current.href + ")", isError: true };
-        }
-        current = next;
-        res = null;
-      }
-      if (!res) {
-        return { content: "too many redirects (limit " + MAX_REDIRECTS + ")", isError: true };
-      }
-      const type = res.headers.get("content-type") ?? "";
-      const body = await res.text();
-      const text = /html/i.test(type) ? htmlToText(body) : body;
-      const clipped = text.length > maxChars ? text.slice(0, maxChars) + "\n...[truncated]" : text;
-      return {
-        content: "status=" + res.status + " url=" + current.href + "\n" + clipped,
-        metadata: { status: res.status, bytes: body.length },
-      };
-    } catch (err) {
-      return { content: "fetch failed: " + (err instanceof Error ? err.message : String(err)), isError: true };
-    }
+    // 抓取与正文提取在 util/pageText.ts：WebSearch 抓检索结果正文用的是同一套逻辑
+    const page = await fetchReadableText(raw, { maxChars, signal: ctx.signal });
+    if (!page.ok) return { content: page.reason ?? "fetch failed", isError: true };
+    return {
+      content: "status=" + page.status + " url=" + page.url + "\n" + (page.text ?? ""),
+      metadata: { status: page.status, bytes: page.bytes },
+    };
   },
 };
-
-function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<\/(p|div|section|article|li|tr|h[1-6]|br)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, "\x22")
-    .replace(/&#39;/g, "\x27")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
 
 export const SkillTool: Tool = {
   name: "Skill",

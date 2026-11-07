@@ -1326,6 +1326,51 @@ if (data.config) { appConfig = data.config; if (!silent) renderSettings(data.con
 - **免 key 后端的精度就是它的上限**：Bing RSS 常常只给"入口页"（查 asyncio 给出 python.org 首页）。要精确结果请配 Tavily/Brave/Serper key。
 - 不做结果页正文抓取：那是 `WebFetch` 的职责，两步分开才能让模型自己决定"哪条值得读"。
 - 没有做分页/翻页（`count` 上限 10）。
+## 16.14 检索后自动抓正文：read 参数与正文区提取
+
+`WebSearch` 只给"标题 + 摘要"是不够的：摘要是搜索引擎写的，不是页面的内容。所以加了自动抓正文——**默认抓第 1 条**，`read` 可到 3，`read: 0` 退回纯摘要。
+
+### 三个必须解决的问题（都是实测出来的）
+
+**1. 串行抓取太慢。** 最初 `read=2` 要 **17 秒**（每页 10s 超时串行累加）。改成 `Promise.all` 并发 + 每页 4s 上限后：
+
+| 配置 | 改造前 | 改造后 |
+| --- | --- | --- |
+| `read=0`（纯摘要） | — | **246ms** |
+| `read=1`（默认） | 6–10s | **908ms**（typescriptlang.org）/ 1.45s（python.org 慢站） |
+| `read=3` | **10.7s** | **1.07s** |
+
+**2. 抓回来的"正文"是导航栏。** 直接把整页 HTML 转文本，nodejs.org 得到的是「学习 关于 下载 博客 文档」——比没有更糟，模型会以为页面在讲导航。新增 `extractMainText()`：
+
+1. 先砍 `<script>/<style>/<noscript>`，再砍 `<nav>/<header>/<footer>/<aside>/<form>/<iframe>/<svg>`；
+2. 再砍 class/id 命中 `nav|menu|header|footer|sidebar|breadcrumb|cookie|share|social|comment|related|banner|promo|ads` 的整块；
+3. 优先取 `<article>` 或 `<main>`；没有就取 `<body>`，并且只保留长度 > 60 的段落（最多 12 段）——宁可短不要噪音。
+
+效果对比（nodejs.org）：改造前 `学习 关于 下载 博客 文档 Start typing... ⌘ K`，改造后 `Node.js® 是一个免费、开源、跨平台的 JavaScript 运行时环境…`。typescriptlang.org 直接抓到《Documentation - TypeScript 4.9》里 `The satisfies Operator` 的正文。
+
+**3. 后端降级链本身也在拖时间。** 原来要求"至少 3 条相关"才停止降级，于是拿不到 3 条时还要再试 Bing 的中文/国际两个站点 + DDG（不可达，挂满 8s）。改成"**≥2 条相关就停**"、后端超时 8s→6s 之后，同一查询从 10.7s 降到 1.07s。
+
+### 实现上的几个细节
+
+| 细节 | 做法 | 理由 |
+| --- | --- | --- |
+| 抓取逻辑复用 | `src/util/pageText.ts` 的 `fetchReadableText()`，`WebFetch` 和 `WebSearch` 共用 | 两个工具互相 import 会成环；SSRF 校验、逐跳重定向校验只写一遍 |
+| 零相关不抓正文 | `readCount = keep.length === 0 ? 0 : read` | 垃圾页抓回来既慢又污染上下文 |
+| 正文过短要说清 | `< 200 字` → `[正文过短 N 字，可能是 JS 渲染页或需要登录]` | python.org 返回的是"JS 未执行"的 fallback 页，不说明模型会误判 |
+| 抓取失败要说清 | `[正文抓取失败: …]`，检索结果本身保留 | 一条抓不到不该让整次搜索白跑 |
+| 数字实体 | `&#x27;` `&#39;` 都解码 | 只处理 `&#39;` 会让撇号以 `&#x27;` 形式留在正文里（实测出现过） |
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `query` | — | 关键词；`site` 会拼成 `site:域名` |
+| `count` | 5 | 结果条数（上限 10；Bing RSS 会给 10 条，工具自己截） |
+| `read` | 1 | 抓前几条的正文（0–3） |
+| `max_chars_per_page` | 1200 | 每页正文上限（300–4000） |
+| `site` | — | 域名过滤，**本地实现**（后端会忽略 `site:`） |
+
+离线测试 18 项，覆盖：解析器、实体解码、跳转还原、后端顺序、降级、打分、site 过滤、零相关告警、`read=1` 抓正文并内联、`read=0` 不抓页、抓取失败上报、每页上限、零相关不抓页。全部不联网。
 ## 17. 下一步
 
 按收益/成本排序：
