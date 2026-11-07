@@ -87,7 +87,7 @@ cd harness
 | **Hooks 语义** | 多钩子按 **deny > ask > allow** 合并（后写的 allow 不能取消前面的 deny）；matcher 编译失败只影响该条；超时夹在 0.1–60s |
 | **成本核算** | 按模型定价估算 USD，顶栏实时显示 |
 | **WebSearch** | 按关键词搜网页，并**自动抓前 N 条正文**（默认 1 条，并发抓取、每页 4s 上限、只提正文区）。后端有序降级：Tavily/Brave/Serper（配 key）→ Bing RSS → DuckDuckGo；**自己按查询词打分过滤**、**本地实现 site: 过滤**（免 key 后端会忽略它），零相关时先警告再列原文且不抓正文 |
-| **WebFetch** | 抓取网页转文本，阻断 loopback/私网地址（SSRF） |
+| **WebFetch** | 抓取**已知 URL** 转文本。默认只留正文区（`full: true` 保留整页），HTML 剥标签、JSON/纯文本原样返回，阻断 loopback/私网地址（SSRF）并逐跳校验重定向 |
 | **图片输入** | 粘贴/选择图片，base64 走 Anthropic image block 或 OpenAI image_url |
 | **沙箱后端** | 子进程环境清洗 + **Windows 低完整性令牌 + Job Object**（内核强制：写隔离 + 内存/进程上限）/ Linux bwrap / macOS seatbelt |
 | **强制可见性** | 顶栏显示「⚠ 沙箱未强制」：模式是意图，`sandboxEnforcement` 报告实际后端；沙箱不可用时绝不假装有内核保护 |
@@ -119,7 +119,7 @@ cd harness
 | `TodoWrite` | 维护任务清单 | ❌ |
 | `JobOutput` `JobKill` `JobList` | 后台任务读取/终止/列表 | ✅/❌ |
 | `WebSearch` | 搜网页 + 自动抓正文（`read` 默认 1） | ✅ |
-| `WebFetch` | 抓网页 | ✅ |
+| `WebFetch` | 抓已知 URL（默认只留正文） | ✅ |
 | `Skill` | 加载技能正文 | ✅ |
 | `mcp__<server>__<tool>` | 任意 MCP 工具，启动时自动发现 | 由 `readOnlyHint` 决定 |
 
@@ -301,13 +301,13 @@ jys plugin test                # 加载校验，出错返回非 0
 ```bash
 npm install       # 只为开发期工具链（运行时零依赖）
 npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
-npm test          # 304 个单元/集成测试（自动发现 tests/*.test.ts）
+npm test          # 311 个单元/集成测试（自动发现 tests/*.test.ts）
 npm run typecheck # tsc --strict，src 必须 0 error
 npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
 npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**304 个测试**，分二十四组：
+**311 个测试**，分二十四组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销

@@ -1371,6 +1371,46 @@ if (data.config) { appConfig = data.config; if (!silent) renderSettings(data.con
 | `site` | — | 域名过滤，**本地实现**（后端会忽略 `site:`） |
 
 离线测试 18 项，覆盖：解析器、实体解码、跳转还原、后端顺序、降级、打分、site 过滤、零相关告警、`read=1` 抓正文并内联、`read=0` 不抓页、抓取失败上报、每页上限、零相关不抓页。全部不联网。
+## 16.15 WebFetch 与 WebSearch 的关系
+
+两者不是替代关系，是**检索**和**读取**的分工，共用同一套抓取实现。
+
+| | WebSearch | WebFetch |
+| --- | --- | --- |
+| 输入 | 关键词 | **具体 URL** |
+| 回答的问题 | "哪个页面可能有用" | "这个页面上写了什么" |
+| 输出 | 标题 + URL + 摘要（+ 自动抓的前 N 条正文） | 该页面的正文文本 |
+| 什么时候用 | 不知道 URL 时 | 已有 URL（文档页、GitHub raw、API 端点、日志） |
+| 默认正文范围 | 正文区（`read` 条，每页 1200 字） | 正文区（`full: true` 保留整页，默认 20000 字） |
+| 上限 | 20k 字符 / 45s | 60k 字符 / 30s |
+
+### 共用实现：`src/util/pageText.ts`
+
+`fetchReadableText(url, { maxChars, signal, main })` 是唯一抓取入口，两个工具都调它：
+
+- `WebFetch` → `main: !full`（默认正文区）
+- `WebSearch` 的自动抓正文 → `main: true` + 每页 4s 超时 + 并发
+
+这样 SSRF 校验（`checkUrl`：字面黑名单 + DNS 解析后 IP 检查）和**逐跳重定向校验**只写一遍——只校验初始 URL 是假的，一个 302 就能把请求引到内网。
+
+### 为什么 WebFetch 也改成默认只取正文
+
+实测同一页（TypeScript 4.9 release notes，270KB HTML）：
+
+| 提取方式 | 长度 | `satisfies` 出现在第几个字符 |
+| --- | --- | --- |
+| `htmlToText`（整页） | 24529 | **2637**（前面全是导航、语言切换、侧栏） |
+| `extractMainText`（正文区） | 19968 | **4** |
+
+用 `max_chars: 700` 抓这页时，整页模式返回的 700 字符**全是导航**——模型会以为页面没有内容。所以默认改成正文区，需要整页（列表、表格、侧栏）时显式 `full: true`。
+
+### 典型用法串联
+
+```
+WebSearch("typescript satisfies operator")       # 拿到候选 URL（并自动读了第 1 条正文）
+WebFetch("https://www.typescriptlang.org/docs/...")  # 需要更长的正文时再抓整页
+WebFetch("https://registry.npmjs.org/is-number")     # JSON 原样返回，不经过 HTML 剥标签
+```
 ## 17. 下一步
 
 按收益/成本排序：

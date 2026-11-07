@@ -109,12 +109,20 @@ export const WebFetchTool: Tool = {
   name: "WebFetch",
   description:
     "Fetch an http(s) URL and return readable text (HTML is stripped). " +
-    "Private/loopback hosts are blocked. Output is capped; use it for docs and pages.",
+    "Private/loopback hosts are blocked. By default only the main content area is kept " +
+    "(nav/header/footer/sidebar are dropped) — set full=true to keep the whole page. " +
+    "Output is capped; use it for docs, API pages and raw files.",
   inputSchema: {
     type: "object",
     properties: {
       url: { type: "string" },
       max_chars: { type: "number", description: "Cap on returned characters (default 20000)." },
+      full: {
+        type: "boolean",
+        description:
+          "Keep the whole page instead of the main content area. Use it when the interesting part " +
+          "is a listing, table or sidebar, not the article body.",
+      },
     },
     required: ["url"],
   },
@@ -132,7 +140,9 @@ export const WebFetchTool: Tool = {
     const raw = str(input, "url");
     const maxChars = Math.min(80_000, Math.max(1000, num(input, "max_chars", 20_000)));
     // 抓取与正文提取在 util/pageText.ts：WebSearch 抓检索结果正文用的是同一套逻辑
-    const page = await fetchReadableText(raw, { maxChars, signal: ctx.signal });
+    // 默认只取正文区：实测文档站整页文本里正文在第 2637 字符，前 700 字符全是导航，
+    // 模型会以为页面没有内容。要整页就显式 full=true。
+    const page = await fetchReadableText(raw, { maxChars, signal: ctx.signal, main: !bool(input, "full", false) });
     if (!page.ok) return { content: page.reason ?? "fetch failed", isError: true };
     return {
       content: "status=" + page.status + " url=" + page.url + "\n" + (page.text ?? ""),
