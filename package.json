@@ -23,7 +23,9 @@
     "install-shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop.ps1",
     "typecheck": "tsc -p tsconfig.json",
     "check": "node src/cli/main.ts check --entropy --types",
-    "verify": "node scripts/verify-crash.ts && node scripts/verify-concurrency.ts && node scripts/verify-images.ts && node scripts/verify-long-session.ts && node scripts/verify-sandbox.ts && node scripts/verify-cost.ts"
+    "verify": "node scripts/verify-crash.ts && node scripts/verify-concurrency.ts && node scripts/verify-images.ts && node scripts/verify-long-session.ts && node scripts/verify-sandbox.ts && node scripts/verify-cost.ts",
+    "bench": "node src/bench/main.ts --mode=scripted",
+    "bench:real": "node src/bench/main.ts --mode=real"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

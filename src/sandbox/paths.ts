@@ -119,6 +119,26 @@ export function guardPath(
   }
 
   if (!inside) {
+    // 工作区外的**写入**必须硬拒绝，不能只是"问一下"。
+    //
+    // 原因：ask 只要调用方自动批准（-y / bypassPermissions / 无人值守）就变成 allow，
+    // 于是"workspace-write"这个承诺在无人值守场景下**根本不成立** —— 更糟的是，
+    // 同一条越界写入用 Bash 会被内核拦住，用 Write 工具却能成功，两种路径不一致。
+    // 真要在外面写，正确做法是把沙箱模式切到 danger-full-access（那是一句显式的人的决定）。
+    if (opts.access === "write") {
+      return {
+        decision: {
+          behavior: "deny",
+          reason: "tool_check_deny",
+          message:
+            "Refusing to write outside the workspace (" +
+            workspaceRoot +
+            "). Switch sandbox mode to danger-full-access if this is really intended.",
+        },
+        resolved,
+      };
+    }
+    // 读取工作区外仍然只是"问一下"：读的风险远小于写，没必要一刀切
     return {
       decision: {
         behavior: "ask",

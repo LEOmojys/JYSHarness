@@ -15,6 +15,9 @@ dist/
 *.log
 *.tmp
 
+# ---- 基准报告（每次运行生成，含本机路径与时间戳；数字已写进 ARCHITECTURE）----
+bench/reports/
+
 # ---- 演示用仓库（含嵌套 git 仓库与 worktree，按需自行 git init）----
 demo-projects/
 # 演示运行产生的输出

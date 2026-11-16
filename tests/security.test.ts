@@ -97,8 +97,14 @@ test("security: path containment survives traversal and symlinks", () => {
   for (const probe of probes) {
     const verdict = guardPath(probe, { access: "write", policy });
     assert.ok(verdict.decision, "must not be silently allowed: " + probe);
-    assert.equal(verdict.decision!.behavior, "ask");
+    // 工作区外的**写入**必须是 deny，不能只是 ask：ask 在自动批准场景下等于放行，
+    // 而同一条越界写入走 Bash 会被内核拦住 —— 两种路径必须一致（由 bench 的
+        // sandbox-escape 任务发现）。
+    assert.equal(verdict.decision!.behavior, "deny", "outside write must be denied: " + probe);
   }
+  // 读取工作区外仍然只是 ask（读的风险小，不必一刀切）
+  const readVerdict = guardPath(path.join(os.tmpdir(), "somewhere.txt"), { access: "read", policy });
+  assert.equal(readVerdict.decision!.behavior, "ask");
   // 工作区内部正常放行
   assert.equal(guardPath(path.join(root, "ok.txt"), { access: "write", policy }).decision, null);
 });
@@ -254,6 +260,8 @@ test("security: no permission mode silently allows writes outside the workspace"
       },
       { mode, rules: emptyRuleSet(), sandboxMode: "workspace-write", workspaceRoot: root },
     );
-    assert.equal(d.behavior, "ask", mode + " -> " + d.behavior);
+    // 以前断言的是 ask（"不静默放行"），但 ask 一旦被自动批准就等于放行 ——
+    // 于是 workspace-write 在无人值守场景形同虚设。现在要求 deny。
+    assert.equal(d.behavior, "deny", mode + " -> " + d.behavior);
   }
 });

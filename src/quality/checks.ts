@@ -129,10 +129,18 @@ const LAYER_RULES: { from: RegExp; forbid: RegExp; why: string }[] = [
   { from: new RegExp("^src/(sandbox|permissions)/"), forbid: new RegExp("^src/(tools|server|cli)/"), why: "安全原语不得依赖被它约束的对象" },
 ];
 
+/**
+ * 基准任务集里的"测试文件内容"是**字符串数据**，里面的 import 指向的是基准任务
+ * 临时工作区里才会生成的文件，跟本仓库依赖图无关。实测会报 9 条 imports.resolve 假阳性，
+ * 所以这里按目录排除（只排除路径解析这一条规则，不跳过其它检查）。
+ */
+const FIXTURE_ONLY_DIRS = [/^src\/bench\//];
+
 function checkImports(root: string, sources: string[]): Finding[] {
   const findings: Finding[] = [];
   for (const abs of sources) {
     const relPath = rel(root, abs);
+    if (FIXTURE_ONLY_DIRS.some((re) => re.test(relPath))) continue;
     let text: string;
     try {
       text = readFileSync(abs, "utf8");
