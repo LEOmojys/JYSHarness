@@ -1529,6 +1529,61 @@ node src/bench/main.ts --mode=external --cmd="claude -p \"$BENCH_PROMPT\""
 2. **无并行/多会话/长跑任务**：这些由 `npm run verify`（52 项）单独覆盖，不在这套 bench 里；
 3. **判分是二值**：只判"对/错"，不判"改得优雅"（没做 diff 质量、可维护性评分）；
 4. **external 模式拿不到 token/成本**：外部 CLI 不一定吐用量，那几列会是 0，比较时只能比 pass 与耗时。
+## 16.18 SWE-bench Verified：无 Docker 的复现路径（与它的三条自检）
+
+`--mode=verified` 用 **SWE-bench Verified**（500 条真实 issue）评测。官方 harness 依赖 Docker 镜像保证环境完全一致；这台机器没有 Docker，所以实现了一条本地复现路径，并把**保真度的每一处妥协都显式记录下来**。
+
+### 流程（与官方口径对齐）
+
+```
+HF datasets-server（经代理）→ 选实例 → shallow fetch 到 base_commit → venv（按官方 spec 的 Python 版本）
+  → 按官方 pins 锁依赖 → 模型干活 → git diff 取 patch → 复位 → 应用模型 patch → 应用官方 test_patch
+  → pytest --no-header -rA --tb=no -p no:cacheprovider <F2P ∪ P2P> → 解析 PASSED/FAILED
+  → F2P 全过且 P2P 不回归 = resolved
+```
+
+判分口径与官方一致：**同样的 test_patch、同样的 F2P/P2P 集合、同样的 pytest 调用形态**。差别只在环境构建方式（本地 venv vs 官方镜像）。
+
+### 三条自检（缺一条，分数就不可信）
+
+**自检 1：gold patch 必须通过。** 每条实例判分前，先用官方 `patch` 跑一遍；不过就说明环境坏了，直接跳过该实例而不是记 0 分。这条自检抓到了三个真问题：
+
+| 问题 | 现象 | 原因 |
+| --- | --- | --- |
+| pytest 版本太新 | 所有用例 ERROR | 仓库存 `requirements_test.txt` 锁了旧 pytest，`pip install pytest` 装了最新版，老 conftest 用的 `monkeypatch.notset` 已被移除 |
+| Werkzeug 版本太新 | 所有用例 ERROR | Flask 2.3 用 `werkzeug.__version__`，Werkzeug 3.x 已删除该属性；官方 spec 明确锁 `Werkzeug==2.3.7` |
+| **判分器自己** | gold patch 被判 0/1 | pytest `-rA` 输出是 `PASSED path::test`（状态在前），解析器只写了 `FAILED path::test` |
+
+第三个最有价值：如果不强制 gold 通过，这个 bug 会让**所有实例都显示 0%**，而人还以为"模型不行"。
+
+**自检 2：Python 版本必须按实例来。** 官方 spec 里 flask 2.3 是 3.11、pylint 是 3.9、django 1.11 是 3.5。本机只有 3.12，用 conda 建了 3.9/3.11；**没有对应版本就直接跳过并说明原因**，绝不拿错版本算分。
+
+**自检 3：测试文件不可被模型改写。** 取完 patch 后 `git clean -fd -e .venv -e .harness` + `git checkout -- .` 复位，再重新应用"模型 patch + 官方 test_patch"，等价于官方流程（模型改测试等于自己改卷子）。
+
+### 实测（本机，deepseek-flash，maxTurns=30）
+
+| 实例 | 仓库/版本 | F2P | 结果 | 模型动作 |
+| --- | --- | --- | --- | --- |
+| `pallets__flask-5014` | flask 2.3 | 1 | **RESOLVED** ✓ | 33 次工具、5 行 patch、72s |
+| `pylint-dev__pylint-4661` | pylint 2.10 | 1 | 未解决（无 patch） | 36 次工具全在读，30 轮内没落笔、225s |
+| `pylint-dev__pylint-6386` | pylint 2.14 | 1 | 未解决（无 patch） | 同上，143s |
+
+**pass@1 = 1/3**。这个数字只代表"3 条实例 + 30 轮预算"，不能外推到 500 条的官方通过率——而且两条失败都是「预算内没动手」，不是判分问题。
+
+### 与官方榜单的差距（必须说明）
+
+| 维度 | 官方 harness | 本实现 |
+| --- | --- | --- |
+| 环境 | 每条实例独立 Docker 镜像（Python/系统库/依赖全固定） | 本机 venv + 官方 pins；**系统库无法固定** |
+| 支持范围 | 12 个仓库、500 条 | 仅 pytest 型实例 + 本机有对应 Python 的版本（当前 flask/pylint/pytest 一部分） |
+| 判分 | 官方 log parser | 自己解析 `-rA`（已用 gold patch 校准） |
+| 并发/时长 | 大规模并行 | 串行，每条 2–5 分钟（克隆+装依赖+模型） |
+
+### 要在本机跑完整 500 条，需要什么
+
+1. **Docker Desktop**（或 Linux 主机）→ 直接用官方 `swebench` 包：`python -m swebench.harness.run_evaluation --predictions <file> --run_id ...`；
+2. 或至少装齐 Python 3.5/3.6/3.7/3.8/3.9/3.10/3.11（conda 可建，但 django 1.11 的 3.5 轮子已难获取）；
+3. 每条实例的 `predictions.jsonl`：本适配器已能产出（`bench/swe-work/<id>.patch`），格式是 `{"instance_id","model_patch","model_name_or_path"}`，可直接喂给官方 harness。
 ## 17. 下一步
 
 按收益/成本排序：

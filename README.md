@@ -96,6 +96,7 @@ cd harness
 | **插件模式** | `.harness/plugins/` 下的项目插件：注册专属工具、进程内 hook、提示段落与内存技能；坏插件只隔离不致命，entry 不能逃出插件目录；**与内置工具重名会被报告**（不是静默丢弃） |
 | **技能索引预算** | 系统提示只列**最多 40 个**技能（简介截断 140 字），其余折叠一行；未列出的技能仍可按精确名字加载 —— 索引是每轮固定成本，必须封顶 |
 | **思考过程** | 推理模型（deepseek-flash / r1 / Anthropic thinking）的推理流以折叠块展示，默认收起、显示字数；**不发回模型、不计入上下文**，但保留在转录里（刷新后仍在） |
+| **SWE-bench Verified** | `--mode=verified`：无 Docker 本地复现（shallow clone + 按官方 spec 的 Python/依赖 + 官方 test_patch 判分），带 **gold patch 自检**。实测 3 条：flask 实例 RESOLVED、两条 pylint 预算内未落笔 |
 | **量化基准** | `npm run bench`（接线，8/8）· `npm run bench:real`（真模型，8/8，$0.0077/任务）· `--mode=external --cmd=...` 让 dsh 等平台跑同一套任务、同一判分器 |
 | **真模型验证** | 已用 DeepSeek 兼容端点（`deepseek-flash`）跑通：`HARNESS_E2E_REAL=1 npm run e2e` **24/24**；桌面端 4 秒完成 Write→Read，成本 $0.0021、缓存命中 39% |
 | **响应式布局** | 桌面窗口可任意缩放（Chromium app 模式，尺寸由 profile 记住）；≤1280 隐藏冗余标签、≤920 侧栏收窄、≤768 侧栏变 ☰ 抽屉、≤560 控件紧凑 |

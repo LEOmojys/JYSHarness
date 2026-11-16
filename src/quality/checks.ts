@@ -45,7 +45,9 @@ const CR = String.fromCharCode(13);
 const TAB = String.fromCharCode(9);
 const BACKTICK = String.fromCharCode(96);
 
-const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".harness", ".idea"]);
+// 基准工作目录（bench/swe-work）里是每个 SWE-bench 实例的 clone + venv，动辄上万文件；
+// 它们不是本仓库源码，必须排除，否则结构检查会被几万个第三方文件拖慢并报无关问题。
+const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".harness", ".idea", "swe-work", "venv", ".venv"]);
 
 function splitLines(text: string): string[] {
   return text.split(NL).map((l) => (l.endsWith(CR) ? l.slice(0, -1) : l));
