@@ -5,9 +5,40 @@
  * block is a stable prefix — that is what keeps prompt caching effective when
  * MCP/extension tools are added or removed.
  */
+import path from "node:path";
 import type { Tool, ToolResult, ToolContext } from "./types.ts";
+import { guardPath } from "../sandbox/paths.ts";
 import { DEFAULT_MAX_OUTPUT_CHARS, truncateOutput, validateAgainstSchema } from "./types.ts";
 
+/**
+ * 给插件/扩展工具兜底加路径守卫。
+ *
+ * 为什么必须在框架层做：插件工具直接调 `api.registerTool({...})`，如果作者忘了写
+ * `toolCheck`，它的写入就**完全绕过** `guardPath` —— 插件能写工作区外，而内置 Write 不能。
+ * 这种"能力因作者是否细心而不同"的差异，等于把沙箱承诺交给了第三方自觉。
+ *
+ * 做法：工具 schema 里出现常见的路径参数名、且自己没声明 toolCheck 时，注入一个
+ * 基于 `guardPath` 的校验；只校验"看起来像路径"的参数，避免误伤普通字符串参数。
+ */
+const PATH_INPUT_KEYS = ["file_path", "path", "target", "dest", "file", "filename"];
+
+export function withDefaultsPathGuard(tool: Tool): Tool {
+  if (tool.toolCheck) return tool;
+  const props = (tool.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
+  const key = PATH_INPUT_KEYS.find((k) => k in props);
+  if (!key) return tool;
+  const access: "read" | "write" = tool.isReadOnly ? "read" : "write";
+  return {
+    ...tool,
+    toolCheck: (input, ctx) => {
+      const raw = input[key];
+      if (typeof raw !== "string" || !raw.trim()) return null;
+      // 交回调用方（权限引擎）判断：这里只产出"越界"这一条事实
+      const abs = path.isAbsolute(raw) ? raw : path.resolve(ctx.cwd, raw);
+      return guardPath(abs, { access, policy: ctx.sandbox }).decision;
+    },
+  };
+}
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
 
@@ -37,7 +68,8 @@ export class ToolRegistry {
   /** Built-ins first (sorted), extension tools appended (sorted), deduped. */
   assemble(extensionTools: Tool[] = []): Tool[] {
     const builtin = [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name));
-    const ext = [...extensionTools].sort((a, b) => a.name.localeCompare(b.name));
+    // 扩展工具（插件/MCP）统一兜底路径守卫：作者没写 toolCheck 也不能绕过沙箱
+    const ext = extensionTools.map((t) => withDefaultsPathGuard(t)).sort((a, b) => a.name.localeCompare(b.name));
     const seen = new Set<string>();
     const out: Tool[] = [];
     for (const t of [...builtin, ...ext]) {

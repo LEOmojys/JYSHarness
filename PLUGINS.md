@@ -157,3 +157,62 @@ jys --agent-mode makePlugin         # 打开桌面端，进入插件开发模式
 ## 分发
 
 插件是工作区的一部分（`.harness/plugins/`），跟着仓库走；也可以放到 `~/.jysharness/plugins/` 作为你自己的常用工具箱。
+
+## 插件能配置到什么程度（实测）
+
+下面这些都是**已经跑通并验证过**的，不是设计设想。
+
+### 三种扩展形态
+
+| 形态 | 放哪里 | 适合什么 | 隔离 |
+| --- | --- | --- | --- |
+| **项目插件** | `<workspace>/.harness/plugins/<name>/` | 只属于这个项目的工具/约定/hook | 同进程 |
+| **用户插件** | `~/.jysharness/plugins/<name>/`（`HARNESS_HOME` 可改） | 跨项目通用（个人习惯、公司规范） | 同进程 |
+| **MCP 服务器** | settings 里的 `mcpServers` | 进程外扩展、换语言、独立升级 | 独立进程 |
+
+前两种是同一个 API（`activate(api)`），区别只是生效范围；第三种走 MCP 协议，工具名自动加 `mcp__<server>__` 前缀。
+
+### 插件能拿到什么（`PluginApi`）
+
+```ts
+api.registerTool({...})        // 新工具，和内置工具走同一条 权限→审计 管道
+api.on("PreToolUse", fn)       // 进程内 hook：可直接 deny 一次调用
+api.addSkill({...})            // 内存技能（不落文件）
+api.addPromptSection(text)     // 固定提示段落（每轮都在，适合放团队约定）
+api.log(msg)                   // 打到 serve/desktop 控制台
+```
+
+外加清单里的 `skills: "skills/"` 可以随插件分发**文件技能**（每个 `*.md` 一个 `SKILL.md` 格式）。
+
+### 实测：一个插件四件套全生效
+
+写了一个 `team-conventions` 插件（工具 + hook + 内存技能 + 文件技能 + 提示段落），用真模型跑：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 加载 | `tools=1 skills=2 hooks=1`，`errors` 为空 |
+| 工具被模型调用 | 模型主动调 `team_iso_now`，返回 `2026-11-17T18:06:09Z` |
+| hook 拦截 | 让模型写 `secrets.env` → 插件返回 deny → **文件不存在** |
+| 技能 | 内存技能 `changelog` + 文件技能 `release-note` 都进了技能索引 |
+| 提示段落 | 进入系统提示，每轮都在 |
+
+外部 MCP 也验证过：一个 30 行的 Node MCP server 暴露 `deploy_window`，被注册成 `mcp__team__deploy_window`，调用返回正确结果。
+
+### 这次补上的一个安全缺口
+
+**插件工具原来不走 `guardPath`**。插件自己没写 `toolCheck` 时，它能写工作区外——而内置 `Write` 不能。等于"沙箱承诺取决于第三方作者是否细心"。
+
+修法：`ToolRegistry.assemble()` 对**所有扩展工具**（插件 + MCP）兜底注入路径校验：若 schema 里有 `file_path` / `path` / `target` 等路径参数且工具未自定义 `toolCheck`，就自动接上 `guardPath`（只读工具按 read 判、其余按 write 判）。
+
+四条测试锁住：注入生效、插件自己的 `toolCheck` 不被覆盖、没有路径参数的工具不乱加、`bypassPermissions` 下插件越界写入仍被 deny。
+
+### 仍然没有的（写插件前要知道）
+
+| 缺口 | 影响 |
+| --- | --- |
+| **没有插件市场/安装命令** | 只能手动放进目录；`jys plugin list` 能看状态、能启用/禁用 |
+| **同进程、无沙箱** | 插件代码直接跑在 harness 进程里，能 `import` 任意模块、能读环境变量。**只装你信任的插件** |
+| **没有版本兼容声明** | manifest 的 `version` 只是展示，不校验平台兼容性 |
+| **没有权限清单** | 插件不需要声明"我要读网络/写文件"，装上就拥有进程的全部能力 |
+| **MCP 走子进程但仍然全权** | 工具调用本身受权限管道约束，但 server 进程自身不受沙箱限制 |
+
