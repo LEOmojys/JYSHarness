@@ -93,7 +93,8 @@ cd harness
 | **强制可见性** | 顶栏显示「⚠ 沙箱未强制」：模式是意图，`sandboxEnforcement` 报告实际后端；沙箱不可用时绝不假装有内核保护 |
 | **规则编辑器** | 侧栏直接增删 allow/deny/ask 规则，写回 settings.json 并立即对所有会话生效 |
 | **桌面安装器** | 一条命令在桌面创建快捷方式，双击即开 |
-| **插件模式** | `.harness/plugins/` 下的项目插件：注册专属工具、进程内 hook、提示段落与内存技能；坏插件只隔离不致命，entry 不能逃出插件目录；**与内置工具重名会被报告**（不是静默丢弃） |
+| **插件模式** | `.harness/plugins/` 下的项目插件：注册专属工具、进程内 hook、提示段落与内存技能；坏插件只隔离不致命，entry 不能逃出插件目录；**与内置工具重名会被报告**（不是静默丢弃）；**扩展工具自动兜底路径守卫**（作者漏写 `toolCheck` 也不能越界） |
+| **DSH 兼容** | 技能格式通用（扁平 `*.md` + frontmatter，支持 `whenToUse`/`enabled`），`jys skill import-dsh <dir>` 一条命令导入（实测 23 个全通）；MCP 配置两边通用；前端 client-plugin 不兼容 |
 | **技能索引预算** | 系统提示只列**最多 40 个**技能（简介截断 140 字），其余折叠一行；未列出的技能仍可按精确名字加载 —— 索引是每轮固定成本，必须封顶 |
 | **思考过程** | 推理模型（deepseek-flash / r1 / Anthropic thinking）的推理流以折叠块展示，默认收起、显示字数；**不发回模型、不计入上下文**，但保留在转录里（刷新后仍在） |
 | **冲突解决（可选）** | `jys worktree merge … --resolve-with-agent`：冲突交给 agent 解决，**解完必须通过 `--verify` 才提交**，否则回滚；默认关闭 |
@@ -306,13 +307,13 @@ jys plugin test                # 加载校验，出错返回非 0
 ```bash
 npm install       # 只为开发期工具链（运行时零依赖）
 npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
-npm test          # 341 个单元/集成测试（自动发现 tests/*.test.ts）
+npm test          # 345 个单元/集成测试（自动发现 tests/*.test.ts）
 npm run typecheck # tsc --strict，src 必须 0 error
 npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
 npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**341 个测试**，分二十四组：
+**345 个测试**，分二十四组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销

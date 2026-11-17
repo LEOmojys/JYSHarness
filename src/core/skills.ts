@@ -25,6 +25,8 @@ export interface SkillMeta {
    * 它会作为提示交给模型（告诉它这个技能本来打算用哪些工具）。
    */
   allowedTools?: string[];
+  /** 原始 whenToUse（已并入 description，这里保留原文给 UI 展示） */
+  whenToUse?: string;
 }
 
 const MAX_BODY = 60_000;
@@ -38,10 +40,24 @@ export function skillDirs(workspaceRoot: string): { dir: string; source: "projec
   ];
 }
 
-export function parseFrontmatter(text: string): { name?: string; description?: string; allowedTools?: string[] } {
+export interface SkillFrontmatter {
+  name?: string;
+  description?: string;
+  allowedTools?: string[];
+  /**
+   * DSH 技能格式里的触发条件（"什么时候该用我"）。
+   * JYSHarness 原来忽略它，可 DSH 的技能 23/23 都写了这个字段 —— 忽略等于丢掉
+   * 最有价值的一行信息：模型选技能靠的就是"这个场景要不要用它"。
+   */
+  whenToUse?: string;
+  /** 是否启用。DSH 用 enabled: false 停用一个技能，我们也该尊重。 */
+  enabled?: boolean;
+}
+
+export function parseFrontmatter(text: string): SkillFrontmatter {
   const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
   if (!m) return {};
-  const out: { name?: string; description?: string; allowedTools?: string[] } = {};
+  const out: SkillFrontmatter = {};
   for (const line of m[1].split(/\r?\n/)) {
     const kv = /^([A-Za-z_-]+):\s*(.*)$/.exec(line.trim());
     if (!kv) continue;
@@ -50,6 +66,9 @@ export function parseFrontmatter(text: string): { name?: string; description?: s
     const value = kv[2].replace(/^["\x27]|["\x27]$/g, "");
     if (key === "name") out.name = value;
     if (key === "description") out.description = value;
+    // whenToUse（DSH/Claude 风格）与 when-to-use / when_to_use 都认
+    if (key === "whentouse" || key === "when-to-use") out.whenToUse = value;
+    if (key === "enabled") out.enabled = !/^(false|0|no|off)$/i.test(value.trim());
     if (key === "allowed-tools") {
       out.allowedTools = value
         .split(",")
@@ -101,14 +120,25 @@ export function discoverSkillsWithWarnings(workspaceRoot: string): SkillDiscover
         warnings.push("技能名重复，已忽略：" + name + "（来源 " + source + "，路径 " + abs + "）");
         continue;
       }
+      // enabled: false（DSH 的停用写法）：跳过但不报错，记一条提示让人知道是被关掉的
+      if (meta.enabled === false) {
+        warnings.push(name + ": 已停用（enabled: false），已跳过");
+        continue;
+      }
       if (!meta.description) warnings.push(name + ": 缺少 description（模型只能看到名字，通常不会选中它）");
       seen.add(name);
+      // 把 whenToUse 拼到描述后面：DSH 技能把"何时使用"单独写在 frontmatter 里，
+      // 只忽略它会让模型少一条最关键的判断依据。
+      const desc = (meta.description ?? "").trim();
+      const when = (meta.whenToUse ?? "").trim();
+      const merged = when ? (desc ? desc + "（何时使用：" + when + "）" : "（何时使用：" + when + "）") : desc;
       found.push({
         name,
-        description: (meta.description ?? "").trim(),
+        description: merged,
         dir: abs,
         source,
         allowedTools: meta.allowedTools,
+        whenToUse: meta.whenToUse,
       });
     }
   }

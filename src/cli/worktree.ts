@@ -29,7 +29,8 @@ export async function runWorktree(argv: string[], workspace: string): Promise<nu
     console.error("当前目录不在 git 仓库里：" + workspace);
     return 2;
   }
-  const action = argv[0] ?? "list";
+  // 同 runSkill：跳过前置 flag（jys --workspace X worktree list）
+  const action = argv.find((x, i) => !x.startsWith("--") && !String(argv[i - 1] ?? "").startsWith("--")) ?? "list";
   const rest = argv.slice(1);
   const flag = (name: string) => {
     const i = rest.indexOf("--" + name);

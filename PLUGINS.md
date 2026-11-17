@@ -216,3 +216,62 @@ api.log(msg)                   // 打到 serve/desktop 控制台
 | **没有权限清单** | 插件不需要声明"我要读网络/写文件"，装上就拥有进程的全部能力 |
 | **MCP 走子进程但仍然全权** | 工具调用本身受权限管道约束，但 server 进程自身不受沙箱限制 |
 
+
+## 与 DSH 的兼容性（实测）
+
+结论：**技能天然兼容（已跑通），MCP 通用，DSH 的前端客户端插件不兼容。**
+
+### 技能：直接可用（不是"能转换"，是"能读"）
+
+DSH 的技能格式是**扁平 `*.md` + frontmatter**：
+
+```yaml
+---
+name: active-scan
+description: 主动端口与服务扫描（nmap/masscan），严格遵守授权范围
+whenToUse: 需要确认资产存活与开放端口时
+role: recon
+enabled: true
+---
+## 前置检查
+...
+```
+
+JYSHarness 的技能发现本来就认扁平 `.md`，所以两个格式在文件层面就是同一件事。差别只在 frontmatter 的两个字段：
+
+| 字段 | 之前 | 现在 |
+| --- | --- | --- |
+| `whenToUse` | 被忽略（可 DSH 的 23 个技能**全部**写了它） | 解析并**并入 description**：`主动端口与服务扫描（何时使用：需要确认资产存活…）` |
+| `enabled: false` | 被忽略（停用的技能照样加载） | **跳过**并提示"已停用" |
+| `role` | 忽略 | 忽略（仅分类信息，对行为无影响） |
+
+### 导入命令
+
+```bash
+jys skill import-dsh "~/.dsh/redteam/skills" --to project   # 进当前项目
+jys skill import-dsh <dir> --to user                        # 进用户级（所有项目）
+jys skill list                                              # 看当前可见的技能
+```
+
+实测：把 DSH 真实目录 `~/.dsh/redteam/skills` 的 **23 个技能**导入临时工作区 → `复制 23 个` → `skill list` 全部可见、`whenToUse` 已并入描述；再导一次是 `复制 0 个，跳过 23 个`（幂等，不覆盖用户改过的版本）。
+
+### MCP：同一份配置两边都能用
+
+JYSHarness 的 `mcpServers` 就是标准 MCP 配置（`command` + `args` + `env`），与 DSH/Claude 一侧的写法一致。实测用 30 行的 Node MCP server 验证过：工具注册为 `mcp__<server>__<tool>`，调用返回正确结果。所以基于 MCP 的扩展两边通用。
+
+### 不兼容的部分（要说清）
+
+| DSH 侧 | 能否复用 | 原因 |
+| --- | --- | --- |
+| **客户端插件（client-plugin）** | ❌ | DSH 的前端插件是打进 `apps/web` 的 React/TS 包，走 HMR 注入 `window.__DSH_BOOT__`；JYSHarness 的 UI 是无构建的经典脚本，两套渲染模型不同 |
+| **DSH 的 `activate(api)` 插件** | ⚠️ 需改写 | 两个平台的 `PluginApi` 不是同一个接口。工具/hook/技能的**贡献类型**一样，但对象形状不同（JYSHarness 是 `registerTool/addSkill/on/addPromptSection`）。好在单个插件通常只有几十行，改写成本低 |
+| **DSH 的 session/checkpoint 数据** | ❌ | JSONL 结构不同 |
+| **prompt-inject.md 之类的注入文件** | ⚠️ 需手写 | JYSHarness 对应的是 `.harness/memory.md` 与 `AGENTS.md` |
+
+### 一句话总结
+
+- **技能**：同一格式，`jys skill import-dsh` 一条命令搬过来，还能吃 `whenToUse` 和 `enabled`；
+- **MCP**：同一协议，配置可直接复用；
+- **插件代码**：贡献类型相同但接口不同，需要改写（通常几十行）；
+- **前端插件**：不兼容，属于两套 UI。
+

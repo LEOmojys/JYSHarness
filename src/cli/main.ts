@@ -3,6 +3,7 @@
  * CLI front-end. The REPL is deliberately thin: all policy lives in the core.
  * Rendering is event-driven, which is why the loop can stream.
  */
+import path from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { paint, Logger } from "../util/log.ts";
@@ -77,6 +78,30 @@ function renderToolResult(name: string, body: string, isError: boolean | undefin
   if (total > lines.length) process.stdout.write(paint.dim("    ... " + (total - lines.length) + " more lines") + "\n");
 }
 
+/**
+ * 剥掉全局 flag，得到"子命令自己的参数"与解析后的工作区。
+ *
+ * 为什么要单独做：`parseArgs` 会把剩余参数折叠进 prompt（那是给一次性对话用的），
+ * 而子命令（skill/worktree）需要干净的 rest。之前直接把原始 argv 传下去，
+ * 于是 `jys --workspace X skill list` 把 X 当成了动作名。
+ */
+function splitGlobalFlags(argv: string[]): { workspace: string; rest: string[] } {
+  const VALUE_FLAGS = new Set(["--provider", "--model", "--script", "--mode", "--sandbox", "--resume", "--max-turns", "--agent-mode", "--port"]);
+  const BOOL_FLAGS = new Set(["-y", "--yes", "--no-subagent", "--debug", "--open"]);
+  let workspace = process.cwd();
+  const rest: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--workspace") {
+      workspace = path.resolve(argv[++i] ?? ".");
+      continue;
+    }
+    if (VALUE_FLAGS.has(a)) { i++; continue; }
+    if (BOOL_FLAGS.has(a)) continue;
+    rest.push(a);
+  }
+  return { workspace, rest };
+}
 async function main(): Promise<void> {
   // Sub-commands that reuse the same runtime but a different front-end.
   //
@@ -84,7 +109,7 @@ async function main(): Promise<void> {
   //   main.ts --workspace <dir> serve --port 4317
   // Looking only at argv[2] silently turned "serve" into a one-shot prompt.
   const argv = process.argv.slice(2);
-  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check", "worktree"]);
+  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check", "worktree", "skill"]);
   const subIndex = argv.findIndex((a) => SUBCOMMANDS.has(a));
   const sub = subIndex >= 0 ? argv[subIndex] : undefined;
   const rest = subIndex >= 0 ? argv.filter((_, i) => i !== subIndex) : argv;
@@ -95,9 +120,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (sub === "worktree") {
-    const { runWorktree } = await import("./worktree.ts");
-    process.exitCode = await runWorktree(rest, process.cwd());
+  if (sub === "skill" || sub === "worktree") {
+    const { workspace, rest: subRest } = splitGlobalFlags(rest);
+    if (sub === "skill") {
+      const { runSkill } = await import("./skill.ts");
+      process.exitCode = await runSkill(subRest, workspace);
+    } else {
+      const { runWorktree } = await import("./worktree.ts");
+      process.exitCode = await runWorktree(subRest, workspace);
+    }
     return;
   }
 
