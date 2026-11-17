@@ -1,7 +1,7 @@
 /** `jys worktree …`：列出/预检/合并并行任务的工作树。 */
 import path from "node:path";
 import { createWorktree, listWorktrees, mainRepositoryRoot, removeWorktree } from "../core/worktrees.ts";
-import { currentBranch, mergeBranches, preflightAll } from "../core/worktreeMerge.ts";
+import { currentBranch, mergeBranches, mergeBranchesAsync, preflightAll } from "../core/worktreeMerge.ts";
 import { conflictedFiles, linkDependencies, rebaseWorktree, runVerify, verifyBranches, withRepoLock } from "../core/worktreeOps.ts";
 import { SessionStore } from "../session/store.ts";
 import { existsSync, readdirSync } from "node:fs";
@@ -18,6 +18,7 @@ function usage(): string {
     "jys worktree link <name>                      把主仓库依赖(junction)链进工作树，省磁盘",
     "jys worktree rebase <name> [--onto main]      把任务分支 rebase 到目标分支（base 漂移）",
     "jys worktree conflicts                        列出当前未解决的冲突文件",
+    "jys worktree merge … --resolve-with-agent     冲突交给 agent 解决（解完需过 --verify 才提交）",
     "jys worktree remove <path> [--force]          删工作树",
   ].join(NL);
 }
@@ -93,8 +94,23 @@ export async function runWorktree(argv: string[], workspace: string): Promise<nu
       }
     }
 
-    // 会写 git 元数据（index/refs），必须持锁执行，避免与别的任务并发撞 index.lock
-    const locked = await withRepoLock(repoRoot, () => mergeBranches(repoRoot, { into, branches, noFf: rest.includes("--no-ff") }));
+    const useAgent = rest.includes("--resolve-with-agent");
+    // 会写 git 元数据（index/refs），必须持锁执行，避免与别的任务并发撞 index.lock。
+    // 开了 --resolve-with-agent 就走异步编排（agent 是异步的，不能塞进同步钩子）。
+    const locked = await withRepoLock(repoRoot, () =>
+      useAgent
+        ? mergeBranchesAsync(repoRoot, {
+            into,
+            branches,
+            noFf: rest.includes("--no-ff"),
+            resolver: async ({ branch: conflictedBranch, files }) => {
+              console.log(NL + "冲突：" + files.join(", ") + " → 交给 agent 解决");
+              const { resolveConflictsWithAgent } = await import("./worktreeResolve.ts");
+              return resolveConflictsWithAgent(repoRoot, conflictedBranch, { verify: verifyCmd, verbose: false });
+            },
+          })
+        : mergeBranches(repoRoot, { into, branches, noFf: rest.includes("--no-ff") }),
+    );
     if (!locked.ok) { console.error("拿不到仓库锁：" + locked.error); return 1; }
     const res = locked.value;
     if (!res.ok) { console.error("合并失败：" + (res.error ?? "")); if (res.blocked) console.error("冲突：" + res.blocked.files.join(", ")); return 1; }

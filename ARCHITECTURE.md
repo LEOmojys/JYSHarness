@@ -1755,6 +1755,43 @@ jys worktree rebase task-b --onto main         # base 漂移就 rebase
 jys worktree merge jys/task-a jys/task-b --verify "npm test"
 jys worktree conflicts            # 万一冲突，看文件
 ```
+## 16.22 修复已知问题（不破坏既有行为）
+
+### 1. 消除测试里的偶发失败
+
+现象：某次改完文档立刻跑测试，出现 1 条失败；之后连跑 14 轮（含 8 轮并行压测）**无法复现**。
+
+根因方向：断言用了裸 `git status --porcelain`，它会把**未跟踪文件**（`.harness/`、`repo.lock`、基准产物）也算进"脏"。这些和"合并有没有留下半成品状态"无关，却会随执行时序偶发命中。
+
+修法（不放松真正的检查）：新增 `trackedDirty()`，用 `git status --porcelain --untracked-files=no` —— 判据变成「**已跟踪文件**是否干净」，这正是"没有半合并/半 rebase 状态"的定义。6 处断言统一改用它。
+
+### 2. 冲突解决接上 agent（原来只留了钩子）
+
+之前只有 `mergeBranches({ resolve })` 的**同步**钩子，CLI 没接 agent。现在补了异步编排，同时**保持同步 API 不变**：
+
+| 层 | 改动 |
+| --- | --- |
+| `mergeStep()` | 抽出"合一个分支"的单步操作，同步/异步两种编排共用，避免逻辑重复 |
+| `mergeBranches()` | 签名与行为**不变**（既有调用与 7 项测试原样通过） |
+| `mergeBranchesAsync()` | 新增：冲突时 `await` resolver；resolver 说 ok 也要复查索引里没有冲突标记；提交由编排层做 |
+| `src/cli/worktreeResolve.ts` | agent 解决器：给它冲突文件清单、要求保留双方意图、禁止 `git commit/abort`，解完用 `--verify` 命令验证 |
+| CLI | `jys worktree merge … --resolve-with-agent`（默认关闭，风险高，要显式开启） |
+
+设计要点：**agent 只改文件，提交与回滚由编排层负责**。这样不会出现"agent 自己 commit 到错分支"或"解到一半退出留下 MERGING"。
+
+### 3. 清掉死导出告警
+
+`src/core/jobs.ts` 的 `formatJob` 没有任何调用方（`dead-export`）。它是给 UI/CLI 展示任务状态用的，直接删会丢能力，所以补了 `tests/jobs-format.test.ts`：断言 id、状态、输出尾部（失败原因）都能渲染出来。告警消失，功能留下。
+
+### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 测试 | **337 / 337**（新增 3 项：async merge 成功/失败、formatJob） |
+| `tests/worktree-ops.test.ts` | 12 / 12 |
+| 类型检查 | 0 error |
+| 结构检查 | 通过；仅剩 README 测试计数提示（已同步） |
+| 既有功能 | 同步 `mergeBranches`、`preflight`、worktree 创建/删除等 11 项原有测试全部原样通过 |
 ## 17. 下一步
 
 按收益/成本排序：

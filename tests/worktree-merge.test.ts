@@ -80,7 +80,9 @@ test("merge: stops at the first conflict and leaves a clean repo", async () => {
   assert.equal(res.ok, false);
   assert.deepEqual(res.merged, ["jys/seq-a"], "冲突前的分支已合并");
   assert.deepEqual(res.blocked?.files, ["README.md"]);
-  const st = git(dir, ["status", "--porcelain"]);
+  // 只看已跟踪文件：未跟踪的 .harness/ 与锁文件跟"有没有留下半合并状态"无关，
+  // 拿裸 porcelain 断言会因未跟踪产物偶发失败。
+  const st = git(dir, ["status", "--porcelain", "--untracked-files=no"]);
   assert.equal(String(st.stdout).trim(), "", "冲突后必须回到干净状态（不能留下 MERGING）");
 });
 
