@@ -115,7 +115,14 @@ export function preflightAll(repoRoot: string, into: string, branches: string[])
  */
 export function mergeBranches(
   repoRoot: string,
-  opts: { into?: string; branches: string[]; noFf?: boolean; message?: string },
+  opts: {
+    into?: string;
+    branches: string[];
+    noFf?: boolean;
+    message?: string;
+    /** 冲突时交给它解决；不传则冲突即回滚（默认安全行为） */
+    resolve?: (ctx: { repoRoot: string; branch: string; files: string[] }) => { ok: boolean; detail?: string };
+  },
 ): MergeOutcome {
   const into = opts.into ?? currentBranch(repoRoot);
   if (!into) return { ok: false, into: "", merged: [], error: "当前处于分离 HEAD 状态，请先 checkout 到一个分支" };
@@ -136,9 +143,22 @@ export function mergeBranches(
     args.push(branch);
     const r = git(repoRoot, args);
     if (r.status !== 0) {
-      // 冲突：立刻回到干净状态，不留半合并仓库
       const conflicted = git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]);
       const files = String(conflicted.stdout ?? "").trim().split(/\r?\n/).filter(Boolean);
+      // 有 resolver 就先留在冲突现场让它解；没有就立刻回滚，不留半合并仓库
+      if (opts.resolve) {
+        const fixed = opts.resolve({ repoRoot, branch, files });
+        if (fixed.ok) {
+          // resolver 只负责解决冲突内容；提交由这里统一做，避免它忘记提交
+          const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
+          if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
+            merged.push(branch);
+            continue;
+          }
+        }
+        git(repoRoot, ["merge", "--abort"]);
+        return { ok: false, into, merged, blocked: { branch, files }, error: (fixed.detail ?? "冲突未解决").slice(0, 400) };
+      }
       git(repoRoot, ["merge", "--abort"]);
       return { ok: false, into, merged, blocked: { branch, files }, error: String(r.stderr ?? "").trim().slice(0, 400) };
     }

@@ -1670,6 +1670,91 @@ jys worktree sessions                   # 每个工作树各有几个会话（�
 | **依赖不共享** | 每个工作树是独立检出，`node_modules` 要各装一份（磁盘 × N）。可用 pnpm 的 store 或 junction 到主仓库来省空间 |
 | **base 漂移** | `--base` 默认 `HEAD`。main 前进后，老工作树的 diff 会变大；需要 `jys worktree rebase <name>` |
 | **并发写仓库** | 两个进程同时 `git worktree add` 会撞 `index.lock`；现在靠 worktree 目录名不同来避让，但没有显式锁 |
+## 16.21 并行任务平台：五项缺口全部补齐
+
+上一节列的五项缺口已经实现，`src/core/worktreeOps.ts` 是运行期能力层（`worktreeMerge.ts` 只管"能不能合、怎么合"）。
+
+### 1. 合并前自动验证（`verify` / `merge --verify`）
+
+只合并不跑测试 = 把回归直接合进主干。现在的顺序是**先验后合、合后再验**：
+
+```bash
+jys worktree verify jys/a jys/b --cmd "npm test"      # 每个工作树各跑一遍
+jys worktree merge jys/a jys/b --verify "npm test"    # 任一失败就不合（--force-merge 可跳过）
+```
+
+合并后还会在主仓库再跑一次 —— 逐个分支通过不等于合起来通过（语义冲突、接口不兼容只在合并后暴露）。失败时提示用 `git reset --hard ORIG_HEAD` 回退。
+
+### 2. 冲突解决（resolver 钩子 + `resolveAndCommit`）
+
+`mergeBranches({ resolve })` 给了 resolver 就**停在冲突现场**让它解；没有就立刻回滚（默认安全）。
+
+关键设计：**不盲信 resolver**。它返回 `ok: true` 不算数，必须再查一次索引里是否还有冲突标记；仍冲突就回滚并报错。单测专门有一条 `resolveAndCommit: lies from the resolver are caught`。
+
+### 3. 依赖共享（`link`）
+
+每个工作树各装一份 `node_modules`，磁盘 ×N。现在用 **junction**（Windows 目录符号链接需要管理员权限，junction 不需要）把主仓库的依赖链进来：
+
+```bash
+jys worktree link fix-sum    # linked / already / missing-in-source / exists-in-target
+```
+
+只链"主仓库有、工作树没有"的项，**绝不覆盖**工作树里已有内容。默认共享 `node_modules`、`.venv`、`venv`、`vendor`、`.pnpm-store`。
+
+### 4. base 漂移（`rebase`）
+
+任务分支基于老的 `HEAD` 建立，主分支前进后 diff 会越来越大。现在可以：
+
+```bash
+jys worktree rebase add-feature --onto main
+```
+
+冲突时立刻 `rebase --abort` —— 留下半 rebase 状态会让人分不清"现在到底在哪个分支"。
+
+### 5. 并发锁（`withRepoLock`）
+
+`git worktree add` 与 `git merge` 都写 `.git/index`，两个任务同时触发，后到的直接失败（`Unable to create index.lock`）。现在所有会写 git 元数据的操作都串行化：
+
+| 行为 | 实现 |
+| --- | --- |
+| 互斥 | `writeFileSync(lock, pid, { flag: "wx" })`（O_EXCL） |
+| 等待 | 轮询，默认最多等 30s，超时报"仓库被另一个操作占用" |
+| 陈旧锁 | 锁文件 mtime 超过 10 分钟视为进程已死，自动清理 |
+| 释放 | `finally` 里删除，异常也不会漏锁 |
+
+### 顺带修掉一个 Windows 路径 bug
+
+`branchPaths()` 用 git 输出的路径与 `path.join` 比较，在 Windows 上**永远不相等**：git 给 `C:/Users/...`（正斜杠）甚至 8.3 短名 `假烟桑~1`，`path.join` 给长名 `假烟桑··`。结果是"按分支找目录"静默失效 —— 验证功能会全部报"没有对应工作树"。修法：`realpathSync.native()` 取真实路径后比较。这条是测试直接抓出来的。
+
+### 端到端实测（真实仓库）
+
+场景：一个仓库两个任务并行，A 修 bug、B 加功能。
+
+| 步骤 | 结果 |
+| --- | --- |
+| 建两个工作树 + `link` | `node_modules` 走 junction；`venv`/`vendor` 报 missing-in-source（本来就没有） |
+| 两个任务各自提交 | 各自独立分支 |
+| `verify` 两个分支 | A **PASS**、B **FAIL** |
+| `merge --verify` | **拒绝合并**："1 个分支验证失败，已放弃合并" |
+| 只合 A（带验证） | 合并前 PASS、合并后复验 PASS |
+| `rebase add-feature --onto main` | 成功，B 继承 A 的修复 |
+| 再合 B（带验证） | 合并前后都 PASS，`sum.js`+`mul.js` 均在，测试全绿 |
+
+**B 第一次验证失败不是缺陷，而是正确行为**：它单独跑时主干还有 A 没修的 bug。真实工作流就该先 rebase 再合。
+
+单测 `tests/worktree-ops.test.ts` 10 项全绿：锁互斥、锁超时、验证通过/失败/输出尾部、分支→目录映射、依赖链接不覆盖、rebase 成功、resolver 成功、resolver 失败回滚、resolveAndCommit 成功、resolver 撒谎被识破。
+
+### 现在这套平台能做什么
+
+```bash
+jys worktree create task-a        # 起一个隔离任务
+jys worktree link task-a          # 共享依赖，省磁盘
+jys worktree verify jys/task-a --cmd "npm test"
+jys worktree preflight jys/task-a jys/task-b   # 顺序感知的冲突预演
+jys worktree rebase task-b --onto main         # base 漂移就 rebase
+jys worktree merge jys/task-a jys/task-b --verify "npm test"
+jys worktree conflicts            # 万一冲突，看文件
+```
 ## 17. 下一步
 
 按收益/成本排序：

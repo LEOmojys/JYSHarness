@@ -1,0 +1,192 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { branchPaths, conflictedFiles, linkDependencies, rebaseWorktree, resolveAndCommit, runVerify, verifyBranches, withRepoLock } from "../src/core/worktreeOps.ts";
+import { createWorktree } from "../src/core/worktrees.ts";
+import { mergeBranches } from "../src/core/worktreeMerge.ts";
+
+const git = (cwd: string, args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8" });
+const NL = String.fromCharCode(10);
+
+function repo(): string {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "jys-ops-"));
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["config", "user.email", "t@example.com"]);
+  git(dir, ["config", "user.name", "t"]);
+  writeFileSync(path.join(dir, "README.md"), "base" + NL, "utf8");
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-qm", "base"]);
+  return dir;
+}
+
+test("lock: second acquisition waits for the first to finish", async () => {
+  const dir = repo();
+  const order: string[] = [];
+  const first = withRepoLock(dir, async () => {
+    order.push("a-start");
+    await new Promise((r) => setTimeout(r, 150));
+    order.push("a-end");
+  });
+  const second = withRepoLock(dir, async () => { order.push("b-start"); }, { waitMs: 5000, pollMs: 20 });
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["a-start", "a-end", "b-start"], "必须互斥，不能交错");
+  assert.equal(existsSync(path.join(dir, ".harness", "repo.lock")), false, "锁文件必须被释放");
+});
+
+test("lock: times out instead of hanging forever", async () => {
+  const dir = repo();
+  const held = withRepoLock(dir, async () => { await new Promise((r) => setTimeout(r, 400)); });
+  const blocked = await withRepoLock(dir, async () => "never", { waitMs: 80, pollMs: 20 });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.ok === false ? blocked.error : "", /占用/);
+  await held;
+});
+
+test("verify: reports pass and fail with output tail", async () => {
+  const dir = repo();
+  mkdirSync(path.join(dir, "scripts"), { recursive: true });
+  writeFileSync(path.join(dir, "scripts", "ok.js"), "process.exit(0);" + NL, "utf8");
+  writeFileSync(path.join(dir, "scripts", "bad.js"), "console.error(\"boom\"); process.exit(3);" + NL, "utf8");
+  const ok = await runVerify(dir, "node scripts/ok.js");
+  assert.equal(ok.ok, true);
+  const bad = await runVerify(dir, "node scripts/bad.js");
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, 3);
+  assert.match(bad.tail, /boom/, "失败时要带回输出尾部");
+});
+
+test("verify: only branches checked out in a worktree can be verified", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "verify-a");
+  if (!a.ok) return;
+  // Windows 上 git 给 8.3 短名、path.join 给长名，必须用真实路径比较（这条测试就是为它写的）
+  const mapped = branchPaths(dir).get("jys/verify-a");
+  assert.equal(mapped !== undefined, true, "分支必须能映射到工作树目录");
+  assert.equal(realpathSync.native(mapped as string), realpathSync.native(a.path));
+  const results = await verifyBranches(dir, ["jys/verify-a", "jys/not-there"], "node -e 0");
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].ok, false);
+  assert.match(results[1].tail, /没有对应工作树/);
+});
+
+test("link: shares node_modules via junction and never overwrites", async () => {
+  const dir = repo();
+  mkdirSync(path.join(dir, "node_modules", "pkg"), { recursive: true });
+  writeFileSync(path.join(dir, "node_modules", "pkg", "index.js"), "module.exports=1;" + NL, "utf8");
+  const a = await createWorktree(dir, "link-a");
+  if (!a.ok) return;
+  const first = linkDependencies(dir, a.path, ["node_modules", "not-there"]);
+  assert.equal(first.find((x) => x.name === "node_modules")?.status, "linked");
+  assert.equal(first.find((x) => x.name === "not-there")?.status, "missing-in-source");
+  assert.match(readFileSync(path.join(a.path, "node_modules", "pkg", "index.js"), "utf8"), /module.exports/);
+  assert.equal(linkDependencies(dir, a.path, ["node_modules"])[0].status, "exists-in-target", "已存在不能覆盖");
+});
+
+test("rebase: replays the task branch onto a moved base", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "reb-a");
+  if (!a.ok) return;
+  writeFileSync(path.join(a.path, "task.txt"), "task" + NL, "utf8");
+  git(a.path, ["add", "."]);
+  git(a.path, ["commit", "-qm", "task work"]);
+  writeFileSync(path.join(dir, "main.txt"), "moved" + NL, "utf8");
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-qm", "main moved"]);
+  const res = rebaseWorktree(a.path, "main");
+  assert.equal(res.ok, true, res.detail);
+  assert.ok(existsSync(path.join(a.path, "main.txt")), "应包含主分支的新提交");
+  assert.ok(existsSync(path.join(a.path, "task.txt")));
+});
+
+test("merge: resolver hook resolves a conflict and the merge completes", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "res-a");
+  const b = await createWorktree(dir, "res-b");
+  if (!a.ok || !b.ok) return;
+  writeFileSync(path.join(a.path, "README.md"), "A" + NL, "utf8");
+  git(a.path, ["commit", "-qam", "A"]);
+  writeFileSync(path.join(b.path, "README.md"), "B" + NL, "utf8");
+  git(b.path, ["commit", "-qam", "B"]);
+  const res = mergeBranches(dir, {
+    into: "main",
+    branches: ["jys/res-a", "jys/res-b"],
+    resolve: ({ repoRoot, files }) => {
+      assert.deepEqual(files, ["README.md"]);
+      writeFileSync(path.join(repoRoot, "README.md"), "A+B" + NL, "utf8");
+      return { ok: git(repoRoot, ["add", "."]).status === 0 };
+    },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(res.merged, ["jys/res-a", "jys/res-b"]);
+  assert.equal(readFileSync(path.join(dir, "README.md"), "utf8").trim(), "A+B");
+  assert.equal(String(git(dir, ["status", "--porcelain"]).stdout).trim(), "", "合并后必须干净");
+});
+
+test("merge: a failing resolver rolls back and reports the conflict", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "bad-a");
+  const b = await createWorktree(dir, "bad-b");
+  if (!a.ok || !b.ok) return;
+  writeFileSync(path.join(a.path, "README.md"), "A" + NL, "utf8");
+  git(a.path, ["commit", "-qam", "A"]);
+  writeFileSync(path.join(b.path, "README.md"), "B" + NL, "utf8");
+  git(b.path, ["commit", "-qam", "B"]);
+  const res = mergeBranches(dir, {
+    into: "main",
+    branches: ["jys/bad-a", "jys/bad-b"],
+    resolve: () => ({ ok: false, detail: "resolver 放弃" }),
+  });
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.blocked?.files, ["README.md"]);
+  assert.equal(String(git(dir, ["status", "--porcelain"]).stdout).trim(), "", "失败后必须回滚干净");
+  assert.equal(conflictedFiles(dir).length, 0);
+});
+
+
+test("resolveAndCommit: commits after the resolver fixes the conflict", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "rc-a");
+  const b = await createWorktree(dir, "rc-b");
+  if (!a.ok || !b.ok) return;
+  writeFileSync(path.join(a.path, "README.md"), "A" + NL, "utf8");
+  git(a.path, ["commit", "-qam", "A"]);
+  writeFileSync(path.join(b.path, "README.md"), "B" + NL, "utf8");
+  git(b.path, ["commit", "-qam", "B"]);
+  // 先制造冲突现场：合并 A 后合 B，冲突停在索引里
+  git(dir, ["merge", "jys/rc-a"]);
+  const conflicted = git(dir, ["merge", "jys/rc-b"]);
+  assert.notEqual(conflicted.status, 0, "这一步应当冲突");
+  assert.deepEqual(conflictedFiles(dir), ["README.md"]);
+
+  const res = await resolveAndCommit(dir, "jys/rc-b", async ({ files }) => {
+    assert.deepEqual(files, ["README.md"]);
+    writeFileSync(path.join(dir, "README.md"), "A+B" + NL, "utf8");
+    git(dir, ["add", "."]);
+    return { ok: true };
+  });
+  assert.equal(res.ok, true, res.detail);
+  assert.equal(readFileSync(path.join(dir, "README.md"), "utf8").trim(), "A+B");
+  assert.equal(String(git(dir, ["status", "--porcelain"]).stdout).trim(), "", "提交后必须干净");
+});
+
+test("resolveAndCommit: lies from the resolver are caught (still conflicted)", async () => {
+  const dir = repo();
+  const a = await createWorktree(dir, "lie-a");
+  const b = await createWorktree(dir, "lie-b");
+  if (!a.ok || !b.ok) return;
+  writeFileSync(path.join(a.path, "README.md"), "A" + NL, "utf8");
+  git(a.path, ["commit", "-qam", "A"]);
+  writeFileSync(path.join(b.path, "README.md"), "B" + NL, "utf8");
+  git(b.path, ["commit", "-qam", "B"]);
+  git(dir, ["merge", "jys/lie-a"]);
+  git(dir, ["merge", "jys/lie-b"]);
+
+  const res = await resolveAndCommit(dir, "jys/lie-b", async () => ({ ok: true })); // 什么都没做却说 ok
+  assert.equal(res.ok, false, "resolver 说解决但索引仍有冲突时必须拒绝");
+  assert.match(res.detail, /仍有冲突/);
+  assert.equal(String(git(dir, ["status", "--porcelain"]).stdout).trim(), "", "必须回滚干净");
+});
+
