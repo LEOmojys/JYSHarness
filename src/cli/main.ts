@@ -84,7 +84,7 @@ async function main(): Promise<void> {
   //   main.ts --workspace <dir> serve --port 4317
   // Looking only at argv[2] silently turned "serve" into a one-shot prompt.
   const argv = process.argv.slice(2);
-  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check"]);
+  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check", "worktree"]);
   const subIndex = argv.findIndex((a) => SUBCOMMANDS.has(a));
   const sub = subIndex >= 0 ? argv[subIndex] : undefined;
   const rest = subIndex >= 0 ? argv.filter((_, i) => i !== subIndex) : argv;
@@ -92,6 +92,12 @@ async function main(): Promise<void> {
   if (sub === "serve" || sub === "desktop") {
     const { runServe } = await import("./serve.ts");
     await runServe(rest, sub === "desktop");
+    return;
+  }
+
+  if (sub === "worktree") {
+    const { runWorktree } = await import("./worktree.ts");
+    process.exitCode = await runWorktree(rest, process.cwd());
     return;
   }
 

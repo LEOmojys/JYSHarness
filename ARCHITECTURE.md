@@ -1610,6 +1610,66 @@ HF datasets-server（经代理）→ 选实例 → shallow fetch 到 base_commit
 ### 顺带修掉的检查器问题
 
 `bench/swe-work/` 里每条实例都是一个完整 clone + venv（上万个文件）。结构检查会把它当成本仓库源码扫（实测扫到 **19230 个文件**），既慢又报无关问题。现在 `SKIP_DIRS` 增加 `swe-work` / `venv` / `.venv`，扫描量回到 187 个文件。
+## 16.20 并行多任务 → 合并：能隔离，还差"合回来"
+
+结论先说：**隔离这一半本来就成立，合并这一半原来完全缺失**。这次补上了合并编排，并用真实 git 仓库验证了三种场景。
+
+### 原来的机制（隔离为什么天然成立）
+
+`createWorktree(repoRoot, name)` 做三件事：`git worktree add -b jys/<name>` 到 `.harness/worktrees/<name>`，并复制本地 `.env` 一类未跟踪配置。于是一个任务工作树 =
+
+| 隔离项 | 为什么天然隔离 |
+| --- | --- |
+| 分支 | 独立分支 `jys/<name>`，互不影响 |
+| 工作区 | 独立目录；`guardPath` 显式禁止跨工作树写入（`.harness/worktrees/**` 直接 deny） |
+| 会话 | `.harness/sessions/` 在每个工作树内，各自 JSONL |
+| 检查点 | 同上，独立目录 |
+| 后台任务 | JobManager 绑定会话工作区 |
+
+所以"同一项目并行做多个分支任务"**本来就可行**，缺的只是最后的合并。
+
+### 补上的合并编排（`src/core/worktreeMerge.ts`）
+
+| 能力 | 做法 |
+| --- | --- |
+| **无副作用预检** | `git merge-tree --write-tree --name-only` —— 不切分支、不碰工作区、不建 index，只算结果树 |
+| **顺序感知** | 把前面分支依次并进一个"累积树"（传 `--merge-base <tree>`），再判下一个；冲突即停止推演 |
+| **冲突即回滚** | 真合并失败时立刻 `git merge --abort`，不留半合并仓库；返回结构化 `{merged, blocked:{branch,files}}` |
+| **脏工作区拒绝** | 主仓库有未提交改动直接报错，避免把用户没提交的东西卷进合并提交 |
+| **幂等** | `merge-base --is-ancestor` 判已合并的分支直接跳过 |
+
+**为什么"顺序感知"是必须的**：这是实测踩出来的。a 和 b 改同一文件的同一行时，单独判「b vs 当前 main」是干净的；但真实流程是先合 a 再合 b，那时才冲突。只做"每个分支独立 vs main"的预检会把冲突藏起来，用户看到的现象是「预检说没问题，合到一半失败」。
+
+### CLI
+
+```bash
+jys worktree list                       # 列出工作树/分支/未提交项
+jys worktree create task-a              # 建任务工作树（分支 jys/task-a）
+jys worktree preflight jys/task-a jys/task-b   # 按顺序推演，报告会不会冲突（冲突退出码 1）
+jys worktree merge jys/task-a jys/task-b        # 依次合并，冲突即停并回滚
+jys worktree sessions                   # 每个工作树各有几个会话（验证隔离）
+```
+
+### 实测（真实 git 仓库，E 盘临时目录）
+
+| 场景 | 结果 |
+| --- | --- |
+| 两个工作树各加一个新文件并提交 → 预检 → 合并 | **2 个分支都合入**，`a.txt`/`b.txt` 都在 main 上 |
+| 两个工作树改同一行 → 预检 | 第一个"可以干净合并"、第二个**"冲突：README.md"**，退出码 1 |
+| 冲突时执行 merge | **被预检拦住，不执行合并**，主仓库 `status --porcelain` 为空（干净） |
+| 重复合并同一分支 | 跳过，返回"无需合并" |
+
+单测 `tests/worktree-merge.test.ts` 7 项全绿（含"冲突后必须回到干净状态，不能留 MERGING"）。
+
+### 仍然缺的（如果要做完整"并行多任务平台"）
+
+| 缺口 | 影响 |
+| --- | --- |
+| **合并前自动验证** | 现在只合并、不跑测试。正确做法是每个工作树先跑自己的测试，合并后主仓库再跑一遍（`jys worktree verify -- cmd`） |
+| **冲突的半自动解决** | 目前冲突只能人工处理。可以让一个 agent 在冲突工作区里尝试解决，再由人确认 |
+| **依赖不共享** | 每个工作树是独立检出，`node_modules` 要各装一份（磁盘 × N）。可用 pnpm 的 store 或 junction 到主仓库来省空间 |
+| **base 漂移** | `--base` 默认 `HEAD`。main 前进后，老工作树的 diff 会变大；需要 `jys worktree rebase <name>` |
+| **并发写仓库** | 两个进程同时 `git worktree add` 会撞 `index.lock`；现在靠 worktree 目录名不同来避让，但没有显式锁 |
 ## 17. 下一步
 
 按收益/成本排序：
