@@ -1584,6 +1584,32 @@ HF datasets-server（经代理）→ 选实例 → shallow fetch 到 base_commit
 1. **Docker Desktop**（或 Linux 主机）→ 直接用官方 `swebench` 包：`python -m swebench.harness.run_evaluation --predictions <file> --run_id ...`；
 2. 或至少装齐 Python 3.5/3.6/3.7/3.8/3.9/3.10/3.11（conda 可建，但 django 1.11 的 3.5 轮子已难获取）；
 3. 每条实例的 `predictions.jsonl`：本适配器已能产出（`bench/swe-work/<id>.patch`），格式是 `{"instance_id","model_patch","model_name_or_path"}`，可直接喂给官方 harness。
+## 16.19 基准资产一律落在仓库盘（不写 C 盘）
+
+踩过的坑：上一版把 SWE-bench 的 Python 解释器建在 `C:/Users/Public/py39`、`py311`，数据集放 `C:/Users/Public/`，8 任务基准的临时工作区用 `os.tmpdir()`（Windows 上是 `C:\Users\...\Temp`）。这台机器 C 盘只剩 30 多 G，一次评测就吃掉 **350MB**。
+
+### 现在的约定（`src/bench/paths.ts`）
+
+| 资产 | 位置 | 大小量级 |
+| --- | --- | --- |
+| 数据集 JSON | `<repo>/bench/datasets/` | 8MB |
+| Python 解释器 | `<repo>/bench/tools/py39`、`py311` | 各 170MB |
+| SWE-bench 实例工作区 | `<repo>/bench/swe-work/` | 每实例 200–500MB |
+| 8 任务基准临时目录 | `<repo>/bench/tmp/` | 每次自动重建 |
+
+全部可用 `HARNESS_BENCH_ROOT` 指到外置盘（例如 `HARNESS_BENCH_ROOT=E:/bench`），解释器也支持 `HARNESS_PY39` / `HARNESS_PY311` 单独覆盖。
+
+### 解释器发现顺序（不再硬编码）
+
+```
+<bench>/tools/py<ver>/python.exe  →  HARNESS_PY<ver>  →  PATH 里的 python<ver>
+```
+
+找不到就**跳过该实例并说明原因**，不会去猜一个路径。之前的实现里硬编码了 `C:/Users/Public/py311/python.exe`，换机器/换盘就 silently 失效——这类"隐藏的绝对路径"是最容易被忽略的技术债。
+
+### 顺带修掉的检查器问题
+
+`bench/swe-work/` 里每条实例都是一个完整 clone + venv（上万个文件）。结构检查会把它当成本仓库源码扫（实测扫到 **19230 个文件**），既慢又报无关问题。现在 `SKIP_DIRS` 增加 `swe-work` / `venv` / `.venv`，扫描量回到 187 个文件。
 ## 17. 下一步
 
 按收益/成本排序：

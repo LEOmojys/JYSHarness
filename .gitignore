@@ -17,8 +17,11 @@ dist/
 
 # ---- 基准报告（每次运行生成，含本机路径与时间戳；数字已写进 ARCHITECTURE）----
 bench/reports/
-# ---- SWE-bench 工作目录（每个实例一个 clone + venv，数百 MB）----
+# ---- 基准资产：全部落在仓库盘，不入库（数据集/解释器/工作区/临时目录）----
 bench/swe-work/
+bench/datasets/
+bench/tools/
+bench/tmp/
 
 # ---- 演示用仓库（含嵌套 git 仓库与 worktree，按需自行 git init）----
 demo-projects/

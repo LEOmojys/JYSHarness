@@ -7,6 +7,7 @@ import { Logger } from "../util/log.ts";
 import { SessionStore } from "../session/store.ts";
 import { applyPatchFile, extractPatch, grade, installRepo, prepareRepo, resetToBase, type SweInstance, type SweResult } from "./swebench.ts";
 import { specFor } from "./sweSpecs.ts";
+import { interpreterFor } from "./paths.ts";
 
 const NL = String.fromCharCode(10);
 
@@ -33,12 +34,8 @@ function agentPrompt(inst: SweInstance): string {
   ].join(NL);
 }
 
-/** 本机可用的解释器（按版本）。没有对应版本就跑不了——这是无 Docker 方案的硬限制。 */
-const INTERPRETERS: Record<string, string> = {
-  "3.9": "C:/Users/Public/py39/python.exe",
-  "3.11": "C:/Users/Public/py311/python.exe",
-  "3.12": "python",
-};
+// 解释器位置由 bench/paths.ts 统一决定（<bench>/tools/py<ver>，或用 HARNESS_BENCH_ROOT 指到外置盘）。
+// 曾经硬编码过 C:/Users/Public/py39 —— 那是把 165MB 写到 C 盘的教训，不要再写死。
 
 export async function runInstance(
   inst: SweInstance,
@@ -61,7 +58,7 @@ export async function runInstance(
   if (!spec) {
     return { ...base, resolved: false, stage: "install", detail: "没有 " + inst.repo + " " + inst.version + " 的官方环境 spec，跳过（避免用错版本得出假分数）", ms: Date.now() - t0 };
   }
-  const interpreter = INTERPRETERS[spec.python];
+  const interpreter = interpreterFor(spec.python);
   if (!interpreter) {
     return { ...base, resolved: false, stage: "install", detail: "本机没有 Python " + spec.python + "（官方要求），无法复现该实例环境", ms: Date.now() - t0 };
   }

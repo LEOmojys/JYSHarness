@@ -23,6 +23,7 @@ import { loadSettings } from "../core/config.ts";
 import { createProvider } from "../providers/index.ts";
 import { SessionStore } from "../session/store.ts";
 import { TASKS, BY_ID, type BenchTask } from "./tasks.ts";
+import { tmpDir } from "./paths.ts";
 
 const NL = String.fromCharCode(10);
 export interface TaskResult {
@@ -147,7 +148,9 @@ export async function runBench(opts: {
     model = resolved.model;
   }
 
-  const root = mkdtempSync(path.join(os.tmpdir(), "jys-bench-"));
+  // 临时工作区也放仓库盘：os.tmpdir() 在 Windows 上是 C:\Users\...\Temp，
+  // 8 个任务各一个 clone 会把 C 盘啃掉一块。用 bench/tmp 并显式清理。
+  const root = mkdtempSync(path.join(tmpDir(), "run-"));
   for (const task of tasks) {
     if (opts.mode === "external") {
       results.push(await runExternalTask(task, root, opts.cmd ?? "", opts.cmdTimeoutMs ?? 300_000));

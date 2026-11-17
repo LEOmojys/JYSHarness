@@ -21,8 +21,11 @@ if (modeArg === "verified") {
   const { runInstance } = await import("./sweRun.ts");
   const { createProvider } = await import("../providers/index.ts");
   const { loadSettings } = await import("../core/config.ts");
-  const datasetPath = args.get("dataset") ?? "C:/Users/Public/swe-verified.json";
-  const workRoot = path.resolve(args.get("workdir") ?? "bench/swe-work");
+  const { datasetDir, workDir } = await import("./paths.ts");
+  // 数据集默认放 <bench>/datasets（仓库所在盘），不再指向 C:/Users/Public
+  const datasetPath = args.get("dataset") ?? path.join(datasetDir(), "swe-verified.json");
+  // 工作目录默认 <bench>/swe-work：每实例一个 clone + venv，都必须落在仓库盘
+  const workRoot = path.resolve(args.get("workdir") ?? workDir());
   const { supportedRepos } = await import("./sweSpecs.ts");
   if (args.get("list-specs") === "1") {
     console.log("本机有官方环境 spec、可复现的 (仓库, 版本)：");
