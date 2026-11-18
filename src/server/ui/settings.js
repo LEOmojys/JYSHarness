@@ -29,6 +29,8 @@ async function openSettings() {
     const res = await fetch("/api/config");
     appConfig = await res.json();
     renderSettings(appConfig);
+    // 启用/禁用插件后立刻反映到侧栏（面板清单随 config 一起刷新）
+    if (typeof applyPluginPanels === "function") applyPluginPanels(appConfig.panels);
     $("settingsMsg").textContent = "";
   } catch (e) {
     $("settingsMsg").textContent = "读取配置失败：" + (e.message || e);

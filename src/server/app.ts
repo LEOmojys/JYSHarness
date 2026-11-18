@@ -21,6 +21,8 @@ import type { ModelProvider } from "../providers/types.ts";
 import type { Tool } from "../tools/types.ts";
 import { inspectPlugins, loadPlugins, setPluginEnabled } from "../plugins/loader.ts";
 import { createWorktree, listWorktrees, mainRepositoryRoot, removeWorktree } from "../core/worktrees.ts";
+import { parsePluginAsset, parsePluginRoute, pipeAsset, resolveAssetPath } from "../plugins/http.ts";
+import { pluginPanelDirs, type PanelDecl } from "../plugins/panels.ts";
 import { spawn } from "node:child_process";
 import {
   browseDirectories,
@@ -235,12 +237,33 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
    * 分开构造过一次，直接导致"设置里填了 API 却保存不了"：POST 少返回 active，
    * 前端 renderSettings 抛错并清空表单。一个构造函数，两端不会再分叉。
    */
+  /**
+   * 插件面板清单（同步读取，不抛错）。
+   *
+   * 为什么在这里做而不是缓存：面板注册发生在插件 activate 时，而 activate 可能有副作用，
+   * 缓存要处理失效；面板数量很小，每次读一遍 manifest 的代价可以忽略。
+   */
+  function panelsOf(workspaceRoot: string): PanelDecl[] {
+    try {
+      return pluginPanelDirs(workspaceRoot).flatMap((p) => p.panels);
+    } catch {
+      return [];
+    }
+  }
+
   function configPayload(h: Hosted) {
     const cfg = describeConfig(h.session.workspaceRoot, {
       provider: h.session.provider.id,
       model: h.session.model,
     });
-    return { ...cfg, active: { provider: h.session.provider.id, model: h.session.model }, workspace: h.session.workspaceRoot };
+    return {
+      ...cfg,
+      active: { provider: h.session.provider.id, model: h.session.model },
+      workspace: h.session.workspaceRoot,
+      // 插件面板清单：UI 据此在侧栏加按钮，并动态 import() 插件自己的浏览器侧资产。
+      // 这里只给"有什么"，不含任何插件代码 —— 代码走 /plugin-assets/<id>/index.js。
+      panels: panelsOf(h.session.workspaceRoot),
+    };
   }
 
   function askApproval(
@@ -693,6 +716,44 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
       }
 
+      // ---- 插件能力面：/plugin/<id>/<path> 与 /plugin-assets/<id>/<file> ----
+      // 放在 /api/* 之前：这两类是"插件拥有的路由"，不参与内核路由表。
+      const pluginRoute = parsePluginRoute(route);
+      if (pluginRoute) {
+        const loadedPlugins = await loadPlugins(current().session.workspaceRoot, logger);
+        const runtime = loadedPlugins.runtimes.find((r) => r.pluginId === pluginRoute.id);
+        if (!runtime) return json(res, 404, { error: "plugin not found: " + pluginRoute.id });
+        const hit = runtime.routes.find((r) => r.method === req.method && r.path === pluginRoute.rest);
+        if (!hit) return json(res, 404, { error: "no route " + req.method + " /" + pluginRoute.rest + " in plugin " + pluginRoute.id });
+        try {
+          const body = req.method === "POST" ? await readJson(req).catch(() => ({})) : undefined;
+          const query: Record<string, string> = {};
+          url.searchParams.forEach((v, k) => (query[k] = v));
+          const out = await hit.handler({
+            pluginId: runtime.pluginId,
+            method: req.method ?? "GET",
+            path: pluginRoute.rest,
+            query,
+            body,
+            workspaceRoot: current().session.workspaceRoot,
+          });
+          if (out?.text !== undefined) return text(res, out.status ?? 200, out.text);
+          return json(res, out?.status ?? 200, out?.json ?? {});
+        } catch (err) {
+          return json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+
+      const assetReq = parsePluginAsset(route);
+      if (assetReq) {
+        const loadedPlugins = await loadPlugins(current().session.workspaceRoot, logger);
+        const runtime = loadedPlugins.runtimes.find((r) => r.pluginId === assetReq.id);
+        const abs = resolveAssetPath(runtime, assetReq.file);
+        // 目录穿越、插件不存在、文件不存在都走同一个 404：不泄露"哪个路径存在"
+        if (!abs) return json(res, 404, { error: "asset not found" });
+        return pipeAsset(abs, res);
+      }
+
       if (route === "/api/plugins" && req.method === "GET") {
         const ws = current().session.workspaceRoot;
         const infos = inspectPlugins(ws);
@@ -993,6 +1054,11 @@ async function serveStatic(res: ServerResponse, rel: string): Promise<void> {
   } catch {
     res.writeHead(404).end("not found");
   }
+}
+
+function text(res: ServerResponse, status: number, body: string): void {
+  res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
+  res.end(body);
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {

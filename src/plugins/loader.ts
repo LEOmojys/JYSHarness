@@ -15,9 +15,13 @@ import type { Logger } from "../util/log.ts";
 import type {
   LoadedPlugin,
   PluginApi,
+  PluginCommand,
   PluginHookHandler,
   PluginLoadResult,
   PluginManifest,
+  PluginPanel,
+  PluginRoute,
+  PluginRuntime,
   SkillContribution,
 } from "./types.ts";
 
@@ -183,7 +187,16 @@ function mergeHook(
 }
 
 export async function loadPlugins(workspaceRoot: string, logger: Logger): Promise<PluginLoadResult> {
-  const result: PluginLoadResult = { plugins: [], tools: [], skills: [], promptSections: [], hooks: {}, errors: [] };
+  const result: PluginLoadResult = {
+    plugins: [],
+    tools: [],
+    skills: [],
+    promptSections: [],
+    hooks: {},
+    errors: [],
+    runtimes: [],
+    warnings: [],
+  };
 
   for (const discovered of discoverPlugins(workspaceRoot)) {
     const label = path.basename(discovered.dir);
@@ -200,6 +213,9 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
     const skills: SkillContribution[] = [];
     const sections: string[] = [];
     const hooks: { event: HookEvent; handler: PluginHookHandler }[] = [];
+    const routes: PluginRoute[] = [];
+    const panels: PluginPanel[] = [];
+    const commands: PluginCommand[] = [];
     const warnings: string[] = [];
 
     const api: PluginApi = {
@@ -239,6 +255,42 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
         }
         skills.push({ name: skill.name, description: skill.description ?? "", content: skill.content });
       },
+      registerRoute: (route) => {
+        if (!route || typeof route.handler !== "function") {
+          warnings.push("registerRoute needs a handler function");
+          return;
+        }
+        const method = route.method === "POST" ? "POST" : "GET";
+        const clean = String(route.path ?? "").trim().replace(/^\/+/, "");
+        if (!clean) {
+          warnings.push("registerRoute needs a path");
+          return;
+        }
+        if (routes.some((r) => r.method === method && r.path === clean)) {
+          warnings.push("duplicate route: " + method + " " + clean);
+          return;
+        }
+        routes.push({ method, path: clean, handler: route.handler });
+      },
+      registerPanel: (panel) => {
+        if (!panel?.id || !panel?.title) {
+          warnings.push("registerPanel needs id and title");
+          return;
+        }
+        if (panels.some((p) => p.id === panel.id)) {
+          warnings.push("duplicate panel id: " + panel.id);
+          return;
+        }
+        panels.push({ id: panel.id, title: panel.title, icon: panel.icon, slot: panel.slot ?? "sidebar" });
+      },
+      registerCommand: (command) => {
+        if (!command?.name || typeof command.run !== "function") {
+          warnings.push("registerCommand needs name and run()");
+          return;
+        }
+        if (!command.name.startsWith("/")) warnings.push("command name 建议以 / 开头: " + command.name);
+        commands.push(command);
+      },
     };
 
     try {
@@ -277,6 +329,18 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
     result.tools.push(...tools);
     result.skills.push(...skills);
     result.promptSections.push(...sections);
+    for (const warning of warnings) result.warnings.push({ plugin: label, message: warning });
+
+    // v2：把路由/面板/命令/UI 资产目录收进运行时表，供服务端挂载
+    const pluginId = (manifest.id ?? label).trim();
+    const uiRel = (manifest as { ui?: string }).ui ?? "ui";
+    const uiAbs = path.resolve(discovered.dir, uiRel);
+    const uiInside = !path.relative(discovered.dir, uiAbs).startsWith("..");
+    const uiDir = uiInside && existsSync(uiAbs) && statSync(uiAbs).isDirectory() ? uiAbs : null;
+    if (routes.length || panels.length || commands.length || uiDir) {
+      result.runtimes.push({ pluginId, routes, panels, commands, uiDir });
+    }
+
     result.plugins.push({
       name: manifest.name,
       version: manifest.version ?? "0.0.0",

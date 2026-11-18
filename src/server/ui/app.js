@@ -1146,6 +1146,8 @@ document.addEventListener("DOMContentLoaded", () => {
       });
   } else {
     connect();
+    // 插件面板：首屏就要知道有哪些（逻辑在 plugins-ui.js，app.js 保持精简）
+    if (typeof loadPluginPanels === "function") void loadPluginPanels();
     if (openSettingsHash) setTimeout(() => void openSettings(), 400);
     if (openWorkspaceHash) setTimeout(() => void openWorkspacePicker(), 400);
   }

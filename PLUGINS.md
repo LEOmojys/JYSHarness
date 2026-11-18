@@ -275,3 +275,91 @@ JYSHarness 的 `mcpServers` 就是标准 MCP 配置（`command` + `args` + `env`
 - **插件代码**：贡献类型相同但接口不同，需要改写（通常几十行）；
 - **前端插件**：不兼容，属于两套 UI。
 
+
+## v2：从"钩进管线"到"可安装的能力面"
+
+参考 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（"Everything is a Plugin"）。DSH 的插件是 Cordis 插件：每个能力都是一个把服务注册到 ctx 的包，分 host 半与 client 半，另有 Plugin Manager 负责安装/启停/检查。
+
+JYSHarness 的 v1 只能"钩进已有管线"（工具/hook/技能/提示词）。v2 让插件能贡献**新的能力面**，因此一个插件可以是一个"可安装的服务 + 界面模块"。
+
+### 对照表
+
+| 能力 | DSH（Cordis） | JYSHarness v2 |
+| --- | --- | --- |
+| 注册工具 | `ctx.tools` | `api.registerTool()` |
+| 注册服务/路由 | `ctx.<service>`，host 半持有 | `api.registerRoute()` → `/plugin/<id>/<path>` |
+| UI 模块 | client 半包，编译进 client program | `ui/index.js`，宿主 `import()` 后 `mount(el, api)` |
+| 命令 | `ctx.commands` | `api.registerCommand()` |
+| 声明式清单 | package.json + Cordis 元信息 | `plugin.json`（id/engines/contributes/panels/ui） |
+| 安装/启停 | Plugin Manager | `jys plugin list/enable/disable` + `/api/plugins` |
+| 隔离 | host/client 双半 + 沙箱 runner | 同进程；路径守卫 + 目录包含校验 |
+
+### 插件能贡献的五类东西
+
+```json
+{
+  "name": "demo-panel", "id": "demo-panel", "version": "1.0.0",
+  "entry": "index.ts", "ui": "ui",
+  "engines": { "harness": ">=0.2" },
+  "contributes": { "permissions": ["http-route", "ui-panel"] },
+  "panels": [{ "id": "demo", "title": "演示面板", "icon": "◈", "slot": "sidebar" }]
+}
+```
+
+```ts
+export function activate(api) {
+  api.registerTool({...});                                       // 工具（走权限/审计管道）
+  api.on("PreToolUse", fn);                                      // 钩子（可 deny）
+  api.addSkill({ name, description, content });                   // 内存技能
+  api.addPromptSection("...");                                   // 固定提示段落
+  api.registerRoute({ method: "GET", path: "stats", handler });    // HTTP 路由
+  api.registerPanel({ id: "demo", title: "演示面板" });            // Web UI 面板
+  api.registerCommand({ name: "/demo-ping", run });               // 斜杠命令
+}
+```
+
+### 三条挂载路径
+
+| 路径 | 来源 | 说明 |
+| --- | --- | --- |
+| `/plugin/<id>/<path>` | `api.registerRoute()` | 插件自己的 API；body 已解析 JSON、query 已解析 |
+| `/plugin-assets/<id>/<file>` | 清单 `ui` 目录 | 浏览器侧资产，no-store 不缓存（改完刷新即生效） |
+| `/api/config` 的 `panels` | 清单 `panels` | UI 首屏据此加侧栏按钮（同步读清单，不执行 activate） |
+
+### 为什么面板要在清单里声明
+
+`api.registerPanel()` 写在 `activate()` 里，而它是异步、可能有副作用；但 `/api/config` 是同步构造的（UI 首屏就要按钮）。所以：
+
+- 清单 `panels` → 首屏可见（同步读 JSON）；
+- `api.registerPanel()` → 运行期登记，出现在 `/api/plugins` 的贡献清单（调试/审计）。
+
+### 安全边界（v2 新增两条）
+
+| 风险 | 处理 |
+| --- | --- |
+| 插件资产被用来读任意文件 | `resolveAssetPath()` 做目录包含校验；`..` 穿越一律 404，且不区分"越界"与"不存在" |
+| 插件工具绕过沙箱 | `ToolRegistry.assemble()` 对扩展工具兜底注入 `guardPath`（漏写 toolCheck 也拦得住） |
+| 插件 JS 拥有页面权限 | 不做隔离，属于已知取舍：面板要与会话状态互通。只装信任的插件 |
+
+### 实测（真实浏览器，非模拟）
+
+| 验证项 | 结果 |
+| --- | --- |
+| `/api/config` 带上 panels | `[{id:"demo",title:"演示面板",icon:"◈",asset:"/plugin-assets/demo-panel/index.js"}]` |
+| `GET /plugin/demo-panel/stats` | `{"plugin":"demo-panel","workspace":"…","at":"…"}` |
+| `GET /plugin-assets/demo-panel/index.js` | 200 text/javascript（未开缓存） |
+| `GET /plugin-assets/demo-panel/../../etc/passwd` | **404**（目录穿越被拒） |
+| 不存在的插件路由 | **404** |
+| 浏览器侧栏按钮 | 出现「◈ 演示面板」 |
+| 点击后面板内容 | `插件: demo-panel / 工作区: … / 时间: …`（数据来自插件自己的路由） |
+| 控制台异常 | 0 |
+
+### 与 DSH 仍有的差距
+
+| 差距 | 说明 |
+| --- | --- |
+| 无沙箱 runner | DSH 用 cordis-host-runner 把插件放进沙箱执行；这里插件在同进程，拥有进程全部能力 |
+| 无动态安装 | DSH 有 Plugin Manager 安装持久化插件；这里是"放目录 + 启停"，没有从 URL/包仓库安装 |
+| UI 能力有限 | 目前只有侧栏面板一个 slot；DSH 的 client 半可注册任意 slot/命令面板/设置页 |
+| 无版本解析 | `engines` 只是声明，不校验；也没有插件间依赖解析 |
+
