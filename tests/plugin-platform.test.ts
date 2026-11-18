@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { copyTree, installPlugin, listInstalled, uninstallPlugin } from "../src/plugins/manager.ts";
-import { checkCompat, satisfies, parseVersion } from "../src/plugins/compat.ts";
+import { createServer } from "node:http";
+import { copyTree, installPlugin, listInstalled, pluginDestination, uninstallPlugin } from "../src/plugins/manager.ts";
+import { checkCompat, satisfies, parseVersion, harnessVersion } from "../src/plugins/compat.ts";
 import { loadPlugins } from "../src/plugins/loader.ts";
+import { encodeLine, MAX_HOST_FRAME_BYTES } from "../src/plugins/host/rpc.ts";
 import { pluginPanelDirs } from "../src/plugins/panels.ts";
+import { parsePluginAsset, pipeAsset, resolveAssetPath } from "../src/plugins/http.ts";
 import { Logger } from "../src/util/log.ts";
 
 const NL = String.fromCharCode(10);
@@ -39,6 +42,109 @@ test("compat: version parsing and range matching", () => {
   assert.equal(satisfies("1.2.9", "~1.2.0").ok, true);
   assert.equal(satisfies("1.3.0", "~1.2.0").ok, false, "tilde 不允许跨 minor");
   assert.equal(satisfies("3.0.0", "^1.0.0 || ^3.0.0").ok, true, "多选范围");
+  assert.equal(satisfies("0.3.0", "^0.2.0").ok, false);
+  assert.equal(satisfies("0.0.2", "^0.0.1").ok, false);
+});
+
+test("compat: harness version belongs to the executable, regardless of the working directory", () => {
+  const before = process.cwd();
+  const expected = harnessVersion();
+  try {
+    process.chdir(ws());
+    assert.equal(harnessVersion(), expected);
+  } finally {
+    process.chdir(before);
+  }
+});
+
+test("plugin RPC frames are bounded before entering stdio buffers", () => {
+  assert.match(encodeLine({ ok: true }), /\n$/);
+  assert.throws(() => encodeLine({ payload: "x".repeat(MAX_HOST_FRAME_BYTES) }), /frame exceeds/);
+});
+
+test("plugin dependencies require the dependency to load successfully", async () => {
+  const root = ws();
+  const pluginRoot = path.join(root, ".harness", "plugins");
+  const depDir = path.join(pluginRoot, "broken-dep");
+  const appDir = path.join(pluginRoot, "dependent-app");
+  mkdirSync(depDir, { recursive: true });
+  mkdirSync(appDir, { recursive: true });
+  writeFileSync(path.join(depDir, "plugin.json"), JSON.stringify({ name: "broken-dep", version: "1.0.0", entry: "missing.ts" }), "utf8");
+  writeFileSync(path.join(appDir, "plugin.json"), JSON.stringify({ name: "dependent-app", version: "1.0.0", entry: "index.ts", dependencies: { "broken-dep": "^1.0.0" } }), "utf8");
+  writeFileSync(path.join(appDir, "index.ts"), "export function activate(api) { api.registerTool({ name: 'ShouldNotLoad', description: 'x', inputSchema: {type:'object',properties:{}}, isReadOnly:true, isConcurrencySafe:()=>true, call:()=>({content:'x'}) }); }\n", "utf8");
+
+  const loaded = await loadPlugins(root, new Logger("error"));
+  assert.equal(loaded.plugins.some((plugin) => plugin.name === "dependent-app"), false);
+  assert.equal(loaded.tools.some((tool) => tool.name === "ShouldNotLoad"), false);
+  assert.ok(loaded.errors.some((error) => error.plugin === "dependent-app" && /缺少依赖插件/.test(error.message)));
+});
+
+test("plugin dependency cycles are rejected", async () => {
+  const root = ws();
+  const pluginRoot = path.join(root, ".harness", "plugins");
+  for (const [name, dependency] of [["cycle-a", "cycle-b"], ["cycle-b", "cycle-a"]]) {
+    const dir = path.join(pluginRoot, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({ name, version: "1.0.0", entry: "index.ts", dependencies: { [dependency]: "^1.0.0" } }), "utf8");
+    writeFileSync(path.join(dir, "index.ts"), "export function activate() {}\n", "utf8");
+  }
+  const loaded = await loadPlugins(root, new Logger("error"));
+  assert.equal(loaded.plugins.length, 0);
+  assert.equal(loaded.errors.filter((error) => /依赖关系形成循环/.test(error.message)).length, 2);
+});
+
+test("plugin ids must be valid unique route segments", async () => {
+  const root = ws();
+  const pluginRoot = path.join(root, ".harness", "plugins");
+  for (const name of ["first", "second"]) {
+    const dir = path.join(pluginRoot, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({ name, id: " shared ", version: "1.0.0", entry: "index.ts" }), "utf8");
+    writeFileSync(path.join(dir, "index.ts"), "export function activate() {}\n", "utf8");
+  }
+  const loaded = await loadPlugins(root, new Logger("error"));
+  assert.equal(loaded.plugins.length, 0);
+  assert.equal(loaded.runtimes.length, 0);
+  assert.equal(loaded.errors.length, 2);
+  assert.ok(loaded.errors.every((e) => /duplicate plugin id/.test(e.message)));
+});
+
+test("plugin destinations must be named child directories", () => {
+  const root = ws();
+  for (const name of ["", ".", "..", "...", "name.", "CON", "a/b", "a\\b"]) {
+    assert.throws(() => pluginDestination(root, name));
+  }
+});
+
+test("assets: encoded filenames resolve inside the plugin UI directory", () => {
+  const pluginDir = pluginSrc();
+  const uiDir = path.join(pluginDir, "ui");
+  writeFileSync(path.join(uiDir, "my icon.svg"), "<svg/>");
+  const request = parsePluginAsset("/plugin-assets/demo/my%20icon.svg");
+  assert.ok(request);
+  const runtime = {
+    pluginId: "demo", pluginDir, uiDir,
+    routes: [], panels: [], commands: [], tools: [], hooks: [], skills: [], promptSections: [],
+  };
+  const asset = resolveAssetPath(runtime, request.file);
+  assert.ok(asset);
+  assert.equal(readFileSync(asset, "utf8"), "<svg/>");
+  assert.equal(resolveAssetPath({ ...runtime, uiDir: ws() }, request.file), null);
+});
+
+test("assets: a file disappearing before stream open returns 404", async () => {
+  const missing = path.join(ws(), "missing.js");
+  const server = createServer((_req, res) => pipeAsset(missing, res));
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const response = await fetch("http://127.0.0.1:" + address.port);
+    assert.equal(response.status, 404);
+    await response.text();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("compat: engines and dependency checks produce errors", () => {
@@ -76,6 +182,38 @@ test("install: rejects an incompatible engines range before copying", () => {
   assert.equal(res.ok, false);
   assert.match(res.error ?? "", /不兼容/);
   assert.equal(existsSync(path.join(root, ".harness", "plugins", "futuristic")), false, "失败时不该留下残留");
+});
+
+test("install: accepts enabled installed dependencies with a matching version", () => {
+  const root = ws();
+  const consumer = pluginSrc("consumer", { dependencies: { base: "^1.0.0" } });
+  assert.equal(installPlugin(root, consumer).ok, false);
+  assert.equal(installPlugin(root, pluginSrc("base")).ok, true);
+  const result = installPlugin(root, consumer);
+  assert.equal(result.ok, true, result.error ?? "");
+});
+
+test("install: a forced reinstall from the installed directory keeps the package", () => {
+  const root = ws();
+  const first = installPlugin(root, pluginSrc());
+  assert.ok(first.dir);
+  const updated = installPlugin(root, first.dir, { force: true });
+  assert.equal(updated.ok, true, updated.error ?? "");
+  assert.ok(existsSync(path.join(first.dir, "index.ts")));
+  assert.ok(existsSync(path.join(first.dir, "plugin.lock.json")));
+});
+
+test("install: a staged copy without its entry leaves the previous version in place", () => {
+  const root = ws();
+  const first = installPlugin(root, pluginSrc("replacement"));
+  assert.ok(first.dir);
+  const next = pluginSrc("replacement", { entry: "node_modules/entry.js" });
+  mkdirSync(path.join(next, "node_modules"));
+  writeFileSync(path.join(next, "node_modules", "entry.js"), "");
+  const result = installPlugin(root, next, { force: true });
+  assert.equal(result.ok, false);
+  assert.ok(existsSync(path.join(first.dir, "index.ts")));
+  assert.equal(JSON.parse(readFileSync(path.join(first.dir, "plugin.json"), "utf8")).entry, "index.ts");
 });
 
 test("install: rejects an entry that escapes the plugin folder", () => {

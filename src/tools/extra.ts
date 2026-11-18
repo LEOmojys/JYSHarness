@@ -1,7 +1,8 @@
 /** Tools added in the product build: jobs, todos, web search/fetch, skills. */
 import { loadSkillBody } from "../core/skills.ts";
 import { WebSearchTool } from "./webSearch.ts";
-import { addMemory, forgetMemory, MAX_MEMORY_CHARS, readMemoryEntries } from "../core/memory.ts";
+import { addMemory, forgetMemory, MAX_MEMORY_CHARS, memoryPath, readMemoryEntries } from "../core/memory.ts";
+import { guardPath } from "../sandbox/paths.ts";
 import { fetchReadableText } from "../util/pageText.ts";
 import { formatJob } from "../core/jobs.ts";
 import { bool, num, str, type Tool } from "./types.ts";
@@ -163,7 +164,7 @@ export const WebFetchTool: Tool = {
     // 截断时必须告诉模型"还有多少、怎么继续拿"，否则它会以为页面就这么多
     const more =
       page.nextOffset != null
-        ? "\n\n[已截断：全文 " +
+        ? "\n\n[已截断：全文至少 " +
           page.totalChars +
           " 字符，本次返回 " +
           (page.offset ?? 0) +
@@ -172,7 +173,9 @@ export const WebFetchTool: Tool = {
           "；继续读取请传 offset=" +
           page.nextOffset +
           "]"
-        : "";
+        : page.truncated
+          ? "\n\n[页面超过 4MB 读取上限；以上仅为已读取前缀，剩余内容未获取，不能视为完整页面]"
+          : "";
     return {
       content: "status=" + page.status + " url=" + page.url + "\n" + (page.text ?? "") + more,
       metadata: { status: page.status, bytes: page.bytes },
@@ -235,6 +238,13 @@ export const MemoryTool: Tool = {
   },
   isReadOnly: false,
   isConcurrencySafe: () => false,
+  // 记忆文件每轮都会拼进系统提示 —— 写它就是"改以后每次会话的行为"，
+  // 所以必须过路径守卫：read-only 沙箱下拒绝，受保护路径上也拒绝。
+  // 没有这道检查时，Memory 在任何模式下都能直接 writeFileSync。
+  toolCheck: (input, ctx) =>
+    str(input, "action", "list") === "list"
+      ? null
+      : guardPath(memoryPath(ctx.workspaceRoot), { access: "write", policy: ctx.sandbox }).decision,
   async call(input, ctx) {
     const action = str(input, "action", "list");
     if (action === "list") {

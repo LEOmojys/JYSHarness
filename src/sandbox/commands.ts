@@ -37,6 +37,8 @@ export interface CommandResult {
 }
 
 const MAX_STREAM = 200_000;
+/** 超限后继续保留的尾部窗口：报错几乎总在最后几行。 */
+const TAIL_STREAM = 64_000;
 
 export function shellForPlatform(): { cmd: string; args: string[] } {
   if (cachedShell) return cachedShell;
@@ -89,6 +91,10 @@ export async function runCommand(
     let stderr = "";
     let outBytes = 0;
     let errBytes = 0;
+    let outDropped = 0;
+    let errDropped = 0;
+    let tailOut = "";
+    let tailErr = "";
     let killed = false;
 
     const timer = setTimeout(() => {
@@ -106,12 +112,20 @@ export async function runCommand(
       if (outBytes < MAX_STREAM) {
         stdout += d.toString("utf8");
         outBytes += d.length;
+      } else {
+        // 超限后不能直接丢弃：命令报错几乎总在最后几行，而 formatCommandResult
+        // 承诺"头尾都留"。保留一个滚动尾窗，才有"尾"可留。
+        outDropped += d.length;
+        tailOut = (tailOut + d.toString("utf8")).slice(-TAIL_STREAM);
       }
     });
     child.stderr?.on("data", (d: Buffer) => {
       if (errBytes < MAX_STREAM) {
         stderr += d.toString("utf8");
         errBytes += d.length;
+      } else {
+        errDropped += d.length;
+        tailErr = (tailErr + d.toString("utf8")).slice(-TAIL_STREAM);
       }
     });
 
@@ -124,12 +138,14 @@ export async function runCommand(
     child.on("close", (code) => {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
+      const withTail = (head: string, dropped: number, tail: string): string =>
+        dropped ? head + "\n[... " + dropped + " bytes omitted ...]\n" + tail : head;
       resolve({
-        stdout,
-        stderr,
+        stdout: withTail(stdout, outDropped, tailOut),
+        stderr: withTail(stderr, errDropped, tailErr),
         exitCode: code ?? (killed ? 124 : 1),
         timedOut: killed,
-        truncated: outBytes >= MAX_STREAM || errBytes >= MAX_STREAM,
+        truncated: outDropped > 0 || errDropped > 0,
       });
     });
   });

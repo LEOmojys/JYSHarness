@@ -1,9 +1,38 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { toWire } from "../src/providers/anthropic.ts";
+import { sseLines } from "../src/providers/types.ts";
 import { textBlock, toolResultMessage, userMessage } from "../src/core/types.ts";
 
 const asst = (blocks: any[]) => ({ role: "assistant", content: blocks, stopReason: "end_turn" });
+
+test("SSE reader is cancelled and unlocked when the consumer stops early", async () => {
+  let cancelled = 0;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: first\n"));
+    },
+    cancel() {
+      cancelled++;
+    },
+  });
+  const iterator = sseLines(body);
+  assert.deepEqual(await iterator.next(), { value: "data: first", done: false });
+  await iterator.return(undefined);
+  assert.equal(cancelled, 1);
+  assert.equal(body.locked, false);
+});
+
+test("SSE reader releases its lock when the underlying stream errors", async () => {
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.error(new Error("stream failed"));
+    },
+  });
+  const iterator = sseLines(body);
+  await assert.rejects(iterator.next(), /stream failed/);
+  assert.equal(body.locked, false);
+});
 
 test("anthropic wire: consecutive user messages are merged", () => {
   const msgs: any[] = [

@@ -4,19 +4,19 @@
  *
  * Failures are isolated per plugin: a broken plugin never blocks a session.
  */
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { configHome } from "../core/configStore.ts";
 import { pathToFileURL } from "node:url";
-import type { HookDefinition, HookEvent, HookPayload, HookResult } from "../hooks/hooks.ts";
+import { HOOK_EVENTS, type HookDefinition, type HookEvent, type HookPayload, type HookResult } from "../hooks/hooks.ts";
 import { parseFrontmatter } from "../core/skills.ts";
-import { CAPABILITY_BY_KIND, checkCompat, hasPermission } from "./compat.ts";
+import { CAPABILITY_BY_KIND, checkCompat, hasPermission, isPluginName } from "./compat.ts";
+import { isInside } from "../sandbox/paths.ts";
 import { hostFor, type PluginHost } from "./host/client.ts";
 import { findCordisPlugin, runCordisPlugin } from "./cordis.ts";
 import type { Tool } from "../tools/types.ts";
 import type { Logger } from "../util/log.ts";
 import type {
-  LoadedPlugin,
   PluginApi,
   PluginCommand,
   PluginHookHandler,
@@ -24,11 +24,9 @@ import type {
   PluginManifest,
   PluginPanel,
   PluginRoute,
-  PluginRuntime,
   SkillContribution,
 } from "./types.ts";
 
-const HOOK_EVENTS: HookEvent[] = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
 const ENTRY_CANDIDATES = ["index.ts", "index.mjs", "index.js"];
 
 export interface DiscoveredPlugin {
@@ -116,19 +114,60 @@ export function inspectPlugins(workspaceRoot: string): PluginInfo[] {
 
 /** Flip "enabled" in plugin.json without touching anything else. */
 export function setPluginEnabled(dir: string, enabled: boolean): void {
-  const manifestPath = path.join(dir, "plugin.json");
-  const raw = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-  raw.enabled = enabled;
-  writeFileSync(manifestPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+  const manifestPath = checkedManifestPath(path.join(dir, "plugin.json"));
+  const manifest = readManifest(manifestPath);
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, enabled }, null, 2) + "\n", "utf8");
+}
+
+function checkedManifestPath(file: string): string {
+  const resolved = realpathSync.native(file);
+  if (!isInside(realpathSync.native(path.dirname(file)), resolved)) {
+    throw new Error("plugin.json escapes the plugin folder");
+  }
+  return resolved;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateManifest(value: unknown): asserts value is PluginManifest {
+  if (!isRecord(value)) throw new Error("plugin.json must be an object");
+  if (!isPluginName(value.name)) throw new Error("plugin.json needs a valid plugin name");
+  for (const field of ["version", "description", "entry", "skills", "ui", "id"]) {
+    if (value[field] !== undefined && typeof value[field] !== "string") {
+      throw new Error("plugin.json " + field + " must be a string");
+    }
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("plugin.json enabled must be boolean");
+  if (value.isolation !== undefined && value.isolation !== "process" && value.isolation !== "in-process") {
+    throw new Error("invalid plugin.json isolation mode");
+  }
+  for (const field of ["engines", "dependencies"]) {
+    const ranges = value[field];
+    if (ranges !== undefined && (!isRecord(ranges) || !Object.values(ranges).every((v) => typeof v === "string"))) {
+      throw new Error("plugin.json " + field + " must map names to version ranges");
+    }
+  }
+  if (value.contributes !== undefined) {
+    if (!isRecord(value.contributes)) throw new Error("plugin.json contributes must be an object");
+    const permissions = value.contributes.permissions;
+    if (permissions !== undefined && (!Array.isArray(permissions) || !permissions.every((p) => typeof p === "string"))) {
+      throw new Error("plugin.json permissions must be an array of strings");
+    }
+  }
+  if (value.panels !== undefined && (!Array.isArray(value.panels) || !value.panels.every((panel: unknown) =>
+    isRecord(panel) && typeof panel.id === "string" && typeof panel.title === "string" &&
+    (panel.icon === undefined || typeof panel.icon === "string") &&
+    (panel.slot === undefined || typeof panel.slot === "string") &&
+    (panel.order === undefined || typeof panel.order === "number")))) {
+    throw new Error("invalid plugin.json panels");
+  }
 }
 
 export function readManifest(manifestPath: string): PluginManifest {
-  const raw = readFileSync(manifestPath, "utf8");
-  const parsed = JSON.parse(raw) as PluginManifest;
-  if (!parsed || typeof parsed !== "object") throw new Error("plugin.json must be an object");
-  if (!parsed.name || !/^[a-zA-Z0-9._-]+$/.test(parsed.name)) {
-    throw new Error("plugin.json needs a name matching [a-zA-Z0-9._-]");
-  }
+  const parsed: unknown = JSON.parse(readFileSync(checkedManifestPath(manifestPath), "utf8"));
+  validateManifest(parsed);
   return parsed;
 }
 
@@ -137,32 +176,37 @@ export function resolveEntry(pluginDir: string, manifest: PluginManifest): strin
   const candidates = manifest.entry ? [manifest.entry] : ENTRY_CANDIDATES;
   for (const candidate of candidates) {
     const abs = path.resolve(pluginDir, candidate);
-    const rel = path.relative(pluginDir, abs);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    if (!isInside(pluginDir, abs)) {
       throw new Error("entry escapes the plugin folder: " + candidate);
     }
-    if (existsSync(abs) && statSync(abs).isFile()) return abs;
+    if (existsSync(abs)) {
+      const real = realpathSync.native(abs);
+      if (!isInside(realpathSync.native(pluginDir), real)) throw new Error("entry escapes the plugin folder: " + candidate);
+      if (statSync(real).isFile()) return real;
+    }
   }
   throw new Error("no entry module found (looked for " + candidates.join(", ") + ")");
 }
 
 function readPluginSkills(pluginDir: string, skillsRel: string): SkillContribution[] {
   const root = path.resolve(pluginDir, skillsRel);
-  const rel = path.relative(pluginDir, root);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return [];
+  if (!isInside(pluginDir, root)) return [];
   if (!existsSync(root)) return [];
   const out: SkillContribution[] = [];
   const files: string[] = [];
+  const pluginRoot = realpathSync.native(pluginDir);
   const walk = (dir: string, depth: number) => {
     if (depth > 3) return;
     for (const name of readdirSync(dir)) {
-      const abs = path.join(dir, name);
+      const abs = realpathSync.native(path.join(dir, name));
+      if (!isInside(pluginRoot, abs)) continue;
       if (statSync(abs).isDirectory()) walk(abs, depth + 1);
       else if (name.toLowerCase().endsWith(".md")) files.push(abs);
     }
   };
   try {
-    walk(root, 0);
+    const resolvedRoot = realpathSync.native(root);
+    if (isInside(pluginRoot, resolvedRoot)) walk(resolvedRoot, 0);
   } catch {
     return [];
   }
@@ -178,6 +222,13 @@ function readPluginSkills(pluginDir: string, skillsRel: string): SkillContributi
     }
   }
   return out;
+}
+
+function pluginUiDir(pluginDir: string, ui = "ui"): string | null {
+  const dir = path.resolve(pluginDir, ui);
+  if (!isInside(pluginDir, dir) || !existsSync(dir)) return null;
+  const resolved = realpathSync.native(dir);
+  return isInside(realpathSync.native(pluginDir), resolved) && statSync(resolved).isDirectory() ? dir : null;
 }
 
 function mergeHook(
@@ -211,24 +262,61 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
     warnings: [],
   };
 
-  // 先把所有可用插件名与版本收集起来，供依赖校验使用（依赖可以指向后面才加载的插件）
-  let discoveredAll = discoverPlugins(workspaceRoot);
-  if (opts.onlyDirs?.length) {
-    const norm = (p: string) => path.resolve(p).toLowerCase();
-    const allow = new Set(opts.onlyDirs.map(norm));
-    discoveredAll = discoveredAll.filter((d) => allow.has(norm(d.dir)));
-  }
-  const availableNames = new Map<string, string>();
+  // 读取 enabled manifests 并建立依赖图。依赖插件必须先成功加载，才能成为后续插件的 available。
+  const discoveredAll = discoverPlugins(workspaceRoot);
+  const manifestByDir = new Map<string, PluginManifest>();
+  const discoveredByName = new Map<string, (typeof discoveredAll)[number]>();
+  const installedNames = new Map<string, string>();
+  const idOwners = new Map<string, string[]>();
   for (const d of discoveredAll) {
     try {
       const m = readManifest(d.manifestPath);
-      if (m.enabled !== false) availableNames.set(m.name, m.version ?? "0.0.0");
+      if (m.enabled === false) continue;
+      manifestByDir.set(d.dir, m);
+      discoveredByName.set(m.name, d);
+      installedNames.set(m.name, m.version ?? "0.0.0");
+      const id = (m.id ?? path.basename(d.dir)).trim();
+      if (!isPluginName(id)) continue;
+      const key = id.toLowerCase();
+      idOwners.set(key, [...(idOwners.get(key) ?? []), path.basename(d.dir)]);
     } catch {
       /* 坏清单留给下面报错 */
     }
   }
+  const duplicateIds = new Map([...idOwners].filter(([, owners]) => owners.length > 1));
+  const loadOrder: (typeof discoveredAll)[number][] = [];
+  const visitState = new Map<string, 0 | 1 | 2>();
+  const visitStack: string[] = [];
+  const cyclicNames = new Set<string>();
+  const visit = (name: string): void => {
+    const state = visitState.get(name) ?? 0;
+    if (state === 2) return;
+    if (state === 1) {
+      const at = visitStack.indexOf(name);
+      for (const cycleName of visitStack.slice(Math.max(0, at))) cyclicNames.add(cycleName);
+      cyclicNames.add(name);
+      return;
+    }
+    const discovered = discoveredByName.get(name);
+    if (!discovered) return;
+    const manifest = manifestByDir.get(discovered.dir);
+    if (!manifest) return;
+    visitState.set(name, 1);
+    visitStack.push(name);
+    for (const dep of Object.keys(manifest.dependencies ?? {})) {
+      if (discoveredByName.has(dep)) visit(dep);
+    }
+    visitStack.pop();
+    visitState.set(name, 2);
+    loadOrder.push(discovered);
+  };
+  for (const name of discoveredByName.keys()) visit(name);
+  const invalidManifests = discoveredAll.filter((d) => !manifestByDir.has(d.dir));
+  loadOrder.push(...invalidManifests);
+  const successfullyLoaded = new Map<string, string>();
 
-  for (const discovered of discoveredAll) {
+  for (const discovered of loadOrder) {
+    if (opts.onlyDirs && !opts.onlyDirs.some((dir) => path.relative(dir, discovered.dir) === "")) continue;
     const label = path.basename(discovered.dir);
     let manifest: PluginManifest;
     try {
@@ -238,9 +326,26 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
       continue;
     }
     if (manifest.enabled === false) continue;
+    if (cyclicNames.has(manifest.name)) {
+      result.errors.push({ plugin: label, message: "依赖关系形成循环：" + manifest.name });
+      continue;
+    }
+    const pluginId = (manifest.id ?? label).trim();
+    if (!isPluginName(pluginId)) {
+      result.errors.push({ plugin: label, message: "plugin.json id must be a valid single path segment" });
+      continue;
+    }
+    const idKey = pluginId.toLowerCase();
+    const owners = duplicateIds.get(idKey);
+    if (owners) {
+      result.errors.push({ plugin: label, message: "duplicate plugin id '" + pluginId + "' shared by: " + owners.join(", ") });
+      continue;
+    }
 
     // 兼容性/依赖：明确报错而不是"加载了但行为怪"
-    const compat = checkCompat(manifest, availableNames);
+    // process host 内只加载单个隔离插件，依赖兼容性由父侧加载顺序预检；普通加载只承认成功进入 runtime 的依赖。
+    const availableForCheck = opts.onlyDirs ? installedNames : successfullyLoaded;
+    const compat = checkCompat(manifest, availableForCheck);
     const fatal = compat.filter((i) => i.severity === "error");
     if (fatal.length) {
       result.errors.push({ plugin: label, message: "兼容性校验失败：" + fatal.map((i) => i.message).join("；") });
@@ -252,6 +357,9 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
     // 必须在 resolveEntry/import 之前分流，否则插件代码仍在父进程执行，隔离形同虚设。
     if (manifest.isolation === "process" && !opts.forceInProcess) {
       await loadInHost(discovered.dir, workspaceRoot, manifest, logger, result, discovered.source);
+      if (result.plugins.some((plugin) => plugin.dir === discovered.dir)) {
+        successfullyLoaded.set(manifest.name, manifest.version ?? "0.0.0");
+      }
       continue;
     }
 
@@ -339,7 +447,7 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
           warnings.push("duplicate panel id: " + panel.id);
           return;
         }
-        panels.push({ id: panel.id, title: panel.title, icon: panel.icon, slot: panel.slot ?? "sidebar" });
+        panels.push({ id: panel.id, title: panel.title, icon: panel.icon, slot: panel.slot ?? "sidebar", order: panel.order });
       },
       registerCommand: (command) => {
         if (!command?.name || typeof command.run !== "function") {
@@ -396,13 +504,10 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
     for (const warning of warnings) result.warnings.push({ plugin: label, message: warning });
 
     // v2：把路由/面板/命令/UI 资产目录收进运行时表，供服务端挂载
-    const pluginId = (manifest.id ?? label).trim();
-    const uiRel = (manifest as { ui?: string }).ui ?? "ui";
-    const uiAbs = path.resolve(discovered.dir, uiRel);
-    const uiInside = !path.relative(discovered.dir, uiAbs).startsWith("..");
-    const uiDir = uiInside && existsSync(uiAbs) && statSync(uiAbs).isDirectory() ? uiAbs : null;
-    if (routes.length || panels.length || commands.length || uiDir || tools.length || skills.length || hooks.length) {
+    const uiDir = pluginUiDir(discovered.dir, manifest.ui);
+    if (routes.length || panels.length || commands.length || uiDir || tools.length || skills.length || hooks.length || sections.length) {
       result.runtimes.push({
+        pluginDir: discovered.dir,
         pluginId,
         routes,
         panels,
@@ -424,6 +529,7 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
       skills: skills.length,
       hooks: hooks.length,
     });
+    successfullyLoaded.set(manifest.name, manifest.version ?? "0.0.0");
   }
 
   // 命令名冲突检测：/deploy 这种名字如果两个插件都注册，先加载的那个会静默生效，
@@ -497,17 +603,13 @@ async function loadInHost(
     });
   }
 
-  const uiRel = manifest.ui ?? "ui";
-  const uiAbs = path.resolve(pluginDir, uiRel);
-  const uiInside = !path.relative(pluginDir, uiAbs).startsWith("..");
-  const uiDir = uiInside && existsSync(uiAbs) && statSync(uiAbs).isDirectory() ? uiAbs : null;
-
   result.runtimes.push({
+    pluginDir,
     pluginId,
     routes: contributions.routes,
     panels: contributions.panels,
     commands: contributions.commands,
-    uiDir,
+    uiDir: pluginUiDir(pluginDir, manifest.ui),
     // 工具/hook 的真实函数在子进程里，父进程只持有代理：
     // 这里放代理对象，保证"runtime 里能拿到本插件工具"的语义不变。
     tools: contributions.tools,

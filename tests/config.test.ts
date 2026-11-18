@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -65,6 +65,23 @@ test("config: secrets never land in settings files", async () => {
     assert.equal(described.key.present, true);
     assert.equal(described.key.hint, "sk-m…3456");
     assert.ok(!JSON.stringify(described).includes("sk-my-secret-123456"));
+  });
+});
+
+test("config: corrupt secrets are backed up before a replacement can be written", async () => {
+  await withHome(async () => {
+    const original = "{ this is truncated json";
+    await writeFile(userSecretsPath(), original, "utf8");
+    assert.deepEqual(readSecrets(), {});
+    const dir = path.dirname(userSecretsPath());
+    const backups = (await readdir(dir)).filter((name) => name.startsWith("secrets.json.corrupt-"));
+    assert.equal(backups.length, 1, "damaged source must be preserved before returning an empty object");
+    assert.equal(await readFile(path.join(dir, backups[0]!), "utf8"), original);
+
+    const { writeSecret } = await import("../src/core/configStore.ts");
+    writeSecret("openai", "key-1");
+    assert.deepEqual(readSecrets(), { openai: "key-1" });
+    assert.equal(await readFile(path.join(dir, backups[0]!), "utf8"), original);
   });
 });
 

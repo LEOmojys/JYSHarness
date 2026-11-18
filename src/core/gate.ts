@@ -7,6 +7,7 @@
 import { runHooks } from "../hooks/hooks.ts";
 import { decidePermission, type PermissionDecision } from "../permissions/engine.ts";
 import { describeSandbox } from "../sandbox/paths.ts";
+import { validateAgainstSchema } from "../tools/types.ts";
 import type { PreparedCall } from "../tools/registry.ts";
 import type { ToolResult } from "../tools/types.ts";
 import type { ToolResultBlock } from "./types.ts";
@@ -40,6 +41,14 @@ export async function gateCall(
     },
     { cwd: params.toolContext.cwd, logger: params.logger, signal: params.signal },
   );
+  if (params.signal.aborted) {
+    return {
+      type: "tool_result",
+      tool_use_id: request.id,
+      content: "<tool_use_error>Tool call cancelled before execution.</tool_use_error>",
+      is_error: true,
+    };
+  }
   if (pre.decision === "deny") {
     return {
       type: "tool_result",
@@ -49,7 +58,22 @@ export async function gateCall(
     };
   }
   if (pre.updatedInput) {
-    request.input = { ...request.input, ...pre.updatedInput };
+    const next = { ...request.input, ...pre.updatedInput };
+    // hook 改完参数必须重新过一遍 schema/validate。prepareCall 校验的是**原始**输入，
+    // 之后没有第二道关，于是 hook 能把 `{file_path: ["a"]}` / `{command: {}}` 这类
+    // 非法值直接送进工具，表现成 "Tool threw an error" 而不是可纠正的 tool_use_error。
+    const schemaError = validateAgainstSchema(tool.inputSchema, next);
+    const customError = schemaError ? null : (tool.validate?.(next) ?? null);
+    const invalid = schemaError ?? customError;
+    if (invalid) {
+      return {
+        type: "tool_result",
+        tool_use_id: request.id,
+        content: "<tool_use_error>PreToolUse hook produced an invalid input: " + invalid + "</tool_use_error>",
+        is_error: true,
+      };
+    }
+    request.input = next;
   }
 
   // Layers 2/4/5: declarative rules, tool checks, mode policy.
@@ -72,6 +96,14 @@ export async function gateCall(
       decision,
       origin: params.toolContext.depth > 0 ? "subagent" : undefined,
     });
+    if (params.signal.aborted) {
+      return {
+        type: "tool_result",
+        tool_use_id: request.id,
+        content: "<tool_use_error>Tool call cancelled while awaiting approval.</tool_use_error>",
+        is_error: true,
+      };
+    }
     if (outcome === "always") {
       params.onAlwaysAllow?.(request.name, request.input);
       final = { behavior: "allow", reason: "rule_allow", message: "approved by user (always)" };

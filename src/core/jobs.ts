@@ -22,6 +22,8 @@ export interface Job {
 }
 
 const MAX_OUTPUT = 200_000;
+/** 保留的后台任务上限：每个 job 带着最多 200KB 输出和一个 child 引用，不能只增不减。 */
+const MAX_JOBS = 32;
 
 export class JobManager {
   private jobs = new Map<string, Job>();
@@ -38,32 +40,73 @@ export class JobManager {
     });
     const job: Job = { id, command, startedAt: Date.now(), status: "running", output: "", truncated: false, child };
     this.jobs.set(id, job);
+    this.evictFinished();
 
+    const omission = "\n...[earlier output omitted]...\n";
+    const headLimit = Math.floor((MAX_OUTPUT - omission.length) / 2);
+    const tailLimit = MAX_OUTPUT - omission.length - headLimit;
+    const safeTail = (chunk: Buffer): string => {
+      let start = Math.max(0, chunk.length - tailLimit);
+      while (start < chunk.length && (chunk[start]! & 0xc0) === 0x80) start++;
+      return chunk.subarray(start).toString("utf8");
+    };
+    const safeHead = (chunk: Buffer): string => {
+      let end = Math.min(headLimit, chunk.length);
+      while (end > 0 && end < chunk.length && (chunk[end]! & 0xc0) === 0x80) end--;
+      return chunk.subarray(0, end).toString("utf8");
+    };
     const append = (chunk: Buffer) => {
-      if (job.output.length > MAX_OUTPUT) {
-        job.truncated = true;
-        job.output = job.output.slice(-Math.floor(MAX_OUTPUT / 2));
+      if (!job.truncated && job.output.length + chunk.length <= MAX_OUTPUT) {
+        job.output += chunk.toString("utf8");
+        return;
       }
-      job.output += chunk.toString("utf8");
+      job.truncated = true;
+      // 若单个 data 块本身巨大，只对首尾小窗口做解码；不先把整块转成字符串。
+      if (chunk.length > MAX_OUTPUT) {
+        const head = job.output ? job.output.slice(0, headLimit) : safeHead(chunk);
+        const tail = safeTail(chunk);
+        job.output = head + omission + tail;
+        return;
+      }
+      const marker = job.output.indexOf(omission);
+      const head = marker >= 0 ? job.output.slice(0, marker) : job.output.slice(0, headLimit);
+      const oldTail = marker >= 0 ? job.output.slice(marker + omission.length) : job.output.slice(headLimit);
+      const tail = (oldTail + chunk.toString("utf8")).slice(-tailLimit);
+      job.output = head + omission + tail;
     };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
     child.on("error", (err) => {
       job.status = "failed";
       job.finishedAt = Date.now();
-      job.output += "\n[spawn error] " + err.message;
+      append(Buffer.from("\n[spawn error] " + err.message));
+      this.evictFinished();
     });
     child.on("close", (code) => {
-      if (job.status === "killed") return;
-      job.exitCode = code ?? 1;
-      job.status = code === 0 ? "done" : "failed";
-      job.finishedAt = Date.now();
+      if (job.status !== "killed") {
+        job.exitCode = code ?? 1;
+        job.status = code === 0 ? "done" : "failed";
+        job.finishedAt = Date.now();
+      }
+      this.evictFinished();
     });
     return job;
   }
 
   get(id: string): Job | undefined {
     return this.jobs.get(id);
+  }
+
+  /** 回收已结束的最旧任务；运行中的不动（它们还可能在写输出）。 */
+  private evictFinished(): void {
+    if (this.jobs.size <= MAX_JOBS) return;
+    const finished = [...this.jobs.values()]
+      .filter((j) => j.status !== "running")
+      .sort((a, b) => a.startedAt - b.startedAt);
+    for (const job of finished) {
+      if (this.jobs.size <= MAX_JOBS) break;
+      this.jobs.delete(job.id);
+    }
   }
 
   list(): Job[] {
@@ -76,6 +119,7 @@ export class JobManager {
     job.status = "killed";
     job.finishedAt = Date.now();
     job.child.kill("SIGKILL");
+    this.evictFinished();
     return true;
   }
 
@@ -83,9 +127,11 @@ export class JobManager {
     for (const job of this.jobs.values()) {
       if (job.status === "running") {
         job.status = "killed";
+        job.finishedAt = Date.now();
         job.child.kill("SIGKILL");
       }
     }
+    this.evictFinished();
   }
 
   async waitFor(id: string, timeoutMs: number): Promise<Job | undefined> {

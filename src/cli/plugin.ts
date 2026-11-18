@@ -2,10 +2,10 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverPlugins, loadPlugins } from "../plugins/loader.ts";
-import { installPlugin, listInstalled, uninstallPlugin } from "../plugins/manager.ts";
+import { inspectPlugins, loadPlugins, setPluginEnabled } from "../plugins/loader.ts";
+import { installPlugin, listInstalled, pluginDestination, uninstallPlugin } from "../plugins/manager.ts";
 import { Logger, paint } from "../util/log.ts";
-import { parseArgs } from "./bootstrap.ts";
+import { parseArgs, GLOBAL_VALUE_FLAGS } from "./bootstrap.ts";
 
 const TEMPLATE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "scripts", "templates", "plugin");
 
@@ -15,16 +15,24 @@ const USAGE = [
   "  new <name> [--workspace <dir>] [--force]        创建插件脚手架",
   "  install <dir|git-url> [--user] [--force] [--disabled]  安装插件",
   "  uninstall <name> [--user]                       卸载插件",
+  "  enable|disable <name> [--user]                  启用/停用插件（写 plugin.json 的 enabled）",
   "  list [--workspace <dir>] [--json]               列出插件（含来源与权限）",
   "  test [--workspace <dir>]                        加载并校验插件，出错返回非 0",
   "",
   "插件目录：<workspace>/.harness/plugins/<name>/ 或 ~/.jysharness/plugins/<name>/",
 ].join("\n");
 
+/**
+ * 第一个"位置参数"（跳过全局带值 flag 的值）。
+ *
+ * 值必须和 flag 一起跳过，否则 `plugin new --workspace X demo` 里的 `X`
+ * 会被当成插件名 —— 名字会被拿去拼目录，跳错等于把目录建到别处。
+ */
 function firstPositional(argv: string[]): string | undefined {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--workspace" || a === "--port" || a === "--mode") {
+    if (a === "--") break;
+    if (GLOBAL_VALUE_FLAGS.has(a)) {
       i++;
       continue;
     }
@@ -36,7 +44,6 @@ function firstPositional(argv: string[]): string | undefined {
 
 /** 插件子命令自己的 flag：parseArgs 不认识它们，必须先摘掉，否则会报 unknown flag。 */
 const PLUGIN_FLAGS = ["--json", "--force", "--disabled", "--user"];
-const GLOBAL_VALUE_FLAGS = new Set(["--workspace", "--provider", "--model", "--mode", "--sandbox", "--port", "--resume", "--max-turns", "--agent-mode"]);
 
 /**
  * 拆出子命令与插件专有 flag。
@@ -49,6 +56,8 @@ export function splitPluginArgs(argv: string[]): { sub: string; rest: string[]; 
   const flags = new Set<string>();
   const rest: string[] = [];
   let sub = "";
+  // `-h` 不是子命令（它是 flag），不单独识别的话 `jys plugin --help` 会落到默认的 list。
+  const wantsHelp = argv.includes("-h") || argv.includes("--help");
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     const isFlag = a.startsWith("-");
@@ -71,7 +80,7 @@ export function splitPluginArgs(argv: string[]): { sub: string; rest: string[]; 
     }
     rest.push(a);
   }
-  return { sub: sub || "list", rest, flags };
+  return { sub: sub || (wantsHelp ? "help" : "list"), rest, flags };
 }
 export async function runPlugin(argvRaw: string[]): Promise<void> {
   const parsed = splitPluginArgs(argvRaw);
@@ -82,9 +91,11 @@ export async function runPlugin(argvRaw: string[]): Promise<void> {
     console.log(USAGE);
     return;
   }
-  if (sub === "new" || sub === "create") return scaffold(rest);
+  if (sub === "new" || sub === "create") return scaffold(rest, parsed.flags);
   if (sub === "install" || sub === "add") return install(rest, parsed.flags);
   if (sub === "uninstall" || sub === "remove" || sub === "rm") return uninstall(rest, parsed.flags);
+  if (sub === "disable" || sub === "off") return setEnabled(rest, false, parsed.flags);
+  if (sub === "enable" || sub === "on") return setEnabled(rest, true, parsed.flags);
   if (sub === "list" || sub === "ls") return list(rest, parsed.flags);
   if (sub === "test" || sub === "check") return test(rest);
 
@@ -97,7 +108,7 @@ function render(template: string, name: string): string {
   return readFileSync(path.join(TEMPLATE_DIR, template), "utf8").split("__NAME__").join(name);
 }
 
-function scaffold(argv: string[]): void {
+function scaffold(argv: string[], flags: Set<string>): void {
   const args = parseArgs(argv);
   const name = firstPositional(argv);
   if (!name) {
@@ -116,7 +127,9 @@ function scaffold(argv: string[]): void {
     return;
   }
 
-  const force = argv.includes("--force");
+  // --force 在 splitPluginArgs 里被摘进 flags，rest 里已经没有它了；
+  // 只看 argv.includes("--force") 会永远是 false，覆盖因此静默失效。
+  const force = flags.has("--force") || argv.includes("--force");
   const dir = path.join(args.workspace, ".harness", "plugins", name);
   if (existsSync(dir) && !force) {
     console.error(paint.red("已存在：" + dir + "（加 --force 覆盖）"));
@@ -142,7 +155,9 @@ function scaffold(argv: string[]): void {
 async function list(argv: string[], flags: Set<string>): Promise<void> {
   const args = parseArgs(argv);
   const logger = new Logger("warn");
-  const discovered = discoverPlugins(args.workspace);
+  // 文本列表用 inspectPlugins（磁盘上的全部插件，含停用/损坏），而不是 loadPlugins：
+  // 后者只返回成功加载的，停用的插件会整个从列表里消失 —— 用户就看不到它、也没法再启用。
+  const infos = inspectPlugins(args.workspace);
   const result = await loadPlugins(args.workspace, logger);
 
   // --json：给脚本/CI 用，输出与 /api/plugins 同构的字段
@@ -168,38 +183,60 @@ async function list(argv: string[], flags: Set<string>): Promise<void> {
 
   console.log("");
   console.log(paint.bold("工作区：") + args.workspace);
-  if (!discovered.length) {
+  if (!infos.length) {
     console.log(paint.dim("  未发现插件。用 jys plugin new <name> 创建第一个，或 jys plugin install <目录|git-url>。"));
     console.log("");
     return;
   }
-  // 一次全量读取，避免在循环里对每个插件重新 discover 一遍（原来是 O(n²)）
-  const installedByName = new Map(listInstalled(args.workspace).map((m) => [m.name, m]));
-  for (const err of result.errors) console.log("  " + paint.red("x") + " " + err.plugin + ": " + err.message);
-  for (const warn of result.warnings) console.log("  " + paint.yellow("!") + " " + warn.plugin + ": " + warn.message);
-  for (const plugin of result.plugins) {
+  const loadedByName = new Map(result.plugins.map((p) => [p.name, p]));
+  const metaByName = new Map(listInstalled(args.workspace).map((m) => [m.name, m]));
+  // 错误只打印一次：以前同一批错误在函数头尾各打一遍（一遍半角冒号、一遍全角）
+  for (const err of result.errors) console.log("  " + paint.red("x") + " " + err.plugin + "：" + err.message);
+  for (const warn of result.warnings) console.log("  " + paint.yellow("!") + " " + warn.plugin + "：" + warn.message);
+  for (const info of infos) {
+    const loaded = loadedByName.get(info.name);
+    const meta = metaByName.get(info.name);
+    const counts = loaded
+      ? paint.dim("  tools=" + loaded.tools + " skills=" + loaded.skills + " hooks=" + loaded.hooks)
+      : paint.dim("  （未加载）");
     console.log(
       "  " +
-        paint.green("*") +
+        (info.enabled ? paint.green("*") : paint.dim("-")) +
         " " +
-        paint.bold(plugin.name) +
-        paint.dim("  v" + plugin.version + "  [" + plugin.source + "]") +
-        paint.dim("  tools=" + plugin.tools + " skills=" + plugin.skills + " hooks=" + plugin.hooks),
+        paint.bold(info.name) +
+        paint.dim("  v" + info.version + "  [" + info.source + "]") +
+        counts,
     );
-    console.log(paint.dim("    " + plugin.dir));
+    console.log(paint.dim("    " + info.dir));
+    if (info.error) console.log(paint.dim("    错误：" + info.error));
     // 来源与能力声明：安装前就能看见"这个插件对外开了什么"
-    const meta = installedByName.get(plugin.name);
-    if (meta) {
-      const bits: string[] = [];
-      if (meta.installedFrom) bits.push("来源 " + meta.installedFrom);
-      if (meta.permissions.length) bits.push("能力 " + meta.permissions.join(","));
-      if (meta.panels) bits.push("面板 " + meta.panels);
-      if (!meta.enabled) bits.push("已停用");
-      if (bits.length) console.log(paint.dim("    " + bits.join(" · ")));
-    }
+    const bits: string[] = [];
+    if (meta?.installedFrom) bits.push("来源 " + meta.installedFrom);
+    if (meta?.permissions.length) bits.push("能力 " + meta.permissions.join(","));
+    if (meta?.panels) bits.push("面板 " + meta.panels);
+    if (!info.enabled) bits.push("已停用");
+    if (bits.length) console.log(paint.dim("    " + bits.join(" · ")));
   }
-  for (const err of result.errors) console.log("  " + paint.red("x") + " " + err.plugin + "：" + err.message);
   console.log("");
+}
+
+/** 启用/停用：只翻 plugin.json 的 enabled，不碰代码与 lock 文件。 */
+function setEnabled(argv: string[], enabled: boolean, flags: Set<string>): void {
+  const args = parseArgs(argv);
+  const name = firstPositional(argv);
+  if (!name) {
+    console.error(paint.red("用法：jys plugin " + (enabled ? "enable" : "disable") + " <name> [--user]"));
+    process.exitCode = 2;
+    return;
+  }
+  const dir = pluginDestination(args.workspace, name, flags.has("--user") ? "user" : "project");
+  if (!existsSync(path.join(dir, "plugin.json"))) {
+    console.error(paint.red("未安装：" + name + "（" + dir + "）"));
+    process.exitCode = 1;
+    return;
+  }
+  setPluginEnabled(dir, enabled);
+  console.log(paint.green((enabled ? "已启用 " : "已停用 ") + name) + paint.dim("  " + dir));
 }
 
 async function test(argv: string[]): Promise<void> {

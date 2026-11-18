@@ -5,6 +5,7 @@
  * Security: loopback bind, Origin check, workspace-contained file API.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { HttpError, json, readJson, serveStatic, text } from "./http.ts";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -16,10 +17,12 @@ import { realResolve, isInside, sandboxEnforcement } from "../sandbox/paths.ts";
 import { loadSettings } from "../core/config.ts";
 import { isValidRule, readRuleArrays, writeRuleArrays, type RuleArrays } from "../core/ruleStore.ts";
 import { describeHooks } from "../hooks/hooks.ts";
-import { describeConfig, resolveApiKey, saveAppConfig, type ConfigPatch, type McpServerView } from "../core/configStore.ts";
+import { describeConfig, readAppConfig, resolveApiKey, saveAppConfig, type ConfigPatch, type McpServerView } from "../core/configStore.ts";
 import type { ModelProvider } from "../providers/types.ts";
 import type { Tool } from "../tools/types.ts";
 import { inspectPlugins, loadPlugins, setPluginEnabled } from "../plugins/loader.ts";
+import { shutdownHost, shutdownHosts } from "../plugins/host/client.ts";
+import type { PluginLoadResult } from "../plugins/types.ts";
 import { createWorktree, listWorktrees, mainRepositoryRoot, removeWorktree } from "../core/worktrees.ts";
 import { parsePluginAsset, parsePluginRoute, pipeAsset, resolveAssetPath } from "../plugins/http.ts";
 import { pluginPanelDirs, type PanelDecl } from "../plugins/panels.ts";
@@ -34,16 +37,6 @@ import {
   validateWorkspace,
 } from "../core/workspaces.ts";
 import type { Logger } from "../util/log.ts";
-
-const UI_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "ui");
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".ico": "image/x-icon",
-};
 
 const CLI_MAIN = fileURLToPath(new URL("../cli/main.ts", import.meta.url));
 
@@ -65,6 +58,7 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", ".h
 
 export interface ServerOptions {
   session: Session;
+  initialPlugins?: PluginLoadResult;
   /** Factory for additional sessions (new tab / fork / another workspace). */
   makeSession?: (
     workspaceRoot?: string,
@@ -96,6 +90,13 @@ export interface RunningServer {
   close: () => Promise<void>;
 }
 
+/**
+ * 带 HTTP 状态码的错误：catch 里据此回不同状态码。
+ * 以前所有客户端错误（坏 JSON、超限、坏 URL）都统一变成 500 + "internal error"，
+/** 权限模式与沙箱模式的合法取值：模式是安全边界，不能接受任意字符串。 */
+const PERMISSION_MODES = new Set(["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"]);
+const SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+
 interface PendingApproval {
   resolve: (outcome: ApprovalOutcome) => void;
   timer: NodeJS.Timeout;
@@ -119,6 +120,16 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const sessions = new Map<string, Hosted>();
   let activeId = "";
   let approvalSeq = 0;
+  /**
+   * 自己的 origin / Host 白名单，listen 之后才知道真实端口。
+   *
+   * 以前只校验 `http://127.0.0.1|localhost`（端口任意）且 origin 缺失直接放行 ——
+   * 本机任何其他端口上的页面（dev server、Jupyter、被 XSS 的本地工具）都能打到
+   * /api/config 把 sandbox 改成 danger-full-access，等于远程 RCE。
+   * 这里收紧成"精确到自己监听的端口"，并补上 Host 头校验（DNS rebinding）。
+   */
+  const selfOrigins = new Set<string>();
+  const selfHosts = new Set<string>();
 
   /**
    * 转录存储。**不能**通过 current().session.store 去拿：
@@ -126,8 +137,22 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
    * 于是删除接口自己 500（实测就是这个）。
    */
   const sessionStore = opts.session.store;
+  const workspacePlugins = new Map<string, Promise<PluginLoadResult>>();
+  if (opts.initialPlugins) workspacePlugins.set(opts.session.workspaceRoot, Promise.resolve(opts.initialPlugins));
 
-  function register(session: Session): Hosted {
+  function pluginsFor(root: string): Promise<PluginLoadResult> {
+    const existing = workspacePlugins.get(root);
+    if (existing) return existing;
+    const loading = loadPlugins(root, logger).catch((err: unknown) => {
+      if (workspacePlugins.get(root) === loading) workspacePlugins.delete(root);
+      throw err;
+    });
+    workspacePlugins.set(root, loading);
+    return loading;
+  }
+
+  async function register(session: Session): Promise<Hosted> {
+    session.applyPlugins(await pluginsFor(session.workspaceRoot));
     const hosted: Hosted = { session, running: false, abort: null, pending: new Map(), changes: [] };
     sessions.set(session.sessionId, hosted);
     session.setApprover((req) => askApproval(hosted, req));
@@ -306,7 +331,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     }
     const fresh = await opts.makeSession!(target);
     await fresh.init();
-    const hosted = register(fresh);
+    const hosted = await register(fresh);
     activeId = fresh.sessionId;
     rememberWorkspace(target);
     return buildState(hosted);
@@ -360,14 +385,26 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     }
   }
 
-  register(opts.session);
+  await register(opts.session);
 
   const server: Server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://" + host + ":" + port);
     const route = url.pathname;
     const origin = req.headers.origin;
-    if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) {
+    // 精确匹配自己的 origin：只放行本服务实际监听的端口。
+    if (origin && selfOrigins.size && !selfOrigins.has(origin)) {
       res.writeHead(403).end("forbidden origin");
+      return;
+    }
+    // Host 头也要认：没有这条，DNS rebinding 能让外部域名解析到 127.0.0.1 后
+    // 用同源的 GET 读走 /api/file 里的密钥（浏览器同源 GET 不发 Origin）。
+    const hostHeader = String(req.headers.host ?? "").toLowerCase();
+    if (selfHosts.size && hostHeader && !selfHosts.has(hostHeader)) {
+      res.writeHead(421).end("misdirected request (bad host)");
+      return;
+    }
+    if (req.headers["sec-fetch-site"] === "cross-site") {
+      res.writeHead(403).end("forbidden cross-site request");
       return;
     }
 
@@ -453,18 +490,21 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             resumeMessages: loaded.messages,
           });
           await fresh.init();
-          const hosted = register(fresh);
+          const hosted = await register(fresh);
           activeId = body.id;
           return json(res, 200, await buildState(hosted));
         }
         if (action === "new" || action === "fork") {
           if (!opts.makeSession) return json(res, 400, { error: "session factory not configured" });
-          const fresh = await opts.makeSession(current().session.workspaceRoot);
-          if (action === "fork") {
-            fresh.messages = JSON.parse(JSON.stringify(current().session.messages));
-          }
+          const source = current().session;
+          const fresh = await opts.makeSession(source.workspaceRoot);
           await fresh.init();
-          register(fresh);
+          if (action === "fork") {
+            // 继承来的历史必须一起落盘：只赋 fresh.messages 的话，重启后 fork
+            // 会话只剩 fork 之后的两条消息，上下文全丢。
+            await fresh.replaceMessages(JSON.parse(JSON.stringify(source.messages)));
+          }
+          await register(fresh);
           activeId = fresh.sessionId;
           return json(res, 200, await buildState(sessions.get(fresh.sessionId)!));
         }
@@ -497,7 +537,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           if (sessions.size === 0 && opts.makeSession) {
             const fresh = await opts.makeSession(undefined);
             await fresh.init();
-            register(fresh);
+            await register(fresh);
           }
           if (wasActive || !sessions.has(activeId)) {
             activeId = sessions.keys().next().value ?? activeId;
@@ -539,6 +579,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         };
         const h = body.session ? sessions.get(body.session) : current();
         if (!h) return json(res, 404, { error: "no such session" });
+        // 枚举白名单：模式是安全边界，"随便传个字符串"不该被当成合法的权限模式。
+        if (body.mode !== undefined && !PERMISSION_MODES.has(body.mode)) return json(res, 400, { error: "unknown permission mode: " + body.mode });
+        if (body.sandbox !== undefined && !SANDBOX_MODES.has(body.sandbox)) return json(res, 400, { error: "unknown sandbox mode: " + body.sandbox });
         if (body.mode) h.session.setMode(body.mode as never);
         if (body.sandbox) h.session.setSandbox(body.sandbox as never);
         if (body.agentMode === "default" || body.agentMode === "makePlugin") {
@@ -574,9 +617,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             sessionId: h.session.sessionId,
             level: undone ? "info" : "warn",
             code: undone ? "undo_done" : "undo_none",
-            params: undone ? { id: undone.id, count: undone.restored.length } : {},
+            params: undone ? { id: undone.id, count: undone.restored.length, skipped: undone.skipped?.length ?? 0 } : {},
             text: undone
-              ? "undid " + undone.id + ": restored " + undone.restored.length + " file(s)"
+              ? "undid " + undone.id + ": restored " + undone.restored.length + " file(s)" + (undone.skipped?.length ? "; " + undone.skipped.length + " file(s) remain for retry" : "")
               : "nothing to undo",
           });
         } else if (name === "skills") {
@@ -586,7 +629,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         } else {
           // 插件命令：和 REPL 共用同一套查找（不用记哪些是内置、哪些是插件）。
           // 用 plugins/commands.ts 而不是 import("../cli/main.ts")：避免服务端反向依赖 CLI。
-          const hit = await findPluginCommand(h.session.workspaceRoot, name, args.join(" "));
+          const root = h.session.workspaceRoot;
+          const hit = await findPluginCommand(root, name, args.join(" "), (await pluginsFor(root)).runtimes);
           if (!hit) return json(res, 400, { error: "unknown command" });
           broadcast({
             type: "notice",
@@ -608,6 +652,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
 
       if (route === "/api/config" && req.method === "POST") {
+        const h0 = current();
         const body = (await readJson(req)) as ConfigPatch;
         if (body.provider === "compatible" && !body.baseUrl) {
           return json(res, 400, { error: "自定义兼容端点需要填写 Base URL" });
@@ -618,8 +663,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         if (body.temperature !== undefined && (body.temperature < 0 || body.temperature > 2)) {
           return json(res, 400, { error: "temperature 需要在 0 到 2 之间" });
         }
+        if (body.permissionMode !== undefined && !PERMISSION_MODES.has(body.permissionMode)) {
+          return json(res, 400, { error: "unknown permission mode: " + body.permissionMode });
+        }
+        if (body.sandboxMode !== undefined && !SANDBOX_MODES.has(body.sandboxMode)) {
+          return json(res, 400, { error: "unknown sandbox mode: " + body.sandboxMode });
+        }
 
-        const h0 = current();
         // Fail before writing anything: a saved config with no usable key would
         // brick the next start.
         const targetProvider = body.provider ?? h0.session.provider.id;
@@ -630,15 +680,18 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             return json(res, 400, { error: "缺少 API Key：请先填写密钥再保存" });
           }
         }
-        saveAppConfig(h0.session.workspaceRoot, body);
+        const savedConfig = saveAppConfig(h0.session.workspaceRoot, body);
         for (const h of sessions.values()) {
+          const sameWorkspace = h.session.workspaceRoot === h0.session.workspaceRoot;
+          if (!sameWorkspace && body.scope !== "user") continue;
+          const behavior = sameWorkspace ? savedConfig.behavior : readAppConfig({ workspaceRoot: h.session.workspaceRoot }).behavior;
           h.session.applyBehavior({
-            permissionMode: body.permissionMode,
-            sandboxMode: body.sandboxMode,
-            maxTurns: body.maxTurns,
-            maxTokens: body.maxTokens,
-            temperature: body.temperature,
-            fallbackModel: body.fallbackModel,
+            permissionMode: body.permissionMode === undefined ? undefined : behavior.permissionMode,
+            sandboxMode: body.sandboxMode === undefined ? undefined : behavior.sandboxMode,
+            maxTurns: body.maxTurns === undefined ? undefined : behavior.maxTurns,
+            maxTokens: body.maxTokens === undefined ? undefined : behavior.maxTokens,
+            temperature: body.temperature === undefined ? undefined : behavior.temperature,
+            fallbackModel: body.fallbackModel === undefined ? undefined : behavior.fallbackModel,
           });
         }
 
@@ -651,7 +704,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
               baseUrl: body.baseUrl,
               apiKeyEnv: body.apiKeyEnv,
             });
-            for (const h of sessions.values()) h.session.setProvider(built.provider, built.model);
+            for (const h of sessions.values()) {
+              // 只改同一工作区的会话（user scope 才是全局）：
+              // 以前无条件遍历，在 A 项目保存设置会把 B 会话的 provider/model/baseUrl
+              // 一起换掉 —— B 的转录从此发往 A 的端点。
+              const sameWorkspace = h.session.workspaceRoot === h0.session.workspaceRoot;
+              if (!sameWorkspace && body.scope !== "user") continue;
+              h.session.setProvider(built.provider, built.model);
+            }
             opts.providerId = built.provider.id;
             opts.providerNote = built.note;
           } catch (err) {
@@ -734,13 +794,18 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       // 放在 /api/* 之前：这两类是"插件拥有的路由"，不参与内核路由表。
       const pluginRoute = parsePluginRoute(route);
       if (pluginRoute) {
-        const loadedPlugins = await loadPlugins(current().session.workspaceRoot, logger);
+        const workspaceRoot = current().session.workspaceRoot;
+        const loadedPlugins = await pluginsFor(workspaceRoot);
         const runtime = loadedPlugins.runtimes.find((r) => r.pluginId === pluginRoute.id);
         if (!runtime) return json(res, 404, { error: "plugin not found: " + pluginRoute.id });
         const hit = runtime.routes.find((r) => r.method === req.method && r.path === pluginRoute.rest);
         if (!hit) return json(res, 404, { error: "no route " + req.method + " /" + pluginRoute.rest + " in plugin " + pluginRoute.id });
         try {
-          const body = req.method === "POST" ? await readJson(req).catch(() => ({})) : undefined;
+          let body: unknown;
+          if (req.method === "POST") {
+            try { body = await readJson(req); }
+            catch { return json(res, 400, { error: "invalid request body" }); }
+          }
           const query: Record<string, string> = {};
           url.searchParams.forEach((v, k) => (query[k] = v));
           const out = await hit.handler({
@@ -749,7 +814,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             path: pluginRoute.rest,
             query,
             body,
-            workspaceRoot: current().session.workspaceRoot,
+            workspaceRoot,
           });
           if (out?.text !== undefined) return text(res, out.status ?? 200, out.text);
           return json(res, out?.status ?? 200, out?.json ?? {});
@@ -760,7 +825,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
       const assetReq = parsePluginAsset(route);
       if (assetReq) {
-        const loadedPlugins = await loadPlugins(current().session.workspaceRoot, logger);
+        const loadedPlugins = await pluginsFor(current().session.workspaceRoot);
         const runtime = loadedPlugins.runtimes.find((r) => r.pluginId === assetReq.id);
         const abs = resolveAssetPath(runtime, assetReq.file);
         // 目录穿越、插件不存在、文件不存在都走同一个 404：不泄露"哪个路径存在"
@@ -771,12 +836,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (route === "/api/plugins" && req.method === "GET") {
         const ws = current().session.workspaceRoot;
         const infos = inspectPlugins(ws);
-        const loaded = await loadPlugins(ws, logger);
-        const byName = new Map(loaded.plugins.map((p) => [p.name, p]));
+        const loaded = await pluginsFor(ws);
+        const byDir = new Map(loaded.plugins.map((p) => [p.dir, p]));
         return json(res, 200, {
           workspace: ws,
           plugins: infos.map((info) => {
-            const hit = byName.get(info.name);
+            const hit = byDir.get(info.dir);
             return {
               ...info,
               tools: hit?.tools ?? 0,
@@ -789,14 +854,16 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
 
       if (route === "/api/plugins" && req.method === "POST") {
-        const body = (await readJson(req)) as { action?: string; dir?: string; enabled?: boolean; name?: string };
         const ws = current().session.workspaceRoot;
+        const body = (await readJson(req)) as { action?: string; dir?: string; enabled?: boolean; name?: string };
+        const target = typeof body.dir === "string" ? inspectPlugins(ws).find((p) => p.dir === body.dir) : undefined;
+        if ((body.action === "setEnabled" || body.action === "open") && !target) {
+          return json(res, 400, { error: "unknown plugin directory" });
+        }
 
-        if (body.action === "setEnabled" && body.dir) {
-          setPluginEnabled(body.dir, body.enabled !== false);
-          // 启停后必须让宿主失效：否则重新启用时仍用旧代码跑
-          const { shutdownHost } = await import("../plugins/host/client.ts");
-          shutdownHost(body.dir);
+        if (body.action === "setEnabled" && target) {
+          setPluginEnabled(target.dir, body.enabled !== false);
+          shutdownHost(target.dir);
         } else if (body.action === "open" && body.dir) {
           try {
             if (process.platform === "win32") spawn("explorer.exe", [body.dir], { detached: true }).unref();
@@ -817,14 +884,20 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           return json(res, 400, { error: "unknown action" });
         }
 
-        // reload 动作要先让全部宿主失效，否则"重新加载"只是读了缓存的旧贡献
-        if (body.action === "reload") {
-          const { shutdownHosts } = await import("../plugins/host/client.ts");
-          shutdownHosts();
+        const roots = target?.source === "user" ? [...workspacePlugins.keys()] : [ws];
+        for (const root of roots) {
+          if (body.action === "reload") shutdownHosts(root);
+          workspacePlugins.delete(root);
         }
-        const loaded = await loadPlugins(ws, logger);
-        for (const h of sessions.values()) h.session.applyPlugins(loaded);
-        for (const h of sessions.values()) await emitState(h);
+        await Promise.all(roots.map(async (root) => {
+          const pending = pluginsFor(root);
+          const loaded = await pending;
+          if (workspacePlugins.get(root) !== pending) return;
+          const affected = [...sessions.values()].filter((h) => h.session.workspaceRoot === root);
+          for (const h of affected) h.session.applyPlugins(loaded);
+          await Promise.all(affected.map(emitState));
+        }));
+        const loaded = await pluginsFor(ws);
         return json(res, 200, {
           ok: true,
           loaded: loaded.plugins.length,
@@ -838,6 +911,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
 
       if (route === "/api/rules" && req.method === "POST") {
+        const workspace = current().session.workspaceRoot;
         const body = (await readJson(req)) as Partial<RuleArrays>;
         const incoming: RuleArrays = {
           allow: body.allow ?? [],
@@ -850,13 +924,18 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             if (problem) return json(res, 400, { error: behavior + ": " + problem });
           }
         }
-        const saved = writeRuleArrays(current().session.workspaceRoot, incoming);
-        // Reload from disk so every live session sees the new rules immediately.
-        const reloaded = loadSettings(current().session.workspaceRoot, {});
-        for (const h of sessions.values()) {
-          h.session.rules = reloaded.rules;
+        const saved = writeRuleArrays(workspace, incoming);
+        const reloaded = loadSettings(workspace);
+        const affected = [...sessions.values()].filter((h) => h.session.workspaceRoot === workspace);
+        for (const h of affected) {
+          for (const kind of ["allow", "ask", "deny"] as const) {
+            h.session.rules[kind] = [
+              ...h.session.rules[kind].filter((r) => r.source !== "project"),
+              ...reloaded.rules[kind].filter((r) => r.source === "project"),
+            ];
+          }
         }
-        for (const h of sessions.values()) await emitState(h);
+        await Promise.all(affected.map(emitState));
         return json(res, 200, saved);
       }
 
@@ -990,9 +1069,16 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
       return json(res, 404, { error: "not found" });
     } catch (err) {
-      logger.error("http error on " + route + ": " + (err instanceof Error ? err.message : String(err)));
-      if (!res.headersSent) json(res, 500, { error: "internal error" });
-      else res.end();
+      // 客户端错误（坏 JSON / 超限 / 坏 URL）是 4xx，不是 500：
+      // 前端据此提示"你发的东西有问题"，而不是"服务端崩了"。
+      const status =
+        err instanceof HttpError ? err.status : err instanceof URIError ? 400 : 500;
+      if (status >= 500) logger.error("http error on " + route + ": " + (err instanceof Error ? err.message : String(err)));
+      if (!res.headersSent) {
+        json(res, status, { error: status >= 500 ? "internal error" : (err instanceof Error ? err.message : "bad request") });
+      } else {
+        res.end();
+      }
     }
   });
 
@@ -1001,14 +1087,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     server.listen(port, host, () => resolve());
   });
 
-  // 兜底：无论从哪条路径退出，都别把插件宿主留成孤儿进程
-  if (!process.listenerCount("exit")) {
-    process.on("exit", () => {
-      void import("../plugins/host/client.ts").then((m) => m.shutdownHosts()).catch(() => undefined);
-    });
-  }
-
   const actualPort = (server.address() as { port: number }).port;
+
+  // 端口只有 listen 之后才知道，所以白名单在这里填。
+  const openToLan = host === "0.0.0.0" || host === "::";
+  const hostNames = openToLan ? [] : [...new Set([host, "127.0.0.1", "localhost", "[::1]"])];
+  for (const name of hostNames) {
+    selfHosts.add((name + ":" + actualPort).toLowerCase());
+    if (!name.startsWith("[")) selfOrigins.add("http://" + name + ":" + actualPort);
+  }
 
   return {
     url: "http://" + host + ":" + actualPort + "/",
@@ -1017,6 +1104,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       for (const h of sessions.values()) {
         h.abort?.abort();
         h.session.jobs.killAll();
+        // 未决审批的定时器必须在这里清掉：每个审批挂着一个 10 分钟的 Timeout，
+        // 不清理的话进程在 close() 之后还被这些句柄钉着（Ctrl+C 后要等十几秒才退）。
+        for (const [id, pending] of h.pending) {
+          clearTimeout(pending.timer);
+          pending.resolve("deny");
+          h.pending.delete(id);
+        }
+        h.running = false;
+        h.abort = null;
       }
       for (const res of clients) {
         try {
@@ -1027,9 +1123,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
       clients.clear();
       // 插件宿主是独立子进程：服务端关闭时必须一起收掉，否则会残留孤儿进程
-      const { shutdownHosts } = await import("../plugins/host/client.ts");
-      shutdownHosts();
+      for (const root of workspacePlugins.keys()) shutdownHosts(root);
+      // SSE / keep-alive 连接会把 close 回调拖住几秒：先掐空闲连接，
+      // 再给一个 1s 兜底，别让"退出"变成"等一会儿"。
+      server.closeIdleConnections?.();
+      const timer = setTimeout(() => server.closeAllConnections?.(), 1000);
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      clearTimeout(timer);
+      server.closeAllConnections?.();
     },
   };
 }
@@ -1069,55 +1170,5 @@ async function readWorkspaceFile(root: string, rel: string) {
   };
 }
 
-async function serveStatic(res: ServerResponse, rel: string): Promise<void> {
-  const safe = path.normalize(rel).replace(/^([.][.][\\/])+/, "");
-  const abs = path.join(UI_DIR, safe);
-  if (!abs.startsWith(UI_DIR)) {
-    res.writeHead(403).end("forbidden");
-    return;
-  }
-  try {
-    const data = await readFile(abs);
-    res.writeHead(200, {
-      "content-type": MIME[path.extname(abs)] ?? "application/octet-stream",
-      "cache-control": "no-store",
-    });
-    res.end(data);
-  } catch {
-    res.writeHead(404).end("not found");
-  }
-}
-
-function text(res: ServerResponse, status: number, body: string): void {
-  res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
-  res.end(body);
-}
-
-function json(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
-}
-
-function readJson(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    req.on("data", (d: Buffer) => {
-      buf += d.toString("utf8");
-      if (buf.length > 2_000_000) {
-        reject(new Error("payload too large"));
-        req.destroy();
-      }
-    });
-    req.on("end", () => {
-      if (!buf.trim()) return resolve({});
-      try {
-        resolve(JSON.parse(buf));
-      } catch {
-        reject(new Error("invalid JSON body"));
-      }
-    });
-    req.on("error", reject);
-  });
-}
 
 export type { HarnessEvent };

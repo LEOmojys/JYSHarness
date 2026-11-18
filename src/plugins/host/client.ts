@@ -5,17 +5,18 @@
  * 包成**普通工具/路由/命令/hook**交给上层 —— 这样 Session 与 HTTP 服务完全不用改。
  *
  * 关键取舍：
- *   - 按插件目录缓存宿主：服务端每个请求都会调 loadPlugins，每次重拉子进程会漏进程；
+ *   - 按工作区与插件目录缓存宿主，避免同一用户插件在不同项目间共享运行状态；
  *   - 崩溃不致命：子进程死了，它贡献的调用一律返回错误，其它插件照常；
  *   - 调用超时：插件卡死不能把整个会话拖死，超时后返回明确错误。
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { realResolve } from "../../sandbox/paths.ts";
 import type { Tool, ToolContext, ToolResult } from "../../tools/types.ts";
 import type { PluginCommand, PluginPanel, PluginRoute } from "../types.ts";
 import type { HostReady, HostRequest, HostResponse, PluginDescriptor } from "./rpc.ts";
-import { encodeLine, parseLine } from "./rpc.ts";
+import { encodeLine, parseLine, MAX_HOST_FRAME_BYTES, MAX_HOST_QUEUED_BYTES } from "./rpc.ts";
 
 const HOST_ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), "child.ts");
 
@@ -56,10 +57,12 @@ export interface HostContributions {
 
 export class PluginHost {
   private child: ChildProcess | null = null;
-  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private seq = 0;
+  private outboundBytes = 0;
   private readyPromise: Promise<HostContributions> | null = null;
   private dead = false;
+  private disposed = false;
   private lastError = "";
 
   readonly pluginDir: string;
@@ -74,9 +77,16 @@ export class PluginHost {
 
   /** 启动子进程并等到 ready；失败时 reject（调用方负责转成 error 记录）。 */
   async start(): Promise<HostContributions> {
+    if (this.disposed) throw new Error("插件宿主已关闭");
     if (this.readyPromise) return this.readyPromise;
-    this.readyPromise = this.spawnAndWait();
-    return this.readyPromise;
+    const boot = this.spawnAndWait();
+    this.readyPromise = boot;
+    try {
+      return await boot;
+    } catch (err) {
+      if (this.readyPromise === boot) this.readyPromise = null;
+      throw err;
+    }
   }
 
   private spawnAndWait(): Promise<HostContributions> {
@@ -112,37 +122,55 @@ export class PluginHost {
       maybeUnref(child.stderr);
 
       const bootTimer = setTimeout(() => {
-        this.kill();
+        child.kill("SIGKILL");
         reject(new Error("宿主启动超时（10s）：插件初始化太慢或卡住"));
       }, 10_000);
 
       child.stdout?.setEncoding("utf8");
       let buf = "";
+      let bufBytes = 0;
       child.stdout?.on("data", (chunk: string) => {
         buf += chunk;
+        bufBytes += Buffer.byteLength(chunk, "utf8");
         for (;;) {
           const nl = buf.indexOf(String.fromCharCode(10));
           if (nl < 0) break;
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
+          const frameBytes = Buffer.byteLength(line, "utf8") + 1;
+          bufBytes = Math.max(0, bufBytes - frameBytes);
+          if (frameBytes > MAX_HOST_FRAME_BYTES) {
+            this.onLog("error", "plugin host frame exceeds " + MAX_HOST_FRAME_BYTES + " bytes; terminating host");
+            child.kill("SIGKILL");
+            return;
+          }
           const msg = parseLine(line) as (HostReady | HostResponse | { type: "log"; level: string; message: string }) | null;
-          if (!msg) continue;
+          if (!msg || typeof msg !== "object") {
+            if (line.trim()) {
+              this.onLog("error", "plugin host emitted an invalid protocol frame; terminating host");
+              child.kill("SIGKILL");
+              return;
+            }
+            continue;
+          }
           if ("type" in msg && msg.type === "log") {
             this.onLog(msg.level, msg.message);
             continue;
           }
           if ("type" in msg && msg.type === "ready") {
             clearTimeout(bootTimer);
-            resolve(this.toContributions(msg));
+            if (!this.disposed) resolve(this.toContributions(msg));
             continue;
           }
           const resp = msg as HostResponse;
           const waiter = this.pending.get(resp.id);
           if (!waiter) continue;
-          this.pending.delete(resp.id);
-          clearTimeout(waiter.timer);
           if (resp.ok) waiter.resolve(resp.result);
           else waiter.reject(new Error(resp.error ?? "plugin host error"));
+        }
+        if (bufBytes > MAX_HOST_FRAME_BYTES) {
+          this.onLog("error", "plugin host sent an unterminated oversized frame; terminating host");
+          child.kill("SIGKILL");
         }
       });
 
@@ -150,12 +178,12 @@ export class PluginHost {
       child.stderr?.on("data", (chunk: Buffer) => this.onLog("warn", String(chunk).trimEnd()));
 
       const onDie = (code: number | null, signal: string | null) => {
+        if (this.child !== child) return;
         this.dead = true;
         this.lastError = "插件宿主已退出（code=" + String(code) + " signal=" + String(signal) + "）";
         clearTimeout(bootTimer);
         // 所有挂起调用立即失败，避免调用方永久等待
         for (const [, w] of this.pending) {
-          clearTimeout(w.timer);
           w.reject(new Error(this.lastError));
         }
         this.pending.clear();
@@ -165,6 +193,7 @@ export class PluginHost {
       };
       child.on("exit", onDie);
       child.on("error", (err) => onDie(null, err.message));
+      child.stdin?.on("error", () => child.kill("SIGKILL"));
     });
   }
 
@@ -197,7 +226,7 @@ export class PluginHost {
       }
 
       for (const p of d.panels) {
-        panels.push({ id: p.id, title: p.title, icon: p.icon, slot: p.slot as PluginPanel["slot"] });
+        panels.push({ id: p.id, title: p.title, icon: p.icon, slot: p.slot as PluginPanel["slot"], order: p.order });
       }
 
       for (const c of d.commands) {
@@ -221,8 +250,19 @@ export class PluginHost {
           pluginId: d.pluginId,
           event: h.event,
           handler: async (payload) => {
-            const out = await this.request("hook", { pluginId: d.pluginId, event: h.event, payload }, timeoutFor("hook"));
-            return (out as { result?: unknown }).result ?? {};
+            try {
+              const out = await this.request("hook", { pluginId: d.pluginId, event: h.event, hookIndex: h.index, payload }, timeoutFor("hook"));
+              return (out as { result?: unknown }).result ?? {};
+            } catch (err) {
+              // 隔离插件挂了/超时了，安全检查就"没有结论"。hooks.ts 会把异常吞成
+              // combined.error，而 gate.ts 只认 decision === "deny" —— 于是 deny 钩子
+              // 失效后工具照样执行（fail-open）。控制类事件必须显式拒绝。
+              const message = err instanceof Error ? err.message : String(err);
+              if (h.event === "PreToolUse" || h.event === "UserPromptSubmit" || h.event === "Stop") {
+                return { decision: "deny", reason: "plugin host unavailable: " + message };
+              }
+              throw err;
+            }
           },
         });
       }
@@ -253,11 +293,16 @@ export class PluginHost {
       inputSchema: t.inputSchema as Tool["inputSchema"],
       isReadOnly: t.isReadOnly,
       isDestructive: t.isDestructive,
-      isConcurrencySafe: () => true,
+      // The plugin's input-dependent predicate is synchronous and lives in the child.
+      isConcurrencySafe: () => false,
+      timeoutMs: t.timeoutMs,
+      retries: t.retries,
+      maxOutputChars: t.maxOutputChars,
       call: async (input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> => {
         try {
           // ctx.signal 是会话的取消信号：用户点停止时，子进程里的插件也会一起停
-          const out = await this.request("tool.call", { toolName: t.name, input }, timeoutFor("tool"), ctx?.signal);
+          const context = { cwd: ctx.cwd, workspaceRoot: ctx.workspaceRoot, sandbox: ctx.sandbox, depth: ctx.depth };
+          const out = await this.request("tool.call", { toolName: t.name, input, context }, timeoutFor("tool"), ctx.signal);
           const r = out as { content?: string; isError?: boolean; metadata?: Record<string, unknown> };
           return { content: r.content ?? "", isError: Boolean(r.isError), metadata: r.metadata };
         } catch (err) {
@@ -271,12 +316,44 @@ export class PluginHost {
     };
   }
 
+  /**
+   * 父到子写入有界：Node stdin.write(false) 代表内部缓冲积压，忽略它会让并发调用
+   * 把请求无限排进 Writable。每个 frame 有单独上限，排队总字节也有硬上限。
+   */
+  private writeFrame(child: ChildProcess, message: string): Promise<void> {
+    const bytes = Buffer.byteLength(message, "utf8");
+    if (bytes > MAX_HOST_FRAME_BYTES) return Promise.reject(new RangeError("plugin host frame exceeds size limit"));
+    if (this.outboundBytes + bytes > MAX_HOST_QUEUED_BYTES) {
+      return Promise.reject(new Error("plugin host outbound queue is full"));
+    }
+    const stdin = child.stdin;
+    if (!stdin || stdin.destroyed) return Promise.reject(new Error("plugin host stdin is closed"));
+    this.outboundBytes += bytes;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error | null) => {
+        if (settled) return;
+        settled = true;
+        this.outboundBytes = Math.max(0, this.outboundBytes - bytes);
+        if (err) reject(err);
+        else resolve();
+      };
+      try {
+        stdin.write(message, (err) => finish(err));
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
   /** 父 → 子：告诉它这次调用已经没人等了，请停掉。 */
   private sendAbort(id: number, reason: string): void {
+    const child = this.child;
+    if (!child) return;
     try {
-      this.child?.stdin?.write(encodeLine({ type: "abort", id, reason }));
+      void this.writeFrame(child, encodeLine({ type: "abort", id, reason })).catch(() => child.kill("SIGKILL"));
     } catch {
-      /* 子进程已经没了，abort 也就没意义 */
+      child.kill("SIGKILL");
     }
   }
 
@@ -286,6 +363,7 @@ export class PluginHost {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<unknown> {
+    if (this.disposed) throw new Error("插件宿主已关闭");
     if (this.dead || !this.child) {
       // 发现已死时尝试重启一次（插件自己退出后的自愈）
       try {
@@ -296,8 +374,9 @@ export class PluginHost {
       if (this.dead || !this.child) throw new Error(this.lastError || "插件宿主不可用");
     }
     const child = this.child;
-    if (!child || !child.stdin) throw new Error("插件宿主不可用");
+    if (this.disposed || !child || !child.stdin) throw new Error("插件宿主不可用");
     const id = ++this.seq;
+    const message = encodeLine({ id, method, ...payload });
     return new Promise((resolve, reject) => {
       const finish = (fn: () => void) => {
         cleanup();
@@ -321,38 +400,45 @@ export class PluginHost {
 
       if (signal) {
         if (signal.aborted) {
-          this.sendAbort(id, "父进程在调用前就已取消");
           finish(() => reject(new Error("插件调用被取消：" + method)));
           return;
         }
         signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      this.pending.set(id, { resolve, reject, timer });
-      child.stdin?.write(encodeLine({ id, method, ...payload }));
+      this.pending.set(id, {
+        resolve: (value) => finish(() => resolve(value)),
+        reject: (error) => finish(() => reject(error)),
+      });
+      void this.writeFrame(child, message).catch((err) => {
+        this.pending.get(id)?.reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
   }
 
   kill(): void {
+    this.disposed = true;
     // 先让子进程停掉进行中的调用，再杀进程：被杀时至少它收到过取消通知
     for (const id of this.pending.keys()) this.sendAbort(id, "宿主正在关闭");
     try {
-      this.child?.kill();
+      this.child?.kill("SIGKILL");
     } catch {
       /* 已经死了就算了 */
     }
-    this.child = null;
-    this.dead = true;
-    this.readyPromise = null;
+    for (const waiter of this.pending.values()) waiter.reject(new Error("插件宿主已关闭"));
   }
 
   get alive(): boolean {
-    return Boolean(this.child) && !this.dead;
+    return Boolean(this.child) && !this.dead && !this.disposed;
   }
 }
 
-// ---- 宿主缓存：同一个插件目录只拉一次子进程 ----
 const hosts = new Map<string, PluginHost>();
+
+function pathKey(dir: string): string {
+  const resolved = realResolve(dir);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
 
 // 进程退出兜底：无论从哪条路径退出（CLI 一次性命令、REPL、服务端、异常），
 // 都不把宿主留成孤儿进程。unref 之后事件循环能正常排空，这里才有机会执行。
@@ -368,10 +454,10 @@ process.once("exit", () => {
 });
 
 export function hostFor(pluginDir: string, workspaceRoot: string, onLog: (level: string, message: string) => void): PluginHost {
-  const key = path.resolve(pluginDir).toLowerCase();
+  const key = JSON.stringify([pathKey(workspaceRoot), pathKey(pluginDir)]);
   const existing = hosts.get(key);
-  if (existing && existing.alive) return existing;
-  const host = new PluginHost(path.resolve(pluginDir), workspaceRoot, onLog);
+  if (existing) return existing;
+  const host = new PluginHost(path.resolve(pluginDir), path.resolve(workspaceRoot), onLog);
   hosts.set(key, host);
   return host;
 }
@@ -384,18 +470,25 @@ export function hostFor(pluginDir: string, workspaceRoot: string, onLog: (level:
  * 把 index.ts 改成 v2，工具仍返回 v1。
  */
 export function shutdownHost(pluginDir: string): boolean {
-  const key = path.resolve(pluginDir).toLowerCase();
-  const host = hosts.get(key);
-  if (!host) return false;
-  host.kill();
-  hosts.delete(key);
-  return true;
+  const target = pathKey(pluginDir);
+  let removed = false;
+  for (const [key, host] of hosts) {
+    if (pathKey(host.pluginDir) !== target) continue;
+    host.kill();
+    hosts.delete(key);
+    removed = true;
+  }
+  return removed;
 }
 
-/** 关掉所有宿主（插件重载/进程退出时调用）。 */
-export function shutdownHosts(): void {
-  for (const h of hosts.values()) h.kill();
-  hosts.clear();
+/** 关闭指定工作区的宿主，省略工作区时关闭全部。 */
+export function shutdownHosts(workspaceRoot?: string): void {
+  const target = workspaceRoot === undefined ? undefined : pathKey(workspaceRoot);
+  for (const [key, host] of hosts) {
+    if (target !== undefined && pathKey(host.workspaceRoot) !== target) continue;
+    host.kill();
+    hosts.delete(key);
+  }
 }
 
 export function hostCount(): number {

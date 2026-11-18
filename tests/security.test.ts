@@ -228,6 +228,34 @@ test("security: transcripts and checkpoints cannot be rewritten by the agent", (
   }
 });
 
+test("security: Windows non-canonical path aliases cannot reach protected files", (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Win32 trims trailing dots/spaces and supports NTFS alternate streams");
+    return;
+  }
+  const root = mkdtempSync(path.join(os.tmpdir(), "jys-sec-win-alias-"));
+  const policy = { mode: "workspace-write" as const, workspaceRoot: root };
+  for (const rel of [
+    ".harness\\settings.json.",
+    ".harness\\settings.json ",
+    ".harness\\settings.json:secret",
+    ".harness\\skills.",
+  ]) {
+    const result = guardPath(path.join(root, rel), { access: "write", policy });
+    assert.equal(result.decision?.behavior, "deny", rel + " -> " + result.decision?.behavior);
+  }
+});
+
+test("security: non-Windows filenames retain their platform semantics", () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(path.join(os.tmpdir(), "jys-sec-unix-colon-"));
+  const result = guardPath(path.join(root, "file:stream"), {
+    access: "write",
+    policy: { mode: "workspace-write", workspaceRoot: root },
+  });
+  assert.equal(result.decision, null, "colon is a legal ordinary filename on POSIX");
+});
+
 test("security: an MCP namespace rule covers every tool of that server", () => {
   const denyGithub = ctx({ rules: addRules(emptyRuleSet(), [parseRule("mcp__github(*)", "deny")!]) });
   for (const tool of ["mcp__github__create_issue", "mcp__github__delete_repo"]) {

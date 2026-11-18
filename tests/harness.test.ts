@@ -79,6 +79,38 @@ test("plan mode denies writes, allows reads", () => {
   assert.equal(read.behavior, "allow");
 });
 
+test("plan mode is read-only for shell tools too", () => {
+  // shell 既不在 WRITE_TOOLS、也没有 isDestructive：旧判据会把它直接放行，
+  // 于是 plan 模式下 `echo x > file` 能改文件 —— 只读承诺是假的。
+  for (const [toolName, input] of [
+    ["Bash", { command: "echo hi > out.txt" }],
+    ["PowerShell", { command: "Set-Content out.txt hi" }],
+    ["JobKill", { job_id: "j1" }],
+  ] as const) {
+    const d = decidePermission(
+      { toolName, input: input as Record<string, unknown>, isReadOnly: false },
+      ctx({ mode: "plan" }),
+    );
+    assert.equal(d.behavior, "deny", toolName + " -> " + d.behavior);
+    assert.equal(d.reason, "mode_plan_deny", toolName);
+  }
+});
+
+test("dontAsk auto-denies approvals but still allows read-only tools", () => {
+  // dontAsk 的语义是"需要问的自动拒绝"，只读工具不需要问。
+  const read = decidePermission(
+    { toolName: "Read", input: { file_path: "a.ts" }, isReadOnly: true },
+    ctx({ mode: "dontAsk" }),
+  );
+  assert.equal(read.behavior, "allow");
+  const shell = decidePermission(
+    { toolName: "Bash", input: { command: "ls" }, isReadOnly: false },
+    ctx({ mode: "dontAsk" }),
+  );
+  assert.equal(shell.behavior, "deny");
+  assert.equal(shell.reason, "mode_dont_ask");
+});
+
 test("read-only sandbox blocks writes and path escape asks", () => {
   const root = realResolve(os.tmpdir());
   const policy = { mode: "read-only" as const, workspaceRoot: root };

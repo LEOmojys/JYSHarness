@@ -11,14 +11,17 @@
  *   - 子进程崩溃 = 贡献全部失效，父进程必须**继续工作**，所以调用侧一律返回错误而不是抛。
  */
 
+import type { Tool, ToolContext } from "../../tools/types.ts";
+import type { PluginPanel } from "../types.ts";
+
 export interface PluginDescriptor {
   pluginId: string;
   dir: string;
-  tools: { name: string; description: string; inputSchema: unknown; isReadOnly: boolean; isDestructive: boolean; concurrencySafe: boolean }[];
+  tools: Pick<Tool, "name" | "description" | "inputSchema" | "isReadOnly" | "isDestructive" | "timeoutMs" | "maxOutputChars" | "retries">[];
   routes: { pluginId: string; method: "GET" | "POST"; path: string }[];
-  panels: { id: string; title: string; icon?: string; slot?: string }[];
+  panels: PluginPanel[];
   commands: { pluginId: string; name: string; description: string }[];
-  hooks: { pluginId: string; event: string }[];
+  hooks: { pluginId: string; event: string; index: number }[];
   skills: { name: string; description: string; content: string }[];
   promptSections: string[];
 }
@@ -44,6 +47,7 @@ export interface HostRequest {
   /** tool.call */
   toolName?: string;
   input?: Record<string, unknown>;
+  context?: Pick<ToolContext, "workspaceRoot" | "cwd" | "sandbox" | "depth">;
   /** route */
   httpMethod?: string;
   path?: string;
@@ -54,6 +58,7 @@ export interface HostRequest {
   arg?: string;
   /** hook */
   event?: string;
+  hookIndex?: number;
   payload?: unknown;
   workspaceRoot?: string;
 }
@@ -83,8 +88,15 @@ export interface HostAbort {
 
 export type HostOutbound = HostReady | HostLog | HostResponse;
 
+export const MAX_HOST_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_HOST_QUEUED_BYTES = 16 * 1024 * 1024;
+
 export function encodeLine(obj: unknown): string {
-  return JSON.stringify(obj) + "\n";
+  const line = JSON.stringify(obj) + "\n";
+  if (Buffer.byteLength(line, "utf8") > MAX_HOST_FRAME_BYTES) {
+    throw new RangeError("plugin host frame exceeds " + MAX_HOST_FRAME_BYTES + " bytes");
+  }
+  return line;
 }
 
 export function parseLine(line: string): unknown | null {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { globSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { guardPath, isInside, realResolve } from "../sandbox/paths.ts";
@@ -8,6 +8,25 @@ import type { PermissionDecision } from "../permissions/engine.ts";
 
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", ".harness", ".next", "target", "__pycache__"]);
 const MAX_READ_LINES = 2000;
+let tmpSeq = 0;
+
+/**
+ * 原子写：先写同目录临时文件，再 rename 覆盖。
+ *
+ * 直接 writeFile 在中途崩溃/断电时会把目标文件截断成半截内容；检查点只存在内存里，
+ * 进程没了就跟着没了 —— 等于"改坏了还退不回去"。同目录 rename 是原子的。
+ * 个别环境（杀软/句柄占用）rename 会失败，此时退回直写：可用性优先于原子性。
+ */
+async function writeFileAtomic(abs: string, content: string): Promise<void> {
+  const tmp = path.join(path.dirname(abs), "." + path.basename(abs) + ".jys-tmp-" + process.pid + "-" + ++tmpSeq);
+  await writeFile(tmp, content, "utf8");
+  try {
+    await rename(tmp, abs);
+  } catch {
+    await writeFile(abs, content, "utf8");
+    await unlink(tmp).catch(() => {});
+  }
+}
 
 function pathCheck(
   input: Record<string, unknown>,
@@ -93,7 +112,7 @@ export const WriteTool: Tool = {
     const content = str(input, "content");
     ctx.checkpoints?.record(abs);
     await mkdir(path.dirname(abs), { recursive: true });
-    await writeFile(abs, content, "utf8");
+    await writeFileAtomic(abs, content);
     return {
       content: "Wrote " + Buffer.byteLength(content, "utf8") + " bytes to " + abs,
       metadata: { bytes: Buffer.byteLength(content, "utf8") },
@@ -129,11 +148,22 @@ export const EditTool: Tool = {
   async call(input, ctx) {
     const raw = str(input, "file_path");
     const abs = realResolve(path.isAbsolute(raw) ? raw : path.resolve(ctx.cwd, raw));
+    const info = await stat(abs).catch(() => null);
+    if (!info) return { content: "Error: file not found: " + abs, isError: true };
+    // 和 Read 一样设上限：没有 stat/上限时，Edit 一个 2GB 日志会先把进程读爆
+    //（checkpoints.record 与 commitCall 还会各整读一遍）。
+    if (info.size > 5_000_000) {
+      return { content: "Error: file too large (" + info.size + " bytes); edit only works on files under 5MB.", isError: true };
+    }
     const oldStr = str(input, "old_string");
     const newStr = str(input, "new_string");
     const replaceAll = bool(input, "replace_all", false);
-    const original = await readFile(abs, "utf8").catch(() => null);
-    if (original === null) return { content: "Error: file not found: " + abs, isError: true };
+    const rawText = await readFile(abs, "utf8").catch(() => null);
+    if (rawText === null) return { content: "Error: file not found: " + abs, isError: true };
+    // BOM 必须单独处理：Read 展示时剥掉了它，模型照着输出去构造 old_string，
+    // 而这里的原文带 BOM —— 不剥的话"改首行"永远 old_string not found。
+    const hadBom = rawText.charCodeAt(0) === 0xfeff;
+    const original = hadBom ? rawText.slice(1) : rawText;
 
     let count = 0;
     let idx = original.indexOf(oldStr);
@@ -152,7 +182,8 @@ export const EditTool: Tool = {
       ? original.split(oldStr).join(newStr)
       : original.slice(0, firstIdx) + newStr + original.slice(firstIdx + oldStr.length);
     ctx.checkpoints?.record(abs);
-    await writeFile(abs, updated, "utf8");
+    // BOM 原样还回去：剥掉是给匹配用的，不该改文件编码。
+    await writeFileAtomic(abs, hadBom ? "\uFEFF" + updated : updated);
 
     const changeStart = firstIdx;
     const lineNo = original.slice(0, changeStart).split("\n").length;
@@ -202,6 +233,9 @@ export const GlobTool: Tool = {
   },
   isReadOnly: true,
   isConcurrencySafe: () => true,
+  // 读工具也要过路径守卫：没有 toolCheck 时 `Glob({path:"C:\\Windows"})` 能直接列举
+  // 工作区外的目录 —— Read 会被 ask，Glob/Grep 却静默放行，等于沙箱有一条侧门。
+  toolCheck: (input, ctx) => pathCheck(input, ctx, "read"),
   async call(input, ctx) {
     const pattern = str(input, "pattern");
     // 相对路径必须相对会话 cwd，而不是服务进程的 cwd（否则会扫错目录）。
@@ -219,7 +253,11 @@ export const GlobTool: Tool = {
       walk(ctx.workspaceRoot, ctx.workspaceRoot, all, 5000);
       const re = new RegExp("^" + pattern.split("**").map((s) => s.replace(/[.+^$\(\)|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, ".")).join(".*") + "$");
       matches = all.filter((f) => re.test(path.relative(ctx.workspaceRoot, f).split(path.sep).join("/")));
-      if (!matches.length) matches = all;
+      // 兜底正则也没命中就返回空：把"全部文件"当成匹配结果，会让模型以为模式命中了，
+      // 接着基于一堆无关路径做决定（而且白烧几千 token）。
+      if (!matches.length) {
+        return { content: "No files matched pattern: " + pattern + " (searched " + all.length + " files)", metadata: { count: 0 } };
+      }
     }
     matches = [...new Set(matches)].sort();
     const shown = matches.slice(0, 200);
@@ -246,6 +284,7 @@ export const GrepTool: Tool = {
   },
   isReadOnly: true,
   isConcurrencySafe: () => true,
+  toolCheck: (input, ctx) => pathCheck(input, ctx, "read"),
   async call(input, ctx) {
     const source = str(input, "pattern");
     let re: RegExp;
@@ -268,13 +307,15 @@ export const GrepTool: Tool = {
     }
     if (isFileTarget) files.push(base);
     else walk(base, base, files, 20000);
+    // include 的正则只取决于参数，不该对每个文件重新编译一遍（原来在循环里 new RegExp，
+    // 两万个文件 = 两万次编译）。
+    const includeRe = include
+      ? new RegExp("^" + include.replace(/[.+^$\(\)|\\]/g, "\\$&").replace(/\*/g, ".*") + "$")
+      : null;
     const hits: string[] = [];
     for (const file of files) {
       if (hits.length >= maxResults) break;
-      if (include) {
-        const g = new RegExp("^" + include.replace(/[.+^$\(\)|\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
-        if (!g.test(path.basename(file))) continue;
-      }
+      if (includeRe && !includeRe.test(path.basename(file))) continue;
       let text: string;
       try {
         const st = await stat(file);

@@ -100,7 +100,7 @@ cd harness
 | **冲突解决（可选）** | `jys worktree merge … --resolve-with-agent`：冲突交给 agent 解决，**解完必须通过 `--verify` 才提交**，否则回滚；默认关闭 |
 | **并行任务平台** | worktree 隔离（独立分支/会话/检查点/后台任务）+ `verify`（合并前后各跑一次测试）+ 顺序感知 `preflight` + `merge`（冲突即回滚或交给 resolver）+ `rebase`（base 漂移）+ `link`（junction 共享依赖）+ `withRepoLock`（并发不撞 index.lock） |
 | **资产位置** | 基准资产（数据集/解释器/工作区/临时目录）全部落在**仓库所在盘** `bench/`，可用 `HARNESS_BENCH_ROOT` 指到外置盘；解释器按 `<bench>/tools/py<ver>` 查找，代码里不写死绝对路径 |
-| **SWE-bench Verified** | `--mode=verified`：无 Docker 本地复现（shallow clone + 按官方 spec 的 Python/依赖 + 官方 test_patch 判分），带 **gold patch 自检**。实测 3 条：flask 实例 RESOLVED、两条 pylint 预算内未落笔 |
+| **SWE-bench Verified** | `--mode=verified` 使用本地 Python 环境和官方 test_patch 对候选补丁评分。此前实测 3 条，其中 Flask 实例通过，两条 pylint 实例在预算内未生成补丁。 |
 | **量化基准** | `npm run bench`（接线，8/8）· `npm run bench:real`（真模型，8/8，$0.0077/任务）· `--mode=external --cmd=...` 让 dsh 等平台跑同一套任务、同一判分器 |
 | **真模型验证** | 已用 DeepSeek 兼容端点（`deepseek-flash`）跑通：`HARNESS_E2E_REAL=1 npm run e2e` **24/24**；桌面端 4 秒完成 Write→Read，成本 $0.0021、缓存命中 39% |
 | **响应式布局** | 桌面窗口可任意缩放（Chromium app 模式，尺寸由 profile 记住）；≤1280 隐藏冗余标签、≤920 侧栏收窄、≤768 侧栏变 ☰ 抽屉、≤560 控件紧凑 |
@@ -307,13 +307,13 @@ jys plugin test                # 加载校验，出错返回非 0
 ```bash
 npm install       # 只为开发期工具链（运行时零依赖）
 npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
-npm test          # 405 个测试声明（运行时 409，含循环生成的用例）（自动发现 tests/*.test.ts）
+npm test          # 464 个测试声明（运行时 470，含循环生成的用例）（自动发现 tests/*.test.ts）
 npm run typecheck # tsc --strict，src 必须 0 error
 npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
 npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**405 个测试声明（运行时 409）**，分二十四组：
+**464 个测试声明（运行时 470）**，分二十四组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销

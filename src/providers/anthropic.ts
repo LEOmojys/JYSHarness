@@ -239,7 +239,9 @@ export function toWire(messages: Message[]): { role: "user" | "assistant"; conte
         return [];
       });
       push("assistant", content);
-      pendingUses = content.filter((b) => b.type === "tool_use").map((b) => b.id);
+      // 累积而不是覆盖：两条连续 assistant（进程在落盘后被杀、resume 的恢复副本）时，
+      // 覆盖会让前一条的 tool_use 完全没有 tool_result，请求直接 400 且每次复现。
+      pendingUses.push(...content.filter((b) => b.type === "tool_use").map((b) => b.id));
       continue;
     }
     const content = m.content.map((b) => {
@@ -269,6 +271,19 @@ export function toWire(messages: Message[]): { role: "user" | "assistant"; conte
     }
     pendingUses = [];
     push("user", content);
+  }
+  // 末尾仍悬挂的 tool_use（中断/崩溃后转录停在这里）也必须补占位结果：
+  // Anthropic 不允许请求以"没有结果的 tool_use"结尾，否则每次 resume 都 400。
+  if (pendingUses.length) {
+    push(
+      "user",
+      pendingUses.map((id) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: "[no result recorded: the tool call was interrupted before it returned]",
+        is_error: true,
+      })),
+    );
   }
   // 第一条必须是 user：某些恢复路径会先塞一条 assistant 副本。
   while (out.length > 0 && out[0].role !== "user") out.shift();

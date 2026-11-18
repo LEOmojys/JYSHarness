@@ -95,6 +95,8 @@ export class OpenAIProvider implements ModelProvider {
     let reasoningText = "";
     const calls = new Map<number, { id: string; name: string; args: string }>();
     let finish: string | null = null;
+    // 上一次 tool_call 分片落在哪个槽：服务端省略 index 时用它续写。
+    let lastToolIdx = 0;
     let usage: Usage = { inputTokens: 0, outputTokens: 0 };
 
     for await (const line of sseLines(res.body)) {
@@ -109,11 +111,16 @@ export class OpenAIProvider implements ModelProvider {
       }
       if (chunk.error) throw classifyHttpError(400, JSON.stringify(chunk.error));
       if (chunk.usage) {
+        // OpenAI 的 prompt_tokens **已包含** cached_tokens，而 Anthropic 的 input_tokens
+        // 不含缓存部分。不对齐的话：成本把命中段算了两次、校准系数虚高最多 2x、
+        // cacheHitRate 的分母翻倍（全命中只显示 50%）。
+        const cached = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+        const prompt = chunk.usage.prompt_tokens ?? 0;
         usage = {
-          inputTokens: chunk.usage.prompt_tokens ?? 0,
+          inputTokens: Math.max(0, prompt - cached),
           outputTokens: chunk.usage.completion_tokens ?? 0,
           // OpenAI 的前缀缓存是自动的，只回报命中量，没有 cache_control 标记。
-          cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? 0,
+          cacheReadTokens: cached,
         };
       }
       const choice = chunk.choices?.[0];
@@ -131,10 +138,19 @@ export class OpenAIProvider implements ModelProvider {
         yield { type: "text_delta", text: delta.content };
       }
       for (const tc of delta.tool_calls ?? []) {
-        const idx = tc.index ?? 0;
+        // index 缺失是允许的（vLLM / 自建代理常见）。全都落到 0 会把两个并行调用
+        // 合成一个、参数 JSON 拼坏 —— 带 id 的分片开新槽，否则续写当前槽。
+        const idx = typeof tc.index === "number" ? tc.index : tc.id ? calls.size : lastToolIdx;
+        lastToolIdx = idx;
         const cur = calls.get(idx) ?? { id: "", name: "", args: "" };
         if (tc.id) cur.id = tc.id;
-        if (tc.function?.name) cur.name += tc.function.name;
+        const namePart = tc.function?.name;
+        if (namePart) {
+          // 兼容真正的分片名（"get_" + "weather"），也兼容少数每帧重发完整名称的代理：
+          // 累积型前缀替换为较长值，完全重复/已包含的片段忽略，其余按增量追加。
+          if (!cur.name || namePart.startsWith(cur.name)) cur.name = namePart;
+          else if (!cur.name.startsWith(namePart) && !cur.name.endsWith(namePart)) cur.name += namePart;
+        }
         if (tc.function?.arguments) cur.args += tc.function.arguments;
         calls.set(idx, cur);
       }

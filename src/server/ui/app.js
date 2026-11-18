@@ -1,6 +1,5 @@
 /* JYSHarness desktop UI — no framework, no build step. */
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 let state = null;
 let liveText = null;
@@ -62,7 +61,7 @@ function noticeText(ev) {
     case "turn_failed":
       return "本轮执行失败：" + (p.message || "");
     case "undo_done":
-      return "已撤销 " + p.id + "：恢复 " + p.count + " 个文件";
+      return "已撤销 " + p.id + "：恢复 " + p.count + " 个文件" + (p.skipped ? "，另有 " + p.skipped + " 个文件待重试" : "");
     case "undo_none":
       return "没有可撤销的改动";
     case "mcp_failed":
@@ -70,44 +69,6 @@ function noticeText(ev) {
     default:
       return ev.text || "";
   }
-}
-
-/* ---------------- markdown ---------------- */
-function inline(s) {
-  return s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-}
-function md(text) {
-  const parts = String(text).split(/```/);
-  let out = "";
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) {
-      const body = parts[i].replace(/^[a-zA-Z0-9]*\n/, "");
-      out += "<pre><code>" + esc(body.replace(/\n$/, "")) + "</code></pre>";
-      continue;
-    }
-    const lines = parts[i].split("\n");
-    let buf = [];
-    let list = false;
-    const flush = () => {
-      if (!buf.length) return;
-      if (list) out += "<ul>" + buf.map((l) => "<li>" + inline(esc(l)) + "</li>").join("") + "</ul>";
-      else out += "<p>" + buf.map((l) => inline(esc(l))).join("<br>") + "</p>";
-      buf = [];
-      list = false;
-    };
-    for (const raw of lines) {
-      const line = raw.replace(/\s+$/, "");
-      if (!line.trim()) { flush(); continue; }
-      const h = /^(#{1,3})\s+(.*)$/.exec(line);
-      if (h) { flush(); out += "<h" + h[1].length + ">" + inline(esc(h[2])) + "</h" + h[1].length + ">"; continue; }
-      const li = /^\s*[-*]\s+(.*)$/.exec(line);
-      if (li) { if (!list) { flush(); list = true; } buf.push(li[1]); continue; }
-      if (list) flush();
-      buf.push(line);
-    }
-    flush();
-  }
-  return out;
 }
 
 /* ---------------- dom helpers ---------------- */
@@ -588,8 +549,26 @@ function renderState(next) {
   }
   if (activePanel === "files" && !fileEntries.length && !fileError) loadFiles(filesPath);
   const t = $("transcript");
+  // 重建 transcript 会把流式节点一起扔掉：先记住已收到的内容，重建后如果这一轮
+  // 还在跑就把 live 节点接回去。否则后续 text_delta 会写进已经脱离文档的节点，
+  // 界面上的回答看起来"消失"了，直到 turn_end 才整段跳出来。
+  const streaming = liveText ? { text: liveText.text, thinking: liveText.thinkingText } : null;
+  liveText = null;
   t.innerHTML = "";
   t.appendChild(next.messages.length ? renderMessages(next.messages) : emptyState());
+  if (next.running && streaming) {
+    const live = liveAssistant();
+    if (streaming.text) {
+      live.text = streaming.text;
+      live.body.textContent = streaming.text;
+    }
+    if (streaming.thinking) {
+      const block = thinkingBlock(live);
+      live.thinkingText = streaming.thinking;
+      block.pre.textContent = live.thinkingText;
+      block.summary.textContent = "思考过程（" + live.thinkingText.length + " 字）";
+    }
+  }
   updateMeter();
   scrollToBottom();
 }
@@ -664,7 +643,11 @@ function selForTool(id) {
 
 function handleEvent(ev) {
   const sid = ev.sessionId || (ev.state && ev.state.sessionId);
-  if (state && sid && sid !== state.sessionId) return;
+  // 审批事件必须跨会话显示：它对应一个正在阻塞的工具调用。
+  // 以前这里对所有事件做 sessionId 过滤，切到别的会话后审批永远不弹，
+  // 10 分钟后服务端自动 deny，整轮白跑且没有任何提示。
+  const crossSession = ev.type === "permission_request" || ev.type === "permission_resolved";
+  if (!crossSession && state && sid && sid !== state.sessionId) return;
 
   switch (ev.type) {
     case "state":
@@ -878,6 +861,20 @@ async function send() {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ text, images, session: state ? state.sessionId : undefined }),
+  }).then(async (res) => {
+    if (res.ok) return;
+    // 失败必须把内容还回输入框：以前清了输入却不看结果，服务端返回 400/413
+    // 时用户的消息和图片就静默消失了。
+    input.value = text;
+    pendingImages = images;
+    renderAttachments();
+    const detail = await res.json().catch(() => ({}));
+    notice("发送失败（" + res.status + "）：" + (detail.error || "服务端拒绝了这条消息"));
+  }).catch((err) => {
+    input.value = text;
+    pendingImages = images;
+    renderAttachments();
+    notice("发送失败：" + (err && err.message ? err.message : String(err)));
   });
 }
 
@@ -1581,7 +1578,7 @@ function renderStatsPop(state) {
       if (!entries.length) return "";
       entries.sort((a, b) => b[1].errors - a[1].errors);
       const worst = entries[0];
-      return "<div class=\"stats-row\"><span>失败最多的工具</span><b>" + worst[0] + " " + worst[1].errors + "/" + worst[1].calls + "</b></div>";
+      return "<div class=\"stats-row\"><span>失败最多的工具</span><b>" + esc(worst[0]) + " " + worst[1].errors + "/" + worst[1].calls + "</b></div>";
     })();
 }
 

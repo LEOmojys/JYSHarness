@@ -67,6 +67,48 @@ export function estimateCost(model: string, input: number | CostInput, outputTok
   );
 }
 
+/** 会话级成本视图所需的统计字段（`SessionStats` 的子集）。 */
+export interface SessionCostStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  /** 模型耗时（毫秒），用于算输出速度。 */
+  modelMs?: number;
+}
+
+export interface SessionCostView extends CostBreakdown {
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  /** 0..1，按 token 计的提示缓存命中率。 */
+  cacheHitRate: number;
+  /** 输出速度（tok/s）。 */
+  tps: number;
+}
+
+/**
+ * 会话成本视图（UI 的"花费"角标与 /stats 面板）。
+ *
+ * 分项必须真算：以前这里写死 0，API 里 breakdown 全是 0，只有总额是真的。
+ */
+export function sessionCost(model: string, stats: SessionCostStats): SessionCostView {
+  const usage = {
+    inputTokens: stats.inputTokens,
+    outputTokens: stats.outputTokens,
+    cacheReadTokens: stats.cacheReadTokens,
+    cacheCreationTokens: stats.cacheCreationTokens,
+  };
+  const bd = costBreakdown(model, usage);
+  return {
+    ...bd,
+    cacheReadTokens: usage.cacheReadTokens ?? 0,
+    cacheCreationTokens: usage.cacheCreationTokens ?? 0,
+    cacheHitRate: cacheHitRate(usage),
+    // 输出速度：输出 token ÷ 模型耗时（不含工具等待）
+    tps: (stats.modelMs ?? 0) > 0 ? Math.round(stats.outputTokens / ((stats.modelMs as number) / 1000)) : 0,
+  };
+}
+
 /** 命中率 = 缓存读 / (普通输入 + 缓存读 + 缓存写)。 */
 export function cacheHitRate(c: CostInput): number {
   const cached = c.cacheReadTokens ?? 0;

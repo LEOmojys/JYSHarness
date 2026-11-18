@@ -254,13 +254,17 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
       }
       const split = splitForSummary(state.messages, compactionCfg.keepRecentMessages);
       // 只摘要"老前缀"；最近几条原样留着，否则用户刚说的话会被摘要复述覆盖。
-      const source = split.older.length ? split.older : state.messages;
-      const summary = await summarizeTranscript(activeProvider, activeModel, source, {
-        maxChars: summaryBudgetChars(params.contextWindow),
-        signal: params.signal,
-      });
-      if (summary) {
-        state.messages = split.older.length ? applySummary(split, summary) : [summary];
+      // older 为空 = 没有可分的老前缀（消息少但每条很大）：这时**不摘要**，
+      // 否则整段历史会被一条有损摘要替换掉，用户刚发的指令直接消失。
+      const source = split.older.length ? split.older : [];
+      const summary = source.length
+        ? await summarizeTranscript(activeProvider, activeModel, source, {
+            maxChars: summaryBudgetChars(params.contextWindow),
+            signal: params.signal,
+          })
+        : null;
+      if (summary && split.older.length) {
+        state.messages = applySummary(split, summary);
         try {
           params.onState?.(state.messages);
         } catch (err) {

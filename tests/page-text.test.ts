@@ -54,6 +54,30 @@ test("pageText: non-HTML content is returned as-is", async () => {
   }
 });
 
+test("pageText: a body over the byte cap is marked as an incomplete prefix", async () => {
+  const previous = globalThis.fetch;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(4_000_000 + 32).fill(97));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  globalThis.fetch = (async () => new Response(body, { status: 200, headers: { "content-type": "text/plain" } })) as typeof fetch;
+  try {
+    const page = await fetchReadableText("https://example.invalid/large", { maxChars: 80_000, offset: 3_950_000 });
+    assert.equal(page.ok, true);
+    assert.equal(page.truncated, true, "读取上限必须显式传播，不能把前缀伪装成完整页面");
+    assert.equal(page.bytes, 4_000_000);
+    assert.equal(page.nextOffset, null, "未知远端尾部不能给出续读 offset");
+    assert.equal(cancelled, true, "超限后应取消底层响应流");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
 test("pageText: redirect chain is validated hop by hop", async () => {
   const previous = globalThis.fetch;
   let calls = 0;

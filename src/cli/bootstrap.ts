@@ -29,39 +29,60 @@ export interface Args {
   open: boolean;
 }
 
+/**
+ * 带一个值的全局 flag —— 单一事实来源。
+ *
+ * 子命令（plugin/skill/worktree）需要自己剥离全局参数。如果每个子命令维护一份
+ * 私有列表，迟早会漏：`jys --script x plugin new demo` 里一旦漏登记 `--script`，
+ * `x` 就会被当成子命令（真实故障：报"未知子命令：config.json"）。
+ * 所以这里导出一份，dispatch、parseArgs、子命令全部复用同一张表。
+ */
+export const GLOBAL_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "--provider", "--model", "--script", "--mode", "--sandbox", "--resume",
+  "--workspace", "--max-turns", "--agent-mode", "--port",
+]);
+
+/** Shared by dispatch and argument parsing so both consume the same tokens. */
+export function readGlobalOption(argv: readonly string[], index: number): { size: number; values: Partial<Args> } | undefined {
+  const flag = argv[index];
+  const next = argv[index + 1];
+  const required = () => {
+    if (next === undefined || next.startsWith("--")) throw new TypeError("missing value for " + flag);
+    return next;
+  };
+  switch (flag) {
+    case "-p": case "--print":
+      return next && !next.startsWith("-")
+        ? { size: 2, values: { print: true, prompt: next } }
+        : { size: 1, values: { print: true } };
+    case "--open": return { size: 1, values: { open: true } };
+    case "-y": case "--yes": return { size: 1, values: { yes: true } };
+    case "--no-subagent": return { size: 1, values: { noSubagent: true } };
+    case "--debug": return { size: 1, values: { debug: true } };
+    case "-h": case "--help": return { size: 1, values: { print: true, mode: "help" } };
+  }
+  if (!GLOBAL_VALUE_FLAGS.has(flag)) return undefined;
+  const value = required();
+  switch (flag) {
+    case "--workspace": return { size: 2, values: { workspace: path.resolve(value) } };
+    case "--max-turns": return { size: 2, values: { maxTurns: Number(value) } };
+    case "--port": return { size: 2, values: { port: Number(value) } };
+    // 连字符名与字段名不同，必须显式映射（`agent-mode`.slice(2) 是 "agent-mode"）
+    case "--agent-mode": return { size: 2, values: { agentMode: value } };
+    default: return { size: 2, values: { [flag.slice(2)]: value } as Partial<Args> };
+  }
+}
+
 export function parseArgs(argv: string[]): Args {
   const args: Args = { workspace: process.cwd(), yes: false, print: false, noSubagent: false, debug: false, open: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    const next = () => argv[++i];
-    switch (a) {
-      case "-p":
-      case "--print":
-        args.print = true;
-        if (argv[i + 1] && !argv[i + 1].startsWith("-")) args.prompt = next();
-        break;
-      case "--provider": args.provider = next(); break;
-      case "--model": args.model = next(); break;
-      case "--script": args.script = next(); break;
-      case "--mode": args.mode = next(); break;
-      case "--sandbox": args.sandbox = next(); break;
-      case "--workspace": args.workspace = path.resolve(next()); break;
-      case "--resume": args.resume = next(); break;
-      case "--max-turns": args.maxTurns = Number(next()); break;
-      case "--agent-mode": args.agentMode = next(); break;
-      case "--port": args.port = Number(next()); break;
-      case "--open": args.open = true; break;
-      case "-y":
-      case "--yes": args.yes = true; break;
-      case "--no-subagent": args.noSubagent = true; break;
-      case "--debug": args.debug = true; break;
-      case "-h":
-      case "--help": args.print = true; args.mode = "help"; break;
-      default:
-        if (a.startsWith("-")) console.error("unknown flag: " + a);
-        else rest.push(a);
-    }
+    const option = readGlobalOption(argv, i);
+    if (option) {
+      Object.assign(args, option.values);
+      i += option.size - 1;
+    } else if (argv[i].startsWith("-")) console.error("unknown flag: " + argv[i]);
+    else rest.push(argv[i]);
   }
   if (!args.prompt && rest.length) args.prompt = rest.join(" ");
   return args;
@@ -75,7 +96,9 @@ export const HELP = [
   "  jys desktop                  desktop app window",
   "  jys serve [--port 4317]      web UI in a browser (--open to launch it)",
   "  jys repl                     interactive terminal session",
-  "  jys plugin <new|list|test>   project plugins (tools / hooks / skills)",
+  "  jys plugin <command>         manage plugins (jys plugin --help)",
+  "  jys skill <list|import-dsh>  list skills or import a directory of skills",
+  "  jys worktree <command>       manage project worktrees",
   "  jys check [--entropy]        architecture + entropy checks (--json, --install-hook)",
   "  jys \"fix the failing test\"   one-shot prompt, then exit",
   "",
@@ -115,18 +138,22 @@ export interface RuntimeOptions {
   onAlwaysAllow?: (toolName: string, input: Record<string, unknown>) => void;
 }
 
-export async function createRuntime(opts: RuntimeOptions): Promise<Runtime> {
-  const { args, logger } = opts;
+export function loadRuntimeSettings(args: Args, workspaceRoot: string, logger: Logger) {
   const cliSettings: HarnessSettings = {};
   if (args.maxTurns) cliSettings.maxTurns = args.maxTurns;
   if (args.mode && args.mode !== "help") cliSettings.permissionMode = args.mode as never;
   if (args.sandbox) cliSettings.sandboxMode = args.sandbox as never;
 
-  const loaded = loadSettings(args.workspace, cliSettings);
+  const loaded = loadSettings(workspaceRoot, cliSettings);
   // 配置里的问题（写错的 hook 等）在启动时就告诉用户，而不是运行时才炸。
   for (const warning of loaded.warnings ?? []) logger.warn("settings: " + warning);
   const settings: HarnessSettings = { ...defaultSettings(), ...loaded.settings };
+  return { loaded, settings };
+}
 
+export async function createRuntime(opts: RuntimeOptions): Promise<Runtime> {
+  const { args, logger } = opts;
+  const { loaded, settings } = loadRuntimeSettings(args, args.workspace, logger);
   const mockTurns = args.script
     ? loadMockScript(path.resolve(args.script))
     : args.provider === "mock"

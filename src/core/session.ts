@@ -13,7 +13,7 @@ import type { Logger } from "../util/log.ts";
 import type { ModelProvider } from "../providers/types.ts";
 import { buildDefaultRegistry, type Tool, type ToolContext } from "../tools/index.ts";
 import { buildSystemPrompt, runtimeSection } from "../context/systemPrompt.ts";
-import { cacheHitRate } from "./cost.ts";
+import { sessionCost, type SessionCostView } from "./cost.ts";
 import {
   applySummary,
   compactCheap,
@@ -32,6 +32,7 @@ import { inferContextWindow } from "./configStore.ts";
 import { runHooks, type HookDefinition, type HookEvent } from "../hooks/hooks.ts";
 import { queryLoop, type ApprovalOutcome, type HarnessEvent } from "./query.ts";
 import { SessionStore, newSessionId, type SessionMeta } from "../session/store.ts";
+import { SessionWriter } from "./sessionWriter.ts";
 import { estimateTokens } from "../util/tokens.ts";
 import { realResolve } from "../sandbox/paths.ts";
 import { JobManager } from "./jobs.ts";
@@ -169,9 +170,15 @@ export class Session {
   skillWarnings: string[] = [];
   /** 持久化失败的告警（去重后只留第一条）：用于 /status 与 state。 */
   persistWarnings: string[] = [];
-  private persistFailures = 0;
-  /** 写盘串行链：见 persist() 里的说明。 */
-  private persistChain: Promise<void> = Promise.resolve();
+  /** 写盘队列（串行 + 快照有序）：见 core/sessionWriter.ts。 */
+  private writer: SessionWriter;
+  /**
+   * 本回合是否在跑。`/compact`、`/undo` 这类会改写历史的命令必须避开回合：
+   * 压缩会拿入口快照覆盖 this.messages，期间新到的消息会被整体丢掉。
+   */
+  private turnBusy = false;
+  /** 本回合已计入 stats 的累计用量（queryLoop 的 totalX 每回合从 0 起算）。 */
+  private usageSeen = { input: 0, output: 0, read: 0, create: 0 };
   /** 被内置工具挡掉的扩展工具名（同名时内置优先，但必须说出来）。 */
   droppedTools: string[] = [];
   /**
@@ -206,6 +213,7 @@ export class Session {
     this.provider = opts.provider;
     this.model = opts.model;
     this.logger = opts.logger;
+    this.writer = new SessionWriter(this.store, this.sessionId, this.logger, (warning) => this.persistWarnings.push(warning));
     this.messages = opts.resumeMessages ?? [];
     this.mode = opts.settings.permissionMode ?? "default";
     this.sandboxMode = opts.settings.sandboxMode ?? "workspace-write";
@@ -215,7 +223,7 @@ export class Session {
     this.contextWindow =
       opts.contextWindow && opts.contextWindow > 0 ? opts.contextWindow : inferContextWindow(this.model);
     this.explicitWindow = Boolean(opts.contextWindow && opts.contextWindow > 0);
-    this.compaction = { ...deriveCompaction(this.contextWindow), ...(opts.compaction ?? {}) };
+    this.compaction = this.deriveCompactionFor(this.contextWindow);
     // 备用模型与主模型相同就没有意义，直接忽略（否则会切到"同一个模型"上白跑一次）。
     const fb = (opts.settings.fallbackModel ?? "").trim();
     this.fallbackModel = fb && fb !== this.model ? fb : undefined;
@@ -356,8 +364,9 @@ export class Session {
   }
 
   /** Restore files touched by the most recent mutating tool call. */
-  undoLast(): { restored: string[]; id: string } | null {
-    return this.checkpoints.undoLast();
+  undoLast(): { restored: string[]; id: string; skipped?: string[] } | null {
+    // 带上沙箱策略：回滚本身也是写文件，read-only 模式下不能借 /undo 绕过去。
+    return this.checkpoints.undoLast({ mode: this.sandboxMode, workspaceRoot: this.workspaceRoot });
   }
 
   get systemPromptText(): string {
@@ -398,17 +407,13 @@ export class Session {
    * 之前是 `void this.store.append(...)` —— 一旦 reject 就是未处理拒绝，
    * Node 24 默认直接结束进程。
    */
-  private async persist(message: Message): Promise<void> {
-    // 串行化：两条 appendFile 并发写同一个文件可能交错，写坏的 JSONL 就是
-    // "恢复出来的对话缺一半"。链式排队保证调用顺序 = 落盘顺序。
-    this.persistChain = this.persistChain.then(async () => {
-      try {
-        await this.store.append(this.sessionId, message);
-      } catch (err) {
-        this.reportPersistError("append", err);
-      }
-    });
-    return this.persistChain;
+  private persist(message: Message): Promise<void> {
+    return this.writer.append(message);
+  }
+
+  /** 压缩检查点：和 append 走同一条队列（见 SessionWriter 的说明）。 */
+  private writeCompact(messages: Message[], before: number): Promise<void> {
+    return this.writer.compact(messages, before);
   }
 
   /**
@@ -418,18 +423,28 @@ export class Session {
    * "send() 已返回但转录还缺最后一轮" —— 此时崩溃就丢掉这轮的回答。
    */
   async flushPersist(): Promise<void> {
-    await this.persistChain;
+    await this.writer.flush();
   }
 
-  private reportPersistError(what: string, err: unknown): void {
-    this.persistFailures++;
-    const message = err instanceof Error ? err.message : String(err);
-    // 只喊一次：每轮都喊会把日志刷爆，反而看不见
-    if (this.persistFailures === 1) {
-      const warning = "会话没有落盘（" + what + "）：" + message + "。这一轮照常进行，但重启后可能丢历史。";
-      this.persistWarnings.push(warning);
-      this.logger.warn(warning);
-    }
+  /**
+   * 用一段历史替换转录（fork / 导入）。
+   *
+   * 只改内存是不行的：存储是纯追加式的，重启后继承来的历史会整个消失。
+   * 这里同时把快照写成检查点，让内存与磁盘保持一致。
+   */
+  async replaceMessages(messages: Message[]): Promise<void> {
+    this.messages = messages;
+    await this.store.create({
+      id: this.sessionId,
+      createdAt: new Date().toISOString(),
+      cwd: this.cwd,
+      workspaceRoot: this.workspaceRoot,
+      model: this.model,
+      provider: this.provider.id,
+      permissionMode: this.mode,
+      sandboxMode: this.sandboxMode,
+    });
+    if (messages.length) await this.writer.compact(messages, 0);
   }
 
   /** 记一次工具调用：总数 + 按工具名分桶（失败单独计数）。 */
@@ -469,6 +484,16 @@ export class Session {
     this.systemPrompt = this.buildPrompt();
   }
 
+  /**
+   * 由窗口推导压缩阈值，并重新叠加用户的 compaction 覆盖。
+   *
+   * 之前 setProvider / setContextWindow 直接 `deriveCompaction()` 整体替换，
+   * 于是设置面板里配的 compaction 被静默清掉 —— 改一次模型，压缩策略就回默认。
+   */
+  private deriveCompactionFor(window: number): CompactionConfig {
+    return { ...deriveCompaction(window), ...(this.opts.compaction ?? {}) };
+  }
+
   /** Hot-swap the model without restarting: takes effect on the next turn. */
   setProvider(provider: ModelProvider, model: string): void {
     this.provider = provider;
@@ -476,7 +501,7 @@ export class Session {
     // A new model usually means a different window; re-derive unless pinned.
     if (!this.explicitWindow) {
       this.contextWindow = inferContextWindow(model);
-      this.compaction = deriveCompaction(this.contextWindow);
+      this.compaction = this.deriveCompactionFor(this.contextWindow);
     }
     this.systemPrompt = this.buildPrompt();
   }
@@ -485,7 +510,7 @@ export class Session {
   setContextWindow(tokens: number): void {
     this.contextWindow = Math.max(2_000, Math.floor(tokens));
     this.explicitWindow = true;
-    this.compaction = deriveCompaction(this.contextWindow);
+    this.compaction = this.deriveCompactionFor(this.contextWindow);
   }
 
   contextUsage(): { used: number; window: number; ratio: number } {
@@ -522,42 +547,8 @@ export class Session {
     return { used: system + tools + messages, max: this.contextWindow, system, tools, messages };
   }
 
-  cost(): {
-    inputUsd: number;
-    outputUsd: number;
-    /** 缓存读取/写入的单独成本（UI 可用来解释"为什么这轮便宜"）。 */
-    cacheReadUsd: number;
-    cacheCreationUsd: number;
-    totalUsd: number;
-    cacheReadTokens: number;
-    cacheCreationTokens: number;
-    /** 0..1，按 token 计的提示缓存命中率。 */
-    cacheHitRate: number;
-    /** 输出速度（tok/s）。 */
-    tps: number;
-  } {
-    const usage = {
-      inputTokens: this.stats.inputTokens,
-      outputTokens: this.stats.outputTokens,
-      cacheReadTokens: this.stats.cacheReadTokens,
-      cacheCreationTokens: this.stats.cacheCreationTokens,
-    };
-    const bd = costBreakdown(this.model, usage);
-    return {
-      // 分项必须是真算的：以前写死 0，API 里 breakdown 全是 0 只有总额是真的。
-      inputUsd: bd.inputUsd,
-      outputUsd: bd.outputUsd,
-      cacheReadUsd: bd.cacheReadUsd,
-      cacheCreationUsd: bd.cacheCreationUsd,
-      totalUsd: bd.totalUsd,
-      cacheReadTokens: usage.cacheReadTokens ?? 0,
-      cacheCreationTokens: usage.cacheCreationTokens ?? 0,
-      cacheHitRate: cacheHitRate(usage),
-      // 输出速度：输出 token ÷ 模型耗时（不含工具等待）
-      tps: this.stats.modelMs && this.stats.modelMs > 0
-        ? Math.round(this.stats.outputTokens / (this.stats.modelMs / 1000))
-        : 0,
-    };
+  cost(): SessionCostView {
+    return sessionCost(this.model, this.stats);
   }
 
   /** First user message, used as the session title in the UI. */
@@ -575,20 +566,27 @@ export class Session {
   async compactNow(focus?: string): Promise<{ applied: string[]; before: number; after: number }> {
     const before = this.contextTokens();
     const applied: string[] = [];
-    let messages = this.messages;
+    // 回合进行中不压缩：摘要是一次网络往返，期间 onState 会不断替换 this.messages，
+    // 结束时用入口快照覆盖，就会把这期间产生的消息整体丢掉（内存与磁盘分叉）。
+    if (this.turnBusy) return { applied, before, after: before };
+    const base = this.messages;
+    let messages = base;
 
     // 手动压缩先摘要、后削工具噪声：用户主动要求"整理上下文"时，
     // 摘要应该看到完整的工具输出，而不是已经被 stub 过的版本。
     if (before > this.compaction.targetTokens) {
       const split = splitForSummary(messages, this.compaction.keepRecentMessages);
-      const source = split.older.length ? split.older : messages;
-      const summary = await summarizeTranscript(this.provider, this.model, source, {
-        maxChars: summaryBudgetChars(this.contextWindow),
-        focus,
-        signal: new AbortController().signal,
-      });
-      if (summary) {
-        messages = split.older.length ? applySummary(split, summary) : [summary];
+      // older 为空时没有"老前缀"可摘要：整段摘要会把用户刚说的话变成一条复述。
+      const source = split.older.length ? split.older : [];
+      const summary = source.length
+        ? await summarizeTranscript(this.provider, this.model, source, {
+            maxChars: summaryBudgetChars(this.contextWindow),
+            focus,
+            signal: new AbortController().signal,
+          })
+        : null;
+      if (summary && split.older.length) {
+        messages = applySummary(split, summary);
         applied.push("summarize(" + source.length + " msgs)");
       }
     }
@@ -609,13 +607,14 @@ export class Session {
       }
     }
 
-    this.messages = messages;
+    // 摘要期间如果真的还有新消息进来（并发调用），把它们原样接在尾部，
+    // 不能拿入口快照把它们盖掉。
+    const arrivedDuring = this.messages === base ? [] : this.messages.slice(base.length);
+    this.messages = arrivedDuring.length ? [...messages, ...arrivedDuring] : messages;
     // 检查点写不进去 = 下次恢复会看到压缩前的历史（会重新摘要一次），
     // 不致命但要让人知道，所以走同一条告警通道。
     if (applied.length) {
-      await this.store.appendCompact(this.sessionId, this.messages, before).catch((err: unknown) => {
-        this.reportPersistError("compact", err);
-      });
+      await this.writeCompact(this.messages, before);
     }
     return { applied, before, after: this.contextTokens() };
   }
@@ -673,84 +672,92 @@ export class Session {
     // 落盘失败不该杀掉这一轮：磁盘满、目录被删都会走到这里。
     await this.persist(userMsg);
 
-    const tools = this.tools;
-    const toolMap = new Map(tools.map((t) => [t.name, t]));
+    this.turnBusy = true;
+    this.usageSeen = { input: 0, output: 0, read: 0, create: 0 };
+    try {
+      const tools = this.tools;
+      const toolMap = new Map(tools.map((t) => [t.name, t]));
 
-    const iterator = queryLoop({
-      provider: this.provider,
-      model: this.model,
-      systemPrompt: this.systemPrompt,
-      messages: this.messages,
-      tools,
-      preloadedToolMap: toolMap,
-      permission: {
-        mode: this.mode,
-        rules: this.rules,
-        sandboxMode: this.sandboxMode,
-        workspaceRoot: this.workspaceRoot,
-      },
-      toolContext: this.toolContext(0),
-      hooks: this.hooks,
-      logger: this.logger,
-      sessionId: this.sessionId,
-      maxTurns: this.opts.settings.maxTurns ?? 60,
-      maxTokens: this.opts.settings.maxTokens ?? 8192,
-      temperature: this.opts.settings.temperature,
-      compaction: this.compaction,
-      contextWindow: this.contextWindow,
-      // 同一 provider 内换模型：跨厂商需要独立的 Key/BaseURL，不做假配置。
-      fallback: this.fallbackModel ? { provider: this.provider, model: this.fallbackModel } : undefined,
-      toolHealth: this.toolHealth,
-      // 日期与 git 状态每轮注入到最后一条消息，不进系统提示（见 runtimeSection）。
-      ephemeralContext: runtimeSection(this.workspaceRoot),
-      calibrator: this.calibrator,
-      countTokens: process.env.HARNESS_COUNT_TOKENS === "off" ? "off" : "auto",
-      signal,
-      approve: this.opts.approve,
-      onAlwaysAllow: this.opts.onAlwaysAllow,
-      persist: (m) => {
-        void this.persist(m);
-      },
-      onState: (m) => {
-        this.messages = m;
-      },
-    });
+      const iterator = queryLoop({
+        provider: this.provider,
+        model: this.model,
+        systemPrompt: this.systemPrompt,
+        messages: this.messages,
+        tools,
+        preloadedToolMap: toolMap,
+        permission: {
+          mode: this.mode,
+          rules: this.rules,
+          sandboxMode: this.sandboxMode,
+          workspaceRoot: this.workspaceRoot,
+        },
+        toolContext: this.toolContext(0),
+        hooks: this.hooks,
+        logger: this.logger,
+        sessionId: this.sessionId,
+        maxTurns: this.opts.settings.maxTurns ?? 60,
+        maxTokens: this.opts.settings.maxTokens ?? 8192,
+        temperature: this.opts.settings.temperature,
+        compaction: this.compaction,
+        contextWindow: this.contextWindow,
+        // 同一 provider 内换模型：跨厂商需要独立的 Key/BaseURL，不做假配置。
+        fallback: this.fallbackModel ? { provider: this.provider, model: this.fallbackModel } : undefined,
+        toolHealth: this.toolHealth,
+        // 日期与 git 状态每轮注入到最后一条消息，不进系统提示（见 runtimeSection）。
+        ephemeralContext: runtimeSection(this.workspaceRoot),
+        calibrator: this.calibrator,
+        countTokens: process.env.HARNESS_COUNT_TOKENS === "off" ? "off" : "auto",
+        signal,
+        approve: this.opts.approve,
+        onAlwaysAllow: this.opts.onAlwaysAllow,
+        persist: (m) => {
+          void this.persist(m);
+        },
+        onState: (m) => {
+          this.messages = m;
+        },
+      });
 
-    for await (const ev of iterator) {
-      if (ev.type === "compaction") {
-        // 循环里的**自动压缩**也要落一个检查点。
-        // 以前只有手动 /compact（compactNow）写检查点，自动压缩只改内存 ——
-        // 重启后就会重放压缩前的历史，白白再摘要一次，甚至再次超出窗口。
-        await this.store
-          .appendCompact(this.sessionId, this.messages, ev.tokensBefore)
-          .catch((err: unknown) => this.reportPersistError("compact", err));
-      } else if (ev.type === "assistant_message") {
-        this.stats.turns++;
-      } else if (ev.type === "tool_end") {
-        this.recordTool(ev.name, ev.result.isError);
-      } else if (ev.type === "timing") {
-        this.stats.modelMs = ev.modelMs;
-        this.stats.toolMs = ev.toolMs;
-        this.stats.ttftAvgMs = ev.ttftAvgMs;
-        this.stats.steps = ev.steps;
-      } else if (ev.type === "usage") {
-        this.stats.inputTokens = ev.totalInput;
-        this.stats.outputTokens = ev.totalOutput;
-        if (typeof (ev as { cacheRead?: number }).cacheRead === "number") {
-          this.stats.cacheReadTokens = (ev as { cacheRead?: number }).cacheRead;
+      for await (const ev of iterator) {
+        if (ev.type === "compaction") {
+          // 循环里的**自动压缩**也要落一个检查点。
+          // 以前只有手动 /compact（compactNow）写检查点，自动压缩只改内存 ——
+          // 重启后就会重放压缩前的历史，白白再摘要一次，甚至再次超出窗口。
+          // 走同一条写盘链：直接 appendCompact 会绕过 persistChain，
+          // 排队中的 append 落到快照之后 → resume 出现重复消息。
+          await this.writeCompact(this.messages, ev.tokensBefore);
+        } else if (ev.type === "assistant_message") {
+          this.stats.turns++;
+        } else if (ev.type === "tool_end") {
+          this.recordTool(ev.name, ev.result.isError);
+        } else if (ev.type === "timing") {
+          this.stats.modelMs = ev.modelMs;
+          this.stats.toolMs = ev.toolMs;
+          this.stats.ttftAvgMs = ev.ttftAvgMs;
+          this.stats.steps = ev.steps;
+        } else if (ev.type === "usage") {
+          // queryLoop 的 totalX 是"本回合累计"（每次 send 从 0 起算），直接赋值会把
+          // 会话统计重置为本回合，还会抹掉并发子 Agent 已经累加进去的增量。
+          // 用差值累加，语义与 runSubagent 里的 += 一致。
+          const read = typeof (ev as { cacheRead?: number }).cacheRead === "number" ? (ev as { cacheRead: number }).cacheRead : 0;
+          const create = typeof (ev as { cacheCreation?: number }).cacheCreation === "number" ? (ev as { cacheCreation: number }).cacheCreation : 0;
+          this.stats.inputTokens += Math.max(0, ev.totalInput - this.usageSeen.input);
+          this.stats.outputTokens += Math.max(0, ev.totalOutput - this.usageSeen.output);
+          this.stats.cacheReadTokens = (this.stats.cacheReadTokens ?? 0) + Math.max(0, read - this.usageSeen.read);
+          this.stats.cacheCreationTokens = (this.stats.cacheCreationTokens ?? 0) + Math.max(0, create - this.usageSeen.create);
+          this.usageSeen = { input: ev.totalInput, output: ev.totalOutput, read, create };
         }
-        if (typeof (ev as { cacheCreation?: number }).cacheCreation === "number") {
-          this.stats.cacheCreationTokens = (ev as { cacheCreation?: number }).cacheCreation;
-        }
+        yield ev;
       }
-      yield ev;
-    }
 
-    // 等这一轮的写入全部落盘：send() 返回之后，转录必须和内存里一致，
-    // 否则"重启丢掉最后一轮回答"是随时会发生的。
-    await this.flushPersist();
-    // onState() kept this.messages in sync, including compaction substitutions.
-    this.stats.contextTokens = this.contextTokens();
+      // 等这一轮的写入全部落盘：send() 返回之后，转录必须和内存里一致，
+      // 否则"重启丢掉最后一轮回答"是随时会发生的。
+      await this.flushPersist();
+      // onState() kept this.messages in sync, including compaction substitutions.
+      this.stats.contextTokens = this.contextTokens();
+    } finally {
+      this.turnBusy = false;
+    }
   }
 
   async runSubagent(

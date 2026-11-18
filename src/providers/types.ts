@@ -124,16 +124,35 @@ export async function* sseLines(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx: number;
-    while ((idx = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, idx).replace(/\r$/, "");
-      buffer = buffer.slice(idx + 1);
-      if (line.length) yield line;
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        // flush decoder：保留 EOF 前仍有完整文本的最后一行。
+        buffer += decoder.decode();
+        completed = true;
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).replace(/\r$/, "");
+        buffer = buffer.slice(idx + 1);
+        if (line.length) yield line;
+      }
+    }
+    if (buffer.trim().length) yield buffer.trim();
+  } finally {
+    if (!completed) {
+      // 调用方在 [DONE] / Abort / generator.return() 提前结束时，底层 body 仍可能
+      // 持有网络缓冲和连接；必须取消，否则连接保持 locked 且无法复用。
+      await reader.cancel().catch(() => {});
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
     }
   }
-  if (buffer.trim().length) yield buffer.trim();
 }

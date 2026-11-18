@@ -100,6 +100,23 @@ test("openai wire: tool_calls are assembled from split deltas", async () => {
   });
 });
 
+test("openai wire: function names stream as fragments and repeated full names are deduplicated", async () => {
+  const chunks = [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_name","function":{"name":"get_","arguments":"{}"}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_repeat","function":{"name":"Read","arguments":"{}"}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"Read"}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  await withServer(chunks, async ([port]) => {
+    const events = await collect(providerFor(port));
+    const done = events[events.length - 1];
+    const calls = (done.message?.content as { type: string; name: string }[]).filter((b) => b.type === "tool_use");
+    assert.deepEqual(calls.map((c) => c.name), ["get_weather", "Read"]);
+  });
+});
+
 test("openai wire: usage is carried through (including cached tokens)", async () => {
   const chunks = [
     'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
@@ -109,9 +126,12 @@ test("openai wire: usage is carried through (including cached tokens)", async ()
   await withServer(chunks, async ([port]) => {
     const events = await collect(providerFor(port));
     const done = events[events.length - 1] as never as { message: { usage: Record<string, number>; stopReason: string } };
-    assert.equal(done.message.usage.inputTokens, 12);
+    // 与 Anthropic 语义对齐：inputTokens **不含**缓存命中段（prompt_tokens - cached）。
+    // 否则 costBreakdown 会把命中段按 1.1x 计两次，cacheHitRate 的分母也翻倍。
+    assert.equal(done.message.usage.inputTokens, 4);
     assert.equal(done.message.usage.outputTokens, 3);
     assert.equal(done.message.usage.cacheReadTokens, 8);
+    assert.equal(done.message.usage.inputTokens + done.message.usage.cacheReadTokens, 12, "total prompt tokens are preserved");
     assert.equal(done.message.stopReason, "end_turn");
   });
 });

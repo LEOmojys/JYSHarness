@@ -154,6 +154,30 @@ test("jobs: background command runs, reports output and can be killed", async ()
   assert.equal(jobs.list().length, 2);
 });
 
+test("jobs: an all-running burst converges after killAll and output stays capped", async (t) => {
+  const root = await tempWorkspace();
+  const jobs = new JobManager();
+  t.after(() => jobs.killAll());
+  for (let i = 0; i < 33; i++) {
+    jobs.start("node -e \"setInterval(()=>{}, 1000)\"", {
+      cwd: root,
+      policy: { mode: "workspace-write", workspaceRoot: root },
+    });
+  }
+  assert.equal(jobs.list().length, 33, "运行中的任务不能被淘汰");
+  jobs.killAll();
+  assert.ok(jobs.list().length <= 32, "终止后应淘汰已结束任务");
+
+  const noisy = jobs.start("node -e \"for(let i=0;i<400;i++)process.stdout.write('x'.repeat(10000))\"", {
+    cwd: root,
+    policy: { mode: "workspace-write", workspaceRoot: root },
+  });
+  const finished = await jobs.waitFor(noisy.id, 15_000);
+  assert.ok(finished);
+  assert.equal(finished!.truncated, true);
+  assert.ok(finished!.output.length <= 200_000, "输出缓冲不能超过硬上限");
+});
+
 test("jobs: Bash run_in_background returns a job id and JobOutput reads it", async () => {
   const root = await tempWorkspace();
   const jobs = new JobManager();

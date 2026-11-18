@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 export type Level = "error" | "warn";
 
@@ -45,38 +45,23 @@ const CR = String.fromCharCode(13);
 const TAB = String.fromCharCode(9);
 const BACKTICK = String.fromCharCode(96);
 
-// 基准工作目录（bench/swe-work）里是每个 SWE-bench 实例的 clone + venv，动辄上万文件；
-// 它们不是本仓库源码，必须排除，否则结构检查会被几万个第三方文件拖慢并报无关问题。
-// 基准产物必须整体排除：swe-work 是每实例 clone+venv，tmp 是基准任务生成的
-// 假仓库（里面故意有 2000 行的大文件、故意有 bug 的源码）。它们都不是本仓库源码，
-// 扫进来会既慢又报一堆"文件太大/函数太复杂"的无关问题。
-const SKIP_DIRS = new Set([
-  "node_modules",
-  "dist",
-  ".git",
-  ".harness",
-  ".idea",
-  "swe-work",
-  "tmp",
-  "datasets",
-  "tools",
-  "venv",
-  ".venv",
-]);
+const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".harness", ".idea", "venv", ".venv"]);
+const BENCH_ARTIFACT_DIRS = new Set(["swe-work", "tmp", "datasets", "tools"]);
 
 function splitLines(text: string): string[] {
   return text.split(NL).map((l) => (l.endsWith(CR) ? l.slice(0, -1) : l));
 }
 
-function walk(dir: string, out: string[] = []): string[] {
+function walk(root: string, dir = root, out: string[] = []): string[] {
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch {
     return out;
   }
+  const inBench = dir === path.join(root, "bench");
   for (const name of entries) {
-    if (SKIP_DIRS.has(name)) continue;
+    if (SKIP_DIRS.has(name) || (inBench && BENCH_ARTIFACT_DIRS.has(name))) continue;
     const abs = path.join(dir, name);
     let st;
     try {
@@ -84,7 +69,7 @@ function walk(dir: string, out: string[] = []): string[] {
     } catch {
       continue;
     }
-    if (st.isDirectory()) walk(abs, out);
+    if (st.isDirectory()) walk(root, abs, out);
     else out.push(abs);
   }
   return out;
@@ -98,26 +83,28 @@ function lineAt(text: string, index: number): number {
   return text.slice(0, index).split(NL).length;
 }
 
-/** 手工扫 import 说明符：覆盖 from "x"、import "x"、import("x")。 */
+/** 完整消费引号字符串，以免把其中的基准样例源码当作真实导入。 */
 function importsOf(text: string): { spec: string; index: number }[] {
   const out: { spec: string; index: number }[] = [];
-  const n = text.length;
-  for (let i = 0; i < n; i++) {
-    let keyword = 0;
-    if (text.startsWith("from", i)) keyword = 4;
-    else if (text.startsWith("import", i)) keyword = 6;
-    if (!keyword) continue;
-    let j = i + keyword;
-    while (j < n && (text[j] === " " || text[j] === TAB || text[j] === NL || text[j] === "(")) j++;
-    const quote = text[j];
-    if (quote !== '"' && quote !== "'") continue;
-    const end = text.indexOf(quote, j + 1);
-    if (end < 0) continue;
-    const spec = text.slice(j + 1, end);
-    if (!spec || spec.indexOf(NL) >= 0) continue;
-    out.push({ spec, index: i });
+  const literals = /(?:(\bfrom|\bimport(?:\s*\()?)\s*)?("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*')/g;
+  for (const match of text.matchAll(literals)) {
+    if (match[1]) out.push({ spec: match[2].slice(1, -1), index: match.index });
   }
   return out;
+}
+
+/**
+ * 把注释换成空格但保留换行。
+ *
+ * 注释里的 `from "./x"` 不是导入，但正则会把它当成导入，于是"imports.resolve"
+ * 报一个指向不存在文件的 error —— 一条注释就能让 `jys check` 失败。
+ * 保留换行是为了让 lineAt() 算出的行号仍然是真实的。
+ */
+function stripCommentsKeepingLines(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    // 前面是 ":" / 引号 / 反斜杠 的 // 不剥（http:// 与正则里的 \/\/）
+    .replace(/(^|[^\\:"'`])\/\/[^\n]*/g, (m, prefix: string) => prefix + " ".repeat(m.length - prefix.length));
 }
 
 function resolveSpec(fromFile: string, spec: string): string | null {
@@ -146,25 +133,19 @@ const LAYER_RULES: { from: RegExp; forbid: RegExp; why: string }[] = [
   { from: new RegExp("^src/(sandbox|permissions)/"), forbid: new RegExp("^src/(tools|server|cli)/"), why: "安全原语不得依赖被它约束的对象" },
 ];
 
-/**
- * 基准任务集里的"测试文件内容"是**字符串数据**，里面的 import 指向的是基准任务
- * 临时工作区里才会生成的文件，跟本仓库依赖图无关。实测会报 9 条 imports.resolve 假阳性，
- * 所以这里按目录排除（只排除路径解析这一条规则，不跳过其它检查）。
- */
-const FIXTURE_ONLY_DIRS = [/^src\/bench\//];
-
 function checkImports(root: string, sources: string[]): Finding[] {
   const findings: Finding[] = [];
   for (const abs of sources) {
     const relPath = rel(root, abs);
-    if (FIXTURE_ONLY_DIRS.some((re) => re.test(relPath))) continue;
     let text: string;
     try {
       text = readFileSync(abs, "utf8");
     } catch {
       continue;
     }
-    for (const imp of importsOf(text)) {
+    // 先剥注释：注释里的 `from "./x"` 不是导入，不剥就会报一个假 error。
+    // stripCommentsKeepingLines 用等长空格替换、保留换行，所以 lineAt() 的行号仍然准确。
+    for (const imp of importsOf(stripCommentsKeepingLines(text))) {
       if (!imp.spec.startsWith(".")) continue;
       const target = resolveSpec(abs, imp.spec);
       if (!target) {
@@ -239,7 +220,13 @@ function checkZeroDeps(root: string): Finding[] {
 const DOCS = ["README.md", "ARCHITECTURE.md", "QUICKSTART.md", "DESKTOP.md", "PLUGINS.md"];
 const FENCE = BACKTICK + BACKTICK + BACKTICK;
 
-/** 抽出一行里的 markdown 链接目标（![x](y) 与 [x](y) 都算）。 */
+/**
+ * 抽出一行里的 markdown 链接目标（![x](y) 与 [x](y) 都算）。
+ *
+ * 两件必须处理的事：
+ *   1. `[x](path "标题")` 的 title 不是文件名 —— 以前整串当路径，正确文档被判 error；
+ *   2. 文件名里可以有括号（`a(b).md`），所以按括号层级配对，不能找第一个 ")"。
+ */
 function linkTargets(line: string): string[] {
   const out: string[] = [];
   let from = 0;
@@ -247,10 +234,20 @@ function linkTargets(line: string): string[] {
     const open = line.indexOf("](", from);
     if (open < 0) break;
     const start = open + 2;
-    const end = line.indexOf(")", start);
-    if (end < 0) break;
-    out.push(line.slice(start, end).trim());
-    from = end + 1;
+    let depth = 1;
+    let i = start;
+    for (; i < line.length; i++) {
+      if (line[i] === "(") depth++;
+      else if (line[i] === ")" && --depth === 0) break;
+    }
+    if (i >= line.length) break;
+    let target = line.slice(start, i).trim();
+    // 去掉 markdown title（`"..."` / `'...'`）与可选的 <...> 包裹
+    const titleAt = target.search(/\s+["']/);
+    if (titleAt > 0) target = target.slice(0, titleAt).trim();
+    if (target.startsWith("<") && target.endsWith(">")) target = target.slice(1, -1);
+    out.push(target);
+    from = i + 1;
   }
   return out;
 }
@@ -564,33 +561,22 @@ function checkDeadExports(root: string, sources: string[], all: string[]): Findi
  * 没装 typescript 时**跳过并说明**：便携安装（双击即用）不该被开发依赖卡住。
  */
 function checkTypes(root: string): Finding[] {
-  const local = process.platform === "win32" ? "node_modules/.bin/tsc.cmd" : "node_modules/.bin/tsc";
-  const tscPath = path.join(root, local);
+  const tscPath = path.join(root, "node_modules", "typescript", "bin", "tsc");
   if (!existsSync(path.join(root, "tsconfig.json"))) {
     return [{ rule: "types", level: "warn", message: "没有 tsconfig.json，跳过类型检查" }];
   }
-  let out = "";
-  try {
-    out = execFileSync(tscPath, ["-p", "tsconfig.json", "--noEmit", "--pretty", "false"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 180_000,
-    });
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; code?: string };
-    if (e.code === "ENOENT") {
-      return [
-        {
-          rule: "types",
-          level: "warn",
-          message: "未安装 typescript（npm install），跳过类型检查 —— 源码的类型标注无人验证",
-        },
-      ];
-    }
-    out = String(e.stdout ?? "") + String(e.stderr ?? "");
+  if (!existsSync(tscPath)) {
+    return [{ rule: "types", level: "warn", message: "未安装 typescript（npm install），跳过类型检查" }];
   }
-  if (!out.trim()) return [];
+  const result = spawnSync(process.execPath, [tscPath, "-p", "tsconfig.json", "--noEmit", "--pretty", "false"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 180_000,
+    windowsHide: true,
+  });
+  if (result.error) return [{ rule: "types", level: "error", message: "运行 tsc 失败：" + result.error.message }];
+  const out = result.stdout + NL + result.stderr;
 
   const findings: Finding[] = [];
   for (const line of splitLines(out)) {
@@ -610,6 +596,11 @@ function checkTypes(root: string): Finding[] {
       findings.push({ rule: "types", level: "error", message: "类型错误超过 40 条，已截断" });
       break;
     }
+  }
+  if (result.status !== 0 && !findings.length) {
+    const detail = out.trim().split(NL)[0];
+    const reason = result.signal ?? String(result.status);
+    findings.push({ rule: "types", level: "error", message: "tsc 异常退出（" + reason + "）" + (detail ? "：" + detail : "") });
   }
   return findings;
 }

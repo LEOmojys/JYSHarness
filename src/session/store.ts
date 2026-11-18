@@ -34,8 +34,19 @@ export class SessionStore {
     this.dir = dir;
   }
 
-  async init(): Promise<void> {
+  /**
+   * 目录不存在就建。
+   *
+   * 以前只有 create()/init() 建目录，append 直接 appendFile；于是"构造了 Session
+   * 但没 await init()"的入口（脚本、bench、插件自带入口）会让**整段会话永不落盘**，
+   * 而且只报一条 warn —— 看起来一切正常，重启后历史没了。
+   */
+  private async ensureDir(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
+  }
+
+  async init(): Promise<void> {
+    await this.ensureDir();
   }
 
   private file(id: string): string {
@@ -58,11 +69,13 @@ export class SessionStore {
   }
 
   async append(sessionId: string, message: Message): Promise<void> {
+    await this.ensureDir();
     const line: Line = { type: "message", message };
     await appendFile(this.file(sessionId), JSON.stringify(line) + "\n", "utf8");
   }
 
   async note(sessionId: string, text: string): Promise<void> {
+    await this.ensureDir();
     const line: Line = { type: "note", text, at: new Date().toISOString() };
     await appendFile(this.file(sessionId), JSON.stringify(line) + "\n", "utf8");
   }
@@ -73,6 +86,7 @@ export class SessionStore {
    * 免得一重新打开会话就把一百多 k 的原始历史重新摘要一遍。
    */
   async appendCompact(sessionId: string, messages: Message[], before: number): Promise<void> {
+    await this.ensureDir();
     const line: Line = { type: "compact", messages, before, at: new Date().toISOString() };
     await appendFile(this.file(sessionId), JSON.stringify(line) + "\n", "utf8");
   }

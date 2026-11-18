@@ -107,17 +107,25 @@ function compactionCount(events: HarnessEvent[]): number {
   return events.filter((e) => e.type === "compaction").length;
 }
 
-async function runLoop(opts: { messageChars: number; tools: boolean; lastInput?: number }) {
+async function runLoop(opts: { messageChars: number; tools: boolean; messages?: number; lastInput?: number }) {
   const root = mkdtempSync(path.join(os.tmpdir(), "jys-ctx-budget-"));
   const all = buildDefaultRegistry({ enableSubagent: false }).assemble();
   const tools = opts.tools ? all : [];
   const provider = new MockProvider([{ text: "SUMMARY-NOTE" }, { text: "done" }]);
   const events: HarnessEvent[] = [];
+  // 多条消息：压缩必须能分出"老前缀 + 最近几条"。只有 1 条消息时没有可分的前缀，
+  // 摘要会把用户刚说的话整段换成复述（splitForSummary 现在会拒绝这么做）。
+  const count = Math.max(1, opts.messages ?? 1);
+  const per = Math.floor(opts.messageChars / count);
+  const history = Array.from({ length: count }, (_, i) => ({
+    role: "user" as const,
+    content: [{ type: "text" as const, text: String.fromCharCode(65 + i).repeat(per) }],
+  }));
   const it = queryLoop({
     provider,
     model: "mock-1",
     systemPrompt: "S".repeat(2000),
-    messages: [{ role: "user", content: [{ type: "text", text: "T".repeat(opts.messageChars) }] }],
+    messages: history,
     tools,
     preloadedToolMap: new Map(tools.map((t) => [t.name, t])),
     permission: { mode: "bypassPermissions", rules: emptyRuleSet(), sandboxMode: "workspace-write", workspaceRoot: root },
@@ -144,11 +152,12 @@ async function runLoop(opts: { messageChars: number; tools: boolean; lastInput?:
 }
 
 test("compaction: the trigger counts the system prompt and tool schemas, not just messages", async () => {
-  // 消息本身 ~1900 token（低于 softLimit 3000），但 system+tools 再占 ~1850
-  const withTools = await runLoop({ messageChars: 7000, tools: true });
+  // 消息本身 ~1900 token（低于 softLimit 3000），但 system+tools 再占 ~1850。
+  // 需要 ≥3 条消息，压缩才能分出"老前缀 + 最近几条"（否则摘要会把用户的话一起吞掉）。
+  const withTools = await runLoop({ messageChars: 7000, messages: 4, tools: true });
   assert.ok(compactionCount(withTools) > 0, "overhead must push it over the limit");
   // 同样消息，没有工具定义时应低于阈值
-  const withoutTools = await runLoop({ messageChars: 7000, tools: false });
+  const withoutTools = await runLoop({ messageChars: 7000, messages: 4, tools: false });
   assert.equal(compactionCount(withoutTools), 0, "without tool overhead the same history fits");
 });
 

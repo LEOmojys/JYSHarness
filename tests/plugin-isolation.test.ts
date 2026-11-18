@@ -3,9 +3,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { loadPlugins } from "../src/plugins/loader.ts";
 import { hostCount, shutdownHosts } from "../src/plugins/host/client.ts";
 import { Logger } from "../src/util/log.ts";
+import { runHooks } from "../src/hooks/hooks.ts";
+import type { ToolContext } from "../src/tools/types.ts";
 
 const NL = String.fromCharCode(10);
 
@@ -14,7 +18,7 @@ const NL = String.fromCharCode(10);
  * 插件暴露：IsoPid（回子进程 pid）、IsoEcho（回传输入）、IsoSlow（睡很久）、IsoCrash（直接退出）、
  * 一条路由 /info、一个命令 /iso、一个 PreToolUse hook（deny）。
  */
-function makeIsolated(opts: { isolation?: string; withCrash?: boolean; sleepMs?: number } = {}): string {
+function makeIsolated(opts: { isolation?: string; withCrash?: boolean; sleepMs?: number; withTimer?: boolean } = {}): string {
   const ws = mkdtempSync(path.join(os.tmpdir(), "jys-iso-"));
   const dir = path.join(ws, ".harness", "plugins", "isolated");
   mkdirSync(path.join(dir, "ui"), { recursive: true });
@@ -44,7 +48,8 @@ function makeIsolated(opts: { isolation?: string; withCrash?: boolean; sleepMs?:
     "  });",
     "  mk('IsoPid', async () => ({ content: 'child-pid:' + process.pid }));",
     "  mk('IsoEcho', async (input) => ({ content: 'echo:' + JSON.stringify(input) }));",
-    "  mk('IsoNoisy', async () => { console.log('noisy-plugin-log-line'); return { content: 'noisy-ok' }; });",
+    "  mk('IsoNoisy', async () => { process.stdout.write('raw-plugin-stdout'); console.log('noisy-plugin-log-line'); return { content: 'noisy-ok' }; });",
+    opts.withTimer ? "  setInterval(() => {}, 1000);" : "",
     `  mk('IsoSlow', async () => { await new Promise((r) => setTimeout(r, ${opts.sleepMs ?? 3000})); return { content: 'slow-done' }; });`,
     opts.withCrash === false ? "" : "  mk('IsoCrash', async () => { process.exit(9); });",
     "  api.registerRoute({ method: 'GET', path: 'info', handler: () => ({ json: { pid: process.pid } }) });",
@@ -129,6 +134,42 @@ test("isolation: plugin console.log does not corrupt the protocol", async () => 
   shutdownHosts();
 });
 
+test("isolation: direct stdout writes are redirected and parent stdin EOF stops live hosts", async (t) => {
+  shutdownHosts();
+  const ws = makeIsolated({ withCrash: false, withTimer: true });
+  const noisy = await loadPlugins(ws, new Logger("error"));
+  const tool = noisy.tools.find((entry) => entry.name === "IsoNoisy")!;
+  const result = await tool.call({}, ctxFor(ws));
+  assert.equal(result.content, "noisy-ok", "raw process.stdout.write must not corrupt the RPC response");
+  shutdownHosts();
+
+  const pluginDir = path.join(ws, ".harness", "plugins", "isolated");
+  const hostEntry = fileURLToPath(new URL("../src/plugins/host/child.ts", import.meta.url));
+  const child = spawn(process.execPath, [hostEntry, "--workspace", ws, "--only", pluginDir], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  t.after(() => child.kill("SIGKILL"));
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => { output += chunk; });
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("host did not emit ready frame")), 5000);
+    const check = () => {
+      if (output.includes('"type":"ready"')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    child.stdout.on("data", check);
+    child.once("error", (err) => { clearTimeout(timer); reject(err); });
+  });
+  const exited = new Promise<number>((resolve) => child.once("exit", (code) => resolve(code ?? -1)));
+  child.stdin.end();
+  assert.equal(await Promise.race([exited, new Promise<number>((resolve) => setTimeout(() => resolve(-99), 3000))]), 0,
+    "host must exit on parent pipe EOF instead of surviving via plugin timers");
+});
+
 test("isolation: a crashed host fails only that plugin, parent stays alive and self-heals", async () => {
   shutdownHosts();
   const ws = makeIsolated();
@@ -170,6 +211,60 @@ test("isolation: hooks registered by an isolated plugin are reachable", async ()
   assert.equal(result.decision, "deny");
   assert.equal(result.reason, "isolated-hook-says-no");
   shutdownHosts();
+});
+
+test("isolation: hooks on the same event each run once and preserve their own decision", async (t) => {
+  t.after(() => shutdownHosts());
+  const ws = makeIsolated();
+  const dir = path.join(ws, ".harness", "plugins", "isolated");
+  writeFileSync(path.join(dir, "index.ts"), `
+    export function activate(api) {
+      let n = 0;
+      api.on('PreToolUse', () => ({ decision: 'deny', reason: 'first', additionalContext: 'a' + ++n }));
+      api.on('PreToolUse', () => ({ decision: 'allow', additionalContext: 'b' + ++n }));
+    }
+  `);
+  const logger = new Logger("error");
+  const loaded = await loadPlugins(ws, logger);
+  const result = await runHooks(loaded.hooks.PreToolUse, { event: "PreToolUse", cwd: ws, sessionId: "fixture" }, { cwd: ws, logger });
+  assert.equal(result.decision, "deny");
+  assert.equal(result.reason, "first");
+  assert.equal(result.additionalContext, "a1\nb2");
+});
+
+test("isolation: tools keep validation, caller context, and scheduling constraints", async (t) => {
+  t.after(() => shutdownHosts());
+  const ws = makeIsolated();
+  const dir = path.join(ws, ".harness", "plugins", "isolated");
+  writeFileSync(path.join(dir, "index.ts"), `
+    export function activate(api) {
+      const tool = {
+        name: 'Checked', description: 'fixture', inputSchema: { type: 'object' }, isReadOnly: true,
+        isConcurrencySafe: (input) => input.parallel === true,
+        maxOutputChars: 1234, retries: 1, timeoutMs: 2000,
+        validate: (input) => input.tag === 'valid' ? null : 'tag required',
+        call: async (_, ctx) => ({ content: JSON.stringify([ctx.cwd, ctx.sandbox.mode, ctx.depth]) }),
+      };
+      api.registerTool(tool);
+      api.registerTool({ ...tool, name: 'Guarded', toolCheck: () => ({ behavior: 'ask' }) });
+    }
+  `);
+  const loaded = await loadPlugins(ws, new Logger("error"));
+  assert.deepEqual(loaded.tools.map((tool) => tool.name), ["Checked"]);
+  assert.ok(loaded.warnings.some((w) => w.message.includes("Guarded") && w.message.includes("toolCheck")));
+  const tool = loaded.tools[0];
+  assert.ok(tool);
+  assert.equal(tool.isConcurrencySafe({ parallel: false }), false);
+  assert.deepEqual([tool.maxOutputChars, tool.retries, tool.timeoutMs], [1234, 1, 2000]);
+  const ctx: ToolContext = {
+    workspaceRoot: ws, cwd: dir, depth: 2, sandbox: { mode: "read-only", workspaceRoot: ws },
+    logger: new Logger("error"), signal: new AbortController().signal,
+  };
+  const invalid = await tool.call({}, ctx);
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content, /tag required/);
+  const valid = await tool.call({ tag: "valid" }, ctx);
+  assert.equal(valid.content, JSON.stringify([dir, "read-only", 2]));
 });
 
 test("isolation: the host is cached per plugin dir, and shutdown clears it", async () => {

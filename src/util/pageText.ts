@@ -21,8 +21,10 @@ export interface PageTextResult {
   totalChars?: number;
   /** 本次返回的起始偏移。 */
   offset?: number;
-  /** 下一次该传的 offset；null 表示已经取完。 */
+  /** 下一次该传的 offset；null 表示当前已读取的正文前缀取完。 */
   nextOffset?: number | null;
+  /** 响应体超过读取上限时为 true；totalChars 仅代表已读取前缀，不是整页长度。 */
+  truncated?: boolean;
 }
 
 /**
@@ -30,15 +32,79 @@ export interface PageTextResult {
  *
  * 不这么做的话，抓 nodejs.org 得到的所谓正文是「学习 关于 下载 博客 文档」—— 导航栏。
  * 那种正文比没有更糟：模型会以为页面在讲导航。
+ *
+ * 这里只按**标签**剥离（nav/header/footer/aside…）。旧实现还有一条"class/id 命中
+ * nav/menu/cookie… 就整块删掉"的正则，它对未闭合标签是超线性的，而且和按标签剥离
+ * 大面积重叠 —— 去掉它换来的是可预测的最坏耗时。
  */
-export function extractMainText(html: string): string {
-  const trimmed = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<(nav|header|footer|aside|form|iframe|svg)[\s\S]*?<\/(nav|header|footer|aside|form|iframe|svg)>/gi, " ")
-    .replace(/<[^>]+(class|id)="[^"]*(nav|menu|header|footer|sidebar|breadcrumb|cookie|share|social|comment|related|banner|promo|ads?)[^"]*"[^>]*>[\s\S]*?<\/\w+>/gi, " ");
+/**
+ * 线性剥掉成块的标签（script/style/nav/…）。
+ *
+ * 为什么不用正则：`/<script[\s\S]*?<\/script>/g` 在页面里出现 N 个**未闭合**的
+ * `<script` 时，每个起点都要扫到文件尾，总代价 O(n²)。实测未闭合的 1.25MB 页面
+ * 会同步卡死 26 秒（事件循环被独占，AbortSignal 完全无效）—— 而 WebFetch 默认
+ * 抓正文，任意 URL 都能触发。这里用 indexOf 单向扫描，from 永远前进。
+ *
+ * 未闭合时**保留内容**（旧正则在那种情况下也不匹配），语义不变、只快不慢。
+ */
+function stripBlocks(html: string, tags: string[]): string {
+  const lower = html.toLowerCase();
+  const out: string[] = [];
+  let from = 0;
+  while (from < html.length) {
+    let best = -1;
+    let bestTag = "";
+    for (const tag of tags) {
+      const at = lower.indexOf("<" + tag, from);
+      if (at >= 0 && (best < 0 || at < best)) {
+        best = at;
+        bestTag = tag;
+      }
+    }
+    if (best < 0) break;
+    const openEnd = lower.indexOf(">", best);
+    if (openEnd < 0) break;
+    const close = lower.indexOf("</" + bestTag, openEnd);
+    if (close < 0) {
+      // 未闭合：把开始标签留下（后面还会被 <[^>]+> 去掉），继续往后找
+      out.push(html.slice(from, openEnd + 1));
+      from = openEnd + 1;
+      continue;
+    }
+    const closeEnd = lower.indexOf(">", close);
+    out.push(html.slice(from, best), " ");
+    from = closeEnd < 0 ? html.length : closeEnd + 1;
+  }
+  out.push(html.slice(from));
+  return out.join("");
+}
 
+/** 线性剥注释：同样避开 `<!--[\s\S]*?-->` 的超线性回扫。 */
+function stripComments(html: string): string {
+  const out: string[] = [];
+  let from = 0;
+  while (from < html.length) {
+    const start = html.indexOf("<!--", from);
+    if (start < 0) break;
+    out.push(html.slice(from, start), " ");
+    const end = html.indexOf("-->", start + 4);
+    from = end < 0 ? html.length : end + 3;
+  }
+  out.push(html.slice(from));
+  return out.join("");
+}
+
+/** 对越界码点一律返回空串：`&#x110000;` 会让 String.fromCodePoint 抛 RangeError，
+ *  异常冲出 htmlToText 后整页被记成"抓取失败"—— 页面里一个实体就能让工具失效。 */
+function codePointToString(cp: number): string {
+  if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff) return "";
+  if (cp >= 0xd800 && cp <= 0xdfff) return "";
+  return String.fromCodePoint(cp);
+}
+
+export function extractMainText(html: string): string {
+  const stripped = stripBlocks(stripComments(html), ["script", "style", "noscript", "nav", "header", "footer", "aside", "svg", "iframe"]);
+  const trimmed = stripped;
   const article = /<article[\s\S]*?<\/article>/i.exec(trimmed);
   const mainTag = /<main[\s\S]*?<\/main>/i.exec(trimmed);
   const body = /<body[\s\S]*?<\/body>/i.exec(trimmed);
@@ -53,10 +119,7 @@ export function extractMainText(html: string): string {
 }
 
 export function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
+  return stripBlocks(stripComments(html), ["script", "style"])
     .replace(/<\/(p|div|section|article|li|tr|h[1-6]|br)>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/g, " ")
@@ -65,9 +128,10 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, String.fromCharCode(34))
     .replace(/&apos;/g, String.fromCharCode(39))
-    // 数字实体：有的站点用 &#x27; 而不是 &#39;，不处理就会留在正文里
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, h: string) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_m, d: string) => String.fromCodePoint(Number(d)))
+    // 数字实体：有的站点用 &#x27; 而不是 &#39;，不处理就会留在正文里。
+    // 正则限长 + 码点钳制：超长/越界实体一律降级成空串，绝不抛异常。
+    .replace(/&#x([0-9a-fA-F]{1,8});/g, (_m, h: string) => codePointToString(parseInt(h, 16)))
+    .replace(/&#(\d{1,10});/g, (_m, d: string) => codePointToString(Number(d)))
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
 
@@ -106,6 +170,52 @@ export function sliceForBudget(
   if (cut < 0) cut = hardEnd;
   return { slice: text.slice(start, cut), nextOffset: cut < total ? cut : null, total };
 }
+/** 页面正文的读取上限：没有上限时，一个 chunked 的 8GB 响应就能把进程内存打爆。 */
+const MAX_PAGE_BYTES = 4_000_000;
+
+async function readBodyCapped(res: Response, limit: number): Promise<{ text: string; bytes: number; truncated: boolean }> {
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const full = await res.text();
+    const bytes = Buffer.from(full, "utf8");
+    if (bytes.length <= limit) return { text: full, bytes: bytes.length, truncated: false };
+    const text = new TextDecoder().decode(bytes.subarray(0, limit), { stream: true });
+    return { text, bytes: limit, truncated: true };
+  }
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        text += decoder.decode();
+        break;
+      }
+      if (!value) continue;
+      const remaining = limit - total;
+      if (value.byteLength > remaining) {
+        if (remaining > 0) text += decoder.decode(value.subarray(0, remaining), { stream: true });
+        total = limit;
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        // 不 flush decoder：若上限刚好切在多字节字符中间，丢掉不完整尾字符。
+        break;
+      }
+      total += value.byteLength;
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
+    }
+  }
+  return { text, bytes: total, truncated };
+}
+
 export async function fetchReadableText(
   rawUrl: string,
   opts: { maxChars?: number; signal?: AbortSignal; main?: boolean; offset?: number } = {},
@@ -142,19 +252,20 @@ export async function fetchReadableText(
     }
     if (!res) return { ok: false, reason: "too many redirects (limit " + MAX_REDIRECTS + ")" };
     const type = res.headers.get("content-type") ?? "";
-    const body = await res.text();
-    const text = /html/i.test(type) ? (opts.main ? extractMainText(body) : htmlToText(body)) : body;
+    const body = await readBodyCapped(res, MAX_PAGE_BYTES);
+    const content = /html/i.test(type) ? (opts.main ? extractMainText(body.text) : htmlToText(body.text)) : body.text;
     // 不再硬切：按段落/句子边界切，并给出下一次的 offset，让调用方可以分段取回全文。
-    const part = sliceForBudget(text, Math.max(0, opts.offset ?? 0), maxChars);
+    const part = sliceForBudget(content, Math.max(0, opts.offset ?? 0), maxChars);
     return {
       ok: true,
       status: res.status,
       url: current.href,
       text: part.slice,
-      bytes: body.length,
+      bytes: body.bytes,
       totalChars: part.total,
       offset: Math.max(0, opts.offset ?? 0),
-      nextOffset: part.nextOffset,
+      nextOffset: body.truncated && part.nextOffset == null ? null : part.nextOffset,
+      truncated: body.truncated,
     };
   } catch (err) {
     return { ok: false, reason: "fetch failed: " + (err instanceof Error ? err.message : String(err)) };

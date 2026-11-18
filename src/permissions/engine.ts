@@ -200,21 +200,29 @@ export function decidePermission(
     };
   }
 
+  // --- Read-only fast path ---
+  //
+  // 放在模式策略**之前**。只读工具根本不存在"要不要批准"的问题，而 dontAsk 的语义是
+  // "需要问的自动拒绝"——它以前把 Read 也一并拒了（因为 read-only 分支在 switch 后面），
+  // 结果是"最保守的模式连看文件都不许"，与语义相反。
+  if (req.isReadOnly) {
+    return { behavior: "allow", reason: "read_only_default", message: "Read-only tool." };
+  }
+
   // --- Mode policy ---
   switch (ctx.mode) {
     case "bypassPermissions":
       return { behavior: "allow", reason: "mode_bypass", message: "bypassPermissions mode." };
-    case "plan": {
-      const writing = WRITE_TOOLS.has(req.toolName) || (!req.isReadOnly && req.isDestructive);
-      if (writing) {
-        return {
-          behavior: "deny",
-          reason: "mode_plan_deny",
-          message: "Plan mode is read-only. Exit plan mode to make changes.",
-        };
-      }
-      return { behavior: "allow", reason: "mode_plan_deny", message: "Plan mode: read-only allowed." };
-    }
+    case "plan":
+      // 走到这里一定是非只读工具。plan 模式的契约是"只读"，判据必须是 isReadOnly，
+      // 而不是"是不是已知的写工具"：Bash/PowerShell 既不在 WRITE_TOOLS、也没有
+      // isDestructive，用旧判据会被直接放行 —— plan 模式下 shell 能随意写文件，
+      // 只读承诺就是假的。
+      return {
+        behavior: "deny",
+        reason: "mode_plan_deny",
+        message: "Plan mode is read-only. Exit plan mode to make changes.",
+      };
     case "acceptEdits":
       if (WRITE_TOOLS.has(req.toolName) && ctx.sandboxMode !== "read-only") {
         return {
@@ -233,9 +241,11 @@ export function decidePermission(
     case "auto": {
       // 风险分类器（ch.5.7）：只放行"能证明安全"的，其余一律升到 ask。
       // 它绝不越过前面的 hardcoded deny 与 deny 规则 —— 位置就在这条链的末尾。
-      if (req.toolName === "Bash") {
+      // PowerShell 与 Bash 是同一类东西（都能写文件），必须走同一套判定；
+      // 以前只判 Bash，PowerShell 在 auto 模式下永远是 ask —— 与 Bash 不一致。
+      if (req.toolName === "Bash" || req.toolName === "PowerShell") {
         const command = String((req.input as { command?: unknown }).command ?? "");
-        const verdict = classifyCommand(command);
+        const verdict = classifyCommand(command, { workspaceRoot: ctx.workspaceRoot });
         if (verdict.risk === "safe") {
           return { behavior: "allow", reason: "auto_safe_command", message: "auto: " + verdict.why };
         }
@@ -245,9 +255,6 @@ export function decidePermission(
           message: "auto 模式需要确认（" + verdict.why + "）：" + command.slice(0, 120),
         };
       }
-      if (req.isReadOnly) {
-        return { behavior: "allow", reason: "auto_safe_command", message: "auto: 只读工具" };
-      }
       return {
         behavior: "ask",
         reason: "auto_needs_review",
@@ -256,11 +263,6 @@ export function decidePermission(
     }
     case "default":
       break;
-  }
-
-  // --- Read-only fast path ---
-  if (req.isReadOnly) {
-    return { behavior: "allow", reason: "read_only_default", message: "Read-only tool." };
   }
 
   // --- Sandbox interaction ---

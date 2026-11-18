@@ -20,6 +20,15 @@ export interface CommandVerdict {
   why: string;
 }
 
+export interface ClassifyOptions {
+  /**
+   * 工作区根。给了之后，"读文件类"命令的绝对路径参数要做包含检查：
+   * `cat /etc/passwd` 与 `cat src/app.ts` 都"只读"，但前者读的是工作区外的
+   * 系统文件，不能算"能证明安全"。不给则跳过这一步（保持旧的纯语法判定）。
+   */
+  workspaceRoot?: string;
+}
+
 /** 只读、幂等、不产生副作用的命令（按可执行名匹配）。 */
 const SAFE_COMMANDS = new Set([
   "ls", "dir", "pwd", "cd", "echo", "cat", "type", "head", "tail", "wc", "stat", "file",
@@ -29,11 +38,28 @@ const SAFE_COMMANDS = new Set([
   "git", "npm", "pnpm", "yarn", "pip", "cargo", "go", "dotnet", "tsc", "eslint", "prettier",
 ]);
 
+/**
+ * 会"代为执行后面那条命令"的前缀。
+ *
+ * 为什么必须单独处理：`env rm -rf build` 的第一个 token 是 `env`，`env` 在只读白名单里，
+ * 于是整条命令被判成 safe —— 但真正被执行的命令是 `rm -rf build`。
+ * 同类还有 sudo/xargs/nice/timeout 等。剥掉前缀后按真实命令判定，才是"能证明安全"。
+ */
+const COMMAND_WRAPPERS = new Set([
+  "env", "sudo", "doas", "nice", "nohup", "time", "command", "builtin", "exec",
+  "xargs", "stdbuf", "setsid", "timeout", "ionice", "chrt", "busybox", "runuser",
+]);
+
+/** 这些命令的路径参数需要做 workspace 包含检查。 */
+const READ_PATH_COMMANDS = new Set([
+  "cat", "type", "head", "tail", "wc", "stat", "file", "grep", "rg", "find",
+  "tree", "du", "df", "diff", "cmp", "sort", "uniq",
+]);
+
 /** 明确危险的动词组合（子串匹配，宁可误报）。 */
 const DANGEROUS_PATTERNS: { needle: string; why: string }[] = [
   { needle: "rm -rf /", why: "递归删除根目录" },
   { needle: "rm -rf ~", why: "递归删除家目录" },
-  { needle: "format ", why: "格式化磁盘" },
   { needle: "mkfs", why: "创建文件系统" },
   { needle: "dd if=", why: "裸设备写入" },
   { needle: "> /dev/sd", why: "写裸设备" },
@@ -80,7 +106,10 @@ const SAFE_GIT_SUBCOMMANDS = new Set([
   "status", "log", "diff", "show", "branch", "rev-parse", "remote", "describe", "blame", "shortlog", "ls-files",
 ]);
 
-const SAFE_NPM_SUBCOMMANDS = new Set(["test", "run", "--version", "ls", "list", "view", "outdated"]);
+/** `git remote add|remove|set-url` 会改仓库配置，只有这几种子命令是只读的。 */
+const SAFE_GIT_REMOTE_ACTIONS = new Set(["", "-v", "--verbose", "show", "get-url"]);
+
+const SAFE_NPM_SUBCOMMANDS = new Set(["--version", "ls", "list", "view", "outdated", "why", "info"]);
 
 function firstToken(segment: string): string {
   const trimmed = segment.trim();
@@ -94,10 +123,21 @@ function secondToken(segment: string): string {
   return (parts[1] ?? "").replace(/^["']|["']$/g, "").toLowerCase();
 }
 
-/** 顶层运算符拆分：; && || | 换行。 */
+/**
+ * 顶层运算符拆分：; && || | & 换行。
+ *
+ * `&` 必须单独处理：`ls & rm -rf build` 的第一个 token 是 `ls`，只按 `;`/`&&` 拆分时
+ * 整条命令会被判成"全部为只读命令"，auto 模式于是**自动放行一次删除**。
+ * 拆之前先把文件描述符重定向（`2>&1`、`>&2`、`&>file`）里的 `&` 摘掉，
+ * 否则那些写法会被拆错（拆错只会更保守，但没必要制造噪音）。
+ */
 function splitOperators(command: string): string[] {
   return command
-    .split(/&&|\|\||;|\||\r?\n/)
+    // 只吃"N>&M"这种 fd 复制（后面必须紧跟数字）；`>& file`/`&> file` 是文件重定向，
+    // 留给下面的 `>` 检查去判，不能在这里吃掉，否则写文件会被当成无害的 fd 操作。
+    .replace(/\d*>&\d+/g, " ")
+    .replace(/&>\s*\S+/g, " ")
+    .split(/&&|\|\||;|\||\r?\n|&/)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -164,18 +204,68 @@ export function splitShellSegments(command: string, depth = 0): string[] {
   return [...new Set(units)];
 }
 
-export function classifyCommand(command: string): CommandVerdict {
+/**
+ * 剥掉"代为执行"的前缀，返回真正会被执行的命令。
+ *
+ * 只剥能确定是前缀的情况：`env` 的 `VAR=VAL`、`timeout` 的时长、各命令自己的 `-x` flag。
+ * 其余（比如 `nice -n 10 rm x` 里的 `10`）故意不猜 —— 剥不动就保持原样，
+ * 后面按"未知命令"升级为 moderate，方向仍然保守。
+ */
+function stripWrappers(segment: string): string {
+  let rest = segment.trim();
+  for (let guard = 0; guard < 5; guard++) {
+    const parts = rest.split(/\s+/).filter(Boolean);
+    const head = path.basename((parts[0] ?? "").replace(/^["']|["']$/g, "")).toLowerCase();
+    if (!COMMAND_WRAPPERS.has(head)) return rest;
+    let i = 1;
+    while (i < parts.length) {
+      const part = parts[i] as string;
+      if (part.startsWith("-")) { i++; continue; }
+      if (head === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(part)) { i++; continue; }
+      if (head === "timeout" && /^\d+(\.\d+)?[smhd]?$/.test(part)) { i++; continue; }
+      break;
+    }
+    if (i >= parts.length) return "";
+    rest = parts.slice(i).join(" ");
+  }
+  // 嵌套超过 5 层：不猜，返回空串让上层按原段处理（会更保守）。
+  return "";
+}
+
+/** `find` 的写/执行动作：`-delete`、`-exec` 之外还有一批，漏一个就等于没拦。 */
+function findAction(segment: string): string | null {
+  const m = /(?:^|\s)-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)(?:\s|$)/.exec(segment);
+  return m ? "-" + m[1] : null;
+}
+
+/** 绝对路径参数是否指向工作区外（相对路径不猜，交由调用方的工作目录语义决定）。 */
+function outsidePathArg(segment: string, root: string): string | null {
+  const rootAbs = path.resolve(root);
+  for (const token of segment.split(/\s+/).slice(1)) {
+    const raw = token.replace(/^["']|["']$/g, "");
+    if (!raw) continue;
+    const looksAbsolute = raw.startsWith("/") || raw.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(raw);
+    if (!looksAbsolute) continue;
+    const rel = path.relative(rootAbs, path.resolve(rootAbs, raw));
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return raw;
+  }
+  return null;
+}
+
+export function classifyCommand(command: string, opts: ClassifyOptions = {}): CommandVerdict {
   const raw = command.toLowerCase();
   for (const p of DANGEROUS_PATTERNS) {
     if (raw.includes(p.needle)) return { risk: "dangerous", why: "命中危险模式：" + p.why };
   }
+  // Windows 的 `format C:`：不能用 "format " 子串判，否则 `git log --format "%h"` 会被误杀
+  if (/\bformat\s+[a-z]:(\s|$)/i.test(command)) return { risk: "dangerous", why: "命中危险模式：格式化磁盘" };
 
   const segments = splitShellSegments(command);
   if (!segments.length) return { risk: "moderate", why: "空命令，无法判断" };
 
-  let worst: CommandVerdict = { risk: "safe", why: "全部为只读命令" };
-
-  for (const segment of segments) {
+  for (const rawSegment of segments) {
+    // 剥不干净时回退到原段：`xargs` 这类"没有后继命令"的写法会因此被判 moderate。
+    const segment = stripWrappers(rawSegment) || rawSegment;
     const cmd = firstToken(segment);
     const sub = secondToken(segment);
 
@@ -189,27 +279,53 @@ export function classifyCommand(command: string): CommandVerdict {
       return { risk: "moderate", why: "未知命令 " + (cmd || "(空)") + "，不自动放行" };
     }
 
+    // 读文件类命令：绝对路径必须落在工作区内，否则 `cat /etc/shadow` 也算"只读"
+    if (opts.workspaceRoot && READ_PATH_COMMANDS.has(cmd)) {
+      const outside = outsidePathArg(segment, opts.workspaceRoot);
+      if (outside) return { risk: "moderate", why: "读取工作区外的路径 " + outside };
+    }
+
     // git / npm 这类多态命令要看子命令
     if (cmd === "git") {
       const safeSub = SAFE_GIT_SUBCOMMANDS.has(sub) || sub === "";
       if (!safeSub) return { risk: "moderate", why: "git " + sub + " 可能修改仓库" };
-      if (sub === "branch" && /\s-[dD]\s/.test(segment)) {
+      if (sub === "branch" && /(^|\s)(-[dD]|--delete)(\s|$)/.test(segment)) {
         return { risk: "moderate", why: "git branch 删除分支" };
+      }
+      if (sub === "remote") {
+        const action = segment.trim().split(/\s+/)[2] ?? "";
+        if (!SAFE_GIT_REMOTE_ACTIONS.has(action)) {
+          return { risk: "moderate", why: "git remote " + action + " 会修改仓库配置" };
+        }
       }
     }
     if (cmd === "npm" || cmd === "pnpm" || cmd === "yarn") {
       const installLike = sub === "install" || sub === "add" || sub === "i";
       if (installLike) return { risk: "moderate", why: "安装依赖" };
+      // run/test/start/exec 都是"执行 package.json 里的任意脚本"，等于任意代码执行，
+      // 不能因为"名字听起来像只读"就放行 —— 脚本里可以是 curl | sh。
+      if (["run", "test", "start", "exec", "dlx", "create"].includes(sub)) {
+        return { risk: "moderate", why: cmd + " " + sub + " 会执行项目脚本" };
+      }
       if (!SAFE_NPM_SUBCOMMANDS.has(sub) && sub !== "") {
         return { risk: "moderate", why: cmd + " " + sub + " 会执行项目脚本" };
       }
     }
-    if (cmd === "find" && segment.includes("-delete")) {
-      return { risk: "moderate", why: "find -delete 会删文件" };
+    if (cmd === "find") {
+      const action = findAction(segment);
+      if (action) return { risk: "moderate", why: "find " + action + " 会删改文件或执行命令" };
+    }
+    if ((cmd === "sort" || cmd === "tree") && /(^|\s)(-o|--output)(\s|=|$)/.test(segment)) {
+      return { risk: "moderate", why: cmd + " 会写入输出文件" };
+    }
+    if (cmd === "uniq") {
+      const positional = segment.split(/\s+/).slice(1).filter((t) => t && !t.startsWith("-"));
+      if (positional.length >= 2) return { risk: "moderate", why: "uniq 的第二个位置参数是输出文件" };
     }
     if (cmd === "node" || cmd === "python" || cmd === "python3" || cmd === "deno" || cmd === "bun") {
-      // 解释器带脚本/参数就可能做任何事；只放行 --version 这类
-      if (!/\s(-v|--version|-h|--help)\b/.test(segment) && sub !== "-v" && sub !== "--version") {
+      // 解释器带脚本/参数就可能做任何事；只放行 --version 这类。
+      // 边界用 (?=\s|$)：`--version-evil` 不是版本开关。
+      if (!/(^|\s)(-v|--version|-h|--help)(?=\s|$)/.test(segment)) {
         return { risk: "moderate", why: "解释器执行代码，不自动放行" };
       }
     }
@@ -217,5 +333,5 @@ export function classifyCommand(command: string): CommandVerdict {
       return { risk: "moderate", why: "命令包含重定向" };
     }
   }
-  return worst;
+  return { risk: "safe", why: "全部为只读命令" };
 }

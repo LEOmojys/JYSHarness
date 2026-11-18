@@ -6,6 +6,7 @@
  * MCP/extension tools are added or removed.
  */
 import path from "node:path";
+import type { PermissionDecision } from "../permissions/engine.ts";
 import type { Tool, ToolResult, ToolContext } from "./types.ts";
 import { guardPath } from "../sandbox/paths.ts";
 import { DEFAULT_MAX_OUTPUT_CHARS, truncateOutput, validateAgainstSchema } from "./types.ts";
@@ -25,17 +26,21 @@ const PATH_INPUT_KEYS = ["file_path", "path", "target", "dest", "file", "filenam
 export function withDefaultsPathGuard(tool: Tool): Tool {
   if (tool.toolCheck) return tool;
   const props = (tool.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
-  const key = PATH_INPUT_KEYS.find((k) => k in props);
-  if (!key) return tool;
+  const keys = PATH_INPUT_KEYS.filter((key) => Object.hasOwn(props, key));
+  if (!keys.length) return tool;
   const access: "read" | "write" = tool.isReadOnly ? "read" : "write";
   return {
     ...tool,
     toolCheck: (input, ctx) => {
-      const raw = input[key];
-      if (typeof raw !== "string" || !raw.trim()) return null;
-      // 交回调用方（权限引擎）判断：这里只产出"越界"这一条事实
-      const abs = path.isAbsolute(raw) ? raw : path.resolve(ctx.cwd, raw);
-      return guardPath(abs, { access, policy: ctx.sandbox }).decision;
+      let approval: PermissionDecision | null = null;
+      for (const key of keys) {
+        const raw = input[key];
+        if (typeof raw !== "string" || !raw.trim()) continue;
+        const { decision } = guardPath(path.resolve(ctx.cwd, raw), { access, policy: ctx.sandbox });
+        if (decision?.behavior === "deny") return decision;
+        if (decision?.behavior === "ask") approval ??= decision;
+      }
+      return approval;
     },
   };
 }
@@ -162,11 +167,14 @@ async function runWithTimeout(tool: Tool, input: Record<string, unknown>, ctx: T
   const onAbort = () => controller.abort();
   ctx.signal.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(), tool.timeoutMs);
+  // 竞速里那个"兜底 resolve"的定时器也必须清掉：否则每次调用都会在事件循环里
+  // 留一个最多 timeoutMs 的 timer（WebFetch/MCP 这类高频工具会持续堆积）。
+  let raceTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       tool.call(input, { ...ctx, signal: controller.signal }),
       new Promise<ToolResult>((resolve) => {
-        setTimeout(
+        raceTimer = setTimeout(
           () => resolve({ content: "timed out after " + tool.timeoutMs + "ms: " + tool.name, isError: true }),
           tool.timeoutMs,
         );
@@ -174,6 +182,7 @@ async function runWithTimeout(tool: Tool, input: Record<string, unknown>, ctx: T
     ]);
   } finally {
     clearTimeout(timer);
+    if (raceTimer) clearTimeout(raceTimer);
     ctx.signal.removeEventListener("abort", onAbort);
   }
 }

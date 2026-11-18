@@ -93,6 +93,11 @@ export function setWorkspaceIntegrity(workspaceRoot: string, low: boolean): bool
       windowsHide: true,
     });
     integrityCache.set(workspaceRoot, want);
+    // 降完整性是**递归**的：子树此前显式设置的 M 标签会被这次继承覆盖。
+    // 不清掉 memo 的话，protectSensitivePaths 会以为"还是 M"而跳过重新抬升，
+    // 于是 workspace-write → read-only → workspace-write 之后，
+    // skills/sessions 能不能写全凭上次的标签有没有活下来（不可依赖）。
+    if (low) protectedState.clear();
     return true;
   } catch {
     if (low && !warned) {

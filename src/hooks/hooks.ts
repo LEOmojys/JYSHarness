@@ -110,11 +110,19 @@ export function clampHookTimeout(ms: number | undefined): number {
   return Math.min(MAX_HOOK_TIMEOUT_MS, Math.max(MIN_HOOK_TIMEOUT_MS, Math.round(raw)));
 }
 
+/**
+ * hook 的 stdout/stderr 上限。
+ *
+ * 不设限的话 hook 里 `cat big.json` 会让 40MB 原文一路拼进工具结果，
+ * 下一次请求直接 413 —— 上下文和内存一起被一条钩子毁掉。
+ */
+const MAX_HOOK_OUTPUT = 64 * 1024;
+
 function runShell(
   command: string,
   payload: string,
   opts: { cwd: string; timeoutMs: number; signal?: AbortSignal },
-): Promise<{ code: number; stdout: string; stderr: string }> {
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean; truncated: boolean }> {
   const shell = shellForPlatform();
   return new Promise((resolve, reject) => {
     const child = spawn(shell.cmd, [...shell.args, command], {
@@ -124,22 +132,72 @@ function runShell(
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs);
-    const onAbort = () => child.kill("SIGKILL");
+    let totalOutput = 0;
+    let outputTruncated = false;
+    let settled = false;
+    let timedOut = false;
+    const append = (current: string, chunk: Buffer) => {
+      const remaining = MAX_HOOK_OUTPUT - totalOutput;
+      if (remaining <= 0) {
+        outputTruncated = true;
+        return current;
+      }
+      const decoded = chunk.toString("utf8");
+      const kept = decoded.slice(0, remaining);
+      totalOutput += kept.length;
+      if (kept.length < decoded.length) outputTruncated = true;
+      return current + kept;
+    };
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      resolve({ code, stdout, stderr, timedOut, truncated: outputTruncated });
+    };
+    /**
+     * 杀整棵进程树。
+     *
+     * 只 kill 直接子进程是不够的：hook 里再起一个 node/pytest 时，grandchild 继承
+     * 了 stdout 管道，'close' 要等它退出才触发 —— 于是 timeout 形同虚设，
+     * 整轮对话被一条钩子卡任意久。Windows 上用 taskkill /T /F 才收得干净。
+     */
+    const killTree = () => {
+      try {
+        if (process.platform === "win32" && child.pid) {
+          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).on("error", () => {});
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        /* already gone */
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree();
+      // 到点就结算：等 'close' 会把超时变成"无限等待"，而且结果会被当成"允许"（fail-open）。
+      finish(124);
+    }, opts.timeoutMs);
+    const onAbort = () => {
+      killTree();
+      finish(130);
+    };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
+    child.stdout?.on("data", (d: Buffer) => (stdout = append(stdout, d)));
+    child.stderr?.on("data", (d: Buffer) => (stderr = append(stderr, d)));
+    // 子进程可能不读 stdin 就退出（文档推荐的 `exit 2` 就是）：EPIPE 必须吞掉，
+    // 否则 'error' 事件没人监听 → uncaughtException → 整个进程退出。
+    child.stdin?.on("error", () => {});
     child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
       reject(err);
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      resolve({ code: code ?? 1, stdout, stderr });
-    });
-    child.stdin.end(payload);
+    child.on("close", (code) => finish(code ?? 1));
+    child.stdin?.end(payload);
   });
 }
 
@@ -150,21 +208,27 @@ export async function runHooks(
 ): Promise<HookResult> {
   if (!defs || defs.length === 0) return {};
   let combined: HookResult = {};
+  const decisionEvent = payload.event === "PreToolUse" || payload.event === "UserPromptSubmit" || payload.event === "Stop";
 
-  // 决策按"更严格优先"合并：deny > ask > allow。
-  // 之前是后者覆盖前者，于是 `[deny, allow]` 两条钩子的结果是 allow ——
-  // 一个追加的 allow 钩子能悄悄取消掉别人的 deny，这在安全链路上不可接受。
+  // 决策按"更严格优先"合并：deny > ask > allow。更新输入则按字段累积，并让后续 hook
+  // 看到已更新的 toolInput；以前所有 hook 都收到原始输入，且最终只有最后一条更新生效。
   const rank = (d: HookResult["decision"]): number => (d === "deny" ? 2 : d === "ask" ? 1 : d === "allow" ? 0 : -1);
   const merge = (r: HookResult) => {
     const stricter = r.decision && rank(r.decision) > rank(combined.decision) ? r : null;
+    const updatedInput = r.updatedInput
+      ? { ...(combined.updatedInput ?? {}), ...r.updatedInput }
+      : combined.updatedInput;
     combined = {
       ...combined,
       ...(stricter ? { decision: stricter.decision, reason: stricter.reason } : {}),
-      ...(r.updatedInput ? { updatedInput: r.updatedInput } : {}),
+      ...(updatedInput ? { updatedInput } : {}),
       ...(r.additionalContext
         ? { additionalContext: [combined.additionalContext, r.additionalContext].filter(Boolean).join("\n") }
         : {}),
     };
+    if (r.updatedInput && payload.event === "PreToolUse") {
+      payload = { ...payload, toolInput: { ...(payload.toolInput ?? {}), ...r.updatedInput } };
+    }
   };
 
   for (const def of defs) {
@@ -194,17 +258,30 @@ export async function runHooks(
       } catch (err) {
         combined.error = err instanceof Error ? err.message : String(err);
         opts.logger.warn("hook handler failed: " + combined.error);
+        if (decisionEvent) merge({ decision: "deny", reason: "hook handler failed: " + combined.error });
       }
       continue;
     }
     if (!def.command) continue;
 
     try {
-      const { code, stdout, stderr } = await runShell(def.command, JSON.stringify(payload), {
+      const hookTimeout = clampHookTimeout(def.timeoutMs);
+      const { code, stdout, stderr, timedOut, truncated } = await runShell(def.command, JSON.stringify(payload), {
         cwd: opts.cwd,
-        timeoutMs: clampHookTimeout(def.timeoutMs),
+        timeoutMs: hookTimeout,
         signal: opts.signal,
       });
+      if (timedOut) {
+        // 超时和"正常 exit 1"必须分开：否则一个 deny 钩子超时会被当成允许（fail-open），
+        // 用户也完全不知道自己配的钩子根本没跑完。
+        combined.error = "hook timed out after " + hookTimeout + "ms";
+        opts.logger.warn("hook timed out (" + hookTimeout + "ms) for " + payload.event + ": " + def.command.slice(0, 120));
+        if (decisionEvent) {
+          // 安全决策拿不到结论时不能默认放行：让人看见并修钩子。
+          merge({ decision: "deny", reason: "hook timed out after " + hookTimeout + "ms" });
+        }
+        continue;
+      }
       if (code === 2) {
         merge({ decision: "deny", reason: stderr.trim() || "blocked by hook" });
         continue;
@@ -225,11 +302,13 @@ export async function runHooks(
         });
       } catch {
         // Plain-text stdout is treated as additional context (Claude Code behaviour).
-        combined.additionalContext = [combined.additionalContext, trimmed].filter(Boolean).join("\n");
+        const note = truncated ? "\n...[hook output truncated]" : "";
+        combined.additionalContext = [combined.additionalContext, trimmed + note].filter(Boolean).join("\n");
       }
     } catch (err) {
       combined.error = err instanceof Error ? err.message : String(err);
       opts.logger.warn("hook failed: " + combined.error);
+      if (decisionEvent) merge({ decision: "deny", reason: "hook failed: " + combined.error });
     }
   }
   return combined;

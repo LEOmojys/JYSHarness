@@ -21,8 +21,12 @@ test("tokens: the provider's exact count decides the compaction trigger", async 
     provider,
     model: "mock-1",
     systemPrompt: "short",
-    // 估算 ~1800 token：正好落在"60% 阈值以上"的区间，才会去问精确值
-    messages: [{ role: "user", content: [{ type: "text", text: "T".repeat(6500) }] }],
+    // 估算 ~1800 token：正好落在"60% 阈值以上"的区间，才会去问精确值。
+    // 用多条消息：压缩必须能分出"老前缀 + 最近几条"，单条消息时摘要会把用户指令一起吞掉。
+    messages: Array.from({ length: 4 }, (_, i) => ({
+      role: "user" as const,
+      content: [{ type: "text" as const, text: String(i).repeat(1625) }],
+    })),
     tools: [],
     preloadedToolMap: new Map(),
     permission: { mode: "bypassPermissions", rules: emptyRuleSet(), sandboxMode: "workspace-write", workspaceRoot: root },

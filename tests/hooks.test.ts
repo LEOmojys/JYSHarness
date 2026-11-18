@@ -18,6 +18,8 @@ import { Session } from "../src/core/session.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { emptyRuleSet } from "../src/permissions/rules.ts";
 import { Logger } from "../src/util/log.ts";
+import { gateCall } from "../src/core/gate.ts";
+import { prepareCall } from "../src/tools/registry.ts";
 
 const logger = new Logger("error");
 const payload: HookPayload = { event: "PreToolUse", sessionId: "s", cwd: process.cwd(), toolName: "Bash", toolInput: { command: "ls" } };
@@ -67,6 +69,69 @@ test("hooks: an invalid matcher does not throw, it just does not match", async (
   // 合法 matcher 仍然工作
   assert.equal(matchesTool({ matcher: "Ba.*", command: "x" }, "Bash"), true);
   assert.equal(matchesTool({ matcher: "Write", command: "x" }, "Bash"), false);
+});
+
+test("hooks: updatedInput changes accumulate and later hooks see earlier updates", async () => {
+  let observed: Record<string, unknown> | undefined;
+  const result = await runHooks(
+    [
+      { handler: () => ({ updatedInput: { command: "echo ready", marker: "first" } }) },
+      { handler: (p) => {
+        observed = p.toolInput;
+        return { updatedInput: { path: "output.txt" } };
+      } },
+    ],
+    payload,
+    ctx,
+  );
+  assert.deepEqual(observed, { command: "echo ready", marker: "first" });
+  assert.deepEqual(result.updatedInput, { command: "echo ready", marker: "first", path: "output.txt" });
+});
+
+test("hooks: decision hook exceptions fail closed", async () => {
+  for (const event of ["PreToolUse", "UserPromptSubmit", "Stop"] as const) {
+    const result = await runHooks([{ handler: () => { throw new Error("boom"); } }], { ...payload, event }, ctx);
+    assert.equal(result.decision, "deny", event + " hook failure must not silently allow");
+    assert.match(result.reason ?? "", /hook handler failed/);
+  }
+});
+
+test("hooks: a shell-hook spawn error blocks decision events", async () => {
+  const missingCwd = path.join(os.tmpdir(), "jys-missing-hook-cwd", String(Date.now()));
+  const result = await runHooks([{ command: "exit 0" }], { ...payload, event: "PreToolUse", cwd: missingCwd }, { ...ctx, cwd: missingCwd });
+  assert.equal(result.decision, "deny");
+  assert.match(result.reason ?? "", /hook failed/);
+});
+
+test("gate: cancellation during hooks or approval never becomes an allow", async () => {
+  const makeCall = () => {
+    const tool = {
+      name: "Write",
+      inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+      isReadOnly: false,
+      isConcurrencySafe: () => false,
+      call: async () => ({ content: "should not execute" }),
+    } as never;
+    return prepareCall({ get: () => tool, names: () => ["Write"] }, { id: "call-1", name: "Write", input: { command: "write" } });
+  };
+  const run = async (cancelAt: "hook" | "approval") => {
+    const controller = new AbortController();
+    const root = process.cwd();
+    const result = await gateCall(makeCall(), {
+      sessionId: "s",
+      hooks: cancelAt === "hook" ? { PreToolUse: [{ handler: () => { controller.abort(); return { decision: "allow" }; } }] } : {},
+      toolContext: { cwd: root, workspaceRoot: root, sandbox: { mode: "workspace-write", workspaceRoot: root }, signal: controller.signal, logger, depth: 0 },
+      permission: { mode: cancelAt === "approval" ? "default" : "bypassPermissions", rules: emptyRuleSet(), sandboxMode: "workspace-write", workspaceRoot: root },
+      logger,
+      signal: controller.signal,
+      approve: async () => { controller.abort(); return "allow"; },
+    } as never);
+    assert.ok(result);
+    assert.match(result!.content, /cancelled/);
+    assert.equal(result!.is_error, true);
+  };
+  await run("hook");
+  await run("approval");
 });
 
 test("hooks: timeouts are clamped into a sane range", () => {

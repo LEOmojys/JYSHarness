@@ -65,10 +65,42 @@ test("auto: non-Bash read-only tools pass, writes ask", () => {
 
 test("classifier: risk levels are stable for the documented examples", () => {
   assert.equal(classifyCommand("git status").risk, "safe");
-  assert.equal(classifyCommand("npm run build").risk, "safe");
   assert.equal(classifyCommand("npm install").risk, "moderate");
   assert.equal(classifyCommand("dd if=/dev/zero of=/dev/sda").risk, "dangerous");
   assert.equal(classifyCommand("").risk, "moderate");
+  // npm run / npm test 执行的是 package.json 里的任意脚本（脚本里可以是 curl | sh），
+  // 所以它不是"能证明安全"的命令。旧断言把 safe 写成了契约，等于把任意代码执行放行。
+  assert.equal(classifyCommand("npm run build").risk, "moderate");
+  assert.equal(classifyCommand("npm test").risk, "moderate");
+});
+
+test("classifier: wrappers, background operators and find actions cannot launder a command", () => {
+  for (const command of [
+    "ls & rm -rf build",
+    "env rm -rf build",
+    "sudo rm -rf build",
+    "nohup rm -rf build",
+    "xargs rm -rf",
+    "find . -exec rm -rf {} \\;",
+    "find . -delete",
+    "sort -o out.txt in.txt",
+    "uniq in.txt out.txt",
+    "git remote add origin https://example.com/x.git",
+    "node --version-evil",
+  ]) {
+    assert.notEqual(classifyCommand(command).risk, "safe", command + " must not be classified safe");
+  }
+  // 前缀剥离不能把正常命令也升级掉
+  assert.equal(classifyCommand("ls -la").risk, "safe");
+  assert.equal(classifyCommand("git remote -v").risk, "safe");
+  assert.equal(classifyCommand("env | grep PATH").risk, "safe");
+});
+
+test("classifier: absolute paths outside the workspace are not auto-approved", () => {
+  const root = path.join(os.tmpdir(), "jys-classify-root");
+  assert.equal(classifyCommand("cat /etc/passwd", { workspaceRoot: root }).risk, "moderate");
+  assert.equal(classifyCommand("grep -r secret /", { workspaceRoot: root }).risk, "moderate");
+  assert.equal(classifyCommand("cat src/app.ts", { workspaceRoot: root }).risk, "safe");
 });
 
 test("hooks: a failed tool call fires PostToolUseFailure exactly once", async () => {

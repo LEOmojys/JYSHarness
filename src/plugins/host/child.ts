@@ -13,10 +13,10 @@
  */
 import { loadPlugins } from '../loader.ts';
 import { Logger } from '../../util/log.ts';
-import type { ToolContext, ToolResult } from '../../tools/types.ts';
+import type { ToolResult } from '../../tools/types.ts';
 import type { HookPayload } from '../../hooks/hooks.ts';
 import type { HostAbort, HostOutbound, HostRequest, PluginDescriptor } from './rpc.ts';
-import { encodeLine, parseLine } from './rpc.ts';
+import { encodeLine, parseLine, MAX_HOST_FRAME_BYTES, MAX_HOST_QUEUED_BYTES } from './rpc.ts';
 
 const NL = String.fromCharCode(10);
 
@@ -27,7 +27,32 @@ const toStderr = (...args: unknown[]) => {
 for (const k of ['log', 'info', 'warn', 'error', 'debug', 'trace']) {
   (console as unknown as Record<string, unknown>)[k] = toStderr;
 }
-const emit = (msg: HostOutbound) => process.stdout.write(encodeLine(msg));
+// 插件不仅可能调用 console.log，也可能直接调用 process.stdout.write。
+// 协议使用原始 write 函数，插件写入则降级到 stderr，避免一个字节就破坏当前帧。
+const protocolWrite = process.stdout.write.bind(process.stdout);
+(process.stdout as unknown as { write: (...args: any[]) => boolean }).write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+  const value = typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString("utf8");
+  toStderr(value);
+  const done = typeof encoding === 'function' ? encoding : callback;
+  if (typeof done === 'function') (done as () => void)();
+  return true;
+}) as typeof process.stdout.write;
+
+let outboundBytes = 0;
+const emit = (msg: HostOutbound) => {
+  const line = encodeLine(msg);
+  const bytes = Buffer.byteLength(line, "utf8");
+  if (outboundBytes + bytes > MAX_HOST_QUEUED_BYTES) {
+    toStderr("plugin host outbound queue exceeded", MAX_HOST_QUEUED_BYTES);
+    process.exit(70);
+    return;
+  }
+  outboundBytes += bytes;
+  protocolWrite(line, (err?: Error | null) => {
+    outboundBytes = Math.max(0, outboundBytes - bytes);
+    if (err) process.exit(70);
+  });
+};
 
 // ---- 2) 参数：工作区 + 要加载的插件目录 ----
 function argOf(flag: string): string | undefined {
@@ -38,23 +63,6 @@ const workspaceRoot = argOf('--workspace') ?? process.cwd();
 const onlyDirs = process.argv.filter((x, i, arr) => arr[i - 1] === '--only' && !x.startsWith('-'));
 
 const logger = new Logger('error');
-
-/**
- * 子进程内的最小 ToolContext。
- *
- * 沙箱与审批**无法**跨进程沿用（子进程是独立 OS 进程），这里如实标为不限制，
- * 文档里也写明'进程隔离 ≠ 安全沙箱'。插件作者需要知道这个边界。
- */
-function toolCtx(signal: AbortSignal): ToolContext {
-  return {
-    workspaceRoot,
-    cwd: workspaceRoot,
-    sandbox: { mode: 'danger-full-access', workspaceRoot },
-    signal,
-    logger,
-    depth: 0,
-  };
-}
 
 /**
  * 进行中的调用 → 它们的 AbortController。
@@ -80,15 +88,17 @@ function describe(dir: string): PluginDescriptor[] {
     tools: rt.tools.map((t) => ({
       name: t.name,
       description: t.description,
-      inputSchema: t.inputSchema as unknown,
+      inputSchema: t.inputSchema,
       isReadOnly: Boolean(t.isReadOnly),
       isDestructive: Boolean(t.isDestructive),
-      concurrencySafe: true,
+      retries: t.retries,
+      maxOutputChars: t.maxOutputChars,
+      timeoutMs: t.timeoutMs,
     })),
     routes: rt.routes.map((r) => ({ pluginId: rt.pluginId, method: r.method, path: r.path })),
-    panels: rt.panels.map((p) => ({ id: p.id, title: p.title, icon: p.icon, slot: p.slot })),
+    panels: rt.panels,
     commands: rt.commands.map((c) => ({ pluginId: rt.pluginId, name: c.name, description: c.description })),
-    hooks: rt.hooks.map((h) => ({ pluginId: rt.pluginId, event: String(h.event) })),
+    hooks: rt.hooks.map((h, index) => ({ pluginId: rt.pluginId, event: h.event, index })),
     skills: rt.skills.map((s) => ({ name: s.name, description: s.description, content: s.content })),
     promptSections: rt.promptSections,
   }));
@@ -97,6 +107,13 @@ function describe(dir: string): PluginDescriptor[] {
 async function boot(): Promise<void> {
   const loaded = await loadPlugins(workspaceRoot, logger, { onlyDirs, forceInProcess: true });
   runtimes = loaded.runtimes;
+  for (const runtime of runtimes) {
+    runtime.tools = runtime.tools.filter((tool) => {
+      if (!tool.toolCheck) return true;
+      loaded.warnings.push({ plugin: runtime.pluginId, message: tool.name + ': custom toolCheck requires in-process permission evaluation; tool unavailable in process isolation' });
+      return false;
+    });
+  }
   emit({
     type: 'ready',
     plugins: describe(onlyDirs[0] ?? workspaceRoot),
@@ -116,7 +133,11 @@ async function handle(req: HostRequest): Promise<void> {
       const owner = runtimes.find((rt) => rt.tools.some((t) => t.name === req.toolName));
       const tool = owner?.tools.find((t) => t.name === req.toolName);
       if (!tool) throw new Error('unknown tool: ' + String(req.toolName));
-      const out: ToolResult = await tool.call(req.input ?? {}, toolCtx(controller.signal));
+      if (!req.context) throw new Error('missing tool context');
+      const input = req.input ?? {};
+      const invalid = tool.validate?.(input);
+      if (invalid) throw new Error(invalid);
+      const out: ToolResult = await tool.call(input, { ...req.context, signal: controller.signal, logger });
       emit({ id: req.id, ok: true, result: { content: out.content, isError: Boolean(out.isError), metadata: out.metadata } });
       return;
     }
@@ -148,13 +169,10 @@ async function handle(req: HostRequest): Promise<void> {
     }
     if (req.method === 'hook') {
       const rt = runtimes.find((r) => r.pluginId === req.pluginId);
-      const hits = rt?.hooks.filter((h) => String(h.event) === req.event) ?? [];
-      let merged: Record<string, unknown> = {};
-      for (const h of hits) {
-        const out = await h.handler(req.payload as HookPayload);
-        if (out && typeof out === 'object') merged = { ...merged, ...(out as Record<string, unknown>) };
-      }
-      emit({ id: req.id, ok: true, result: { result: merged } });
+      const hook = req.hookIndex === undefined ? undefined : rt?.hooks[req.hookIndex];
+      if (!hook || hook.event !== req.event) throw new Error('unknown hook: ' + String(req.event));
+      const result = await hook.handler(req.payload as HookPayload);
+      emit({ id: req.id, ok: true, result: { result: result ?? {} } });
       return;
     }
     throw new Error('unknown method: ' + String(req.method));
@@ -184,13 +202,33 @@ process.on('unhandledRejection', (err) => {
 
 process.stdin.setEncoding('utf8');
 let buffer = '';
+let bufferBytes = 0;
+let parentDisconnected = false;
+const onParentDisconnected = () => {
+  if (parentDisconnected) return;
+  parentDisconnected = true;
+  for (const controller of inflight.values()) controller.abort(new Error('父进程已断开'));
+  // 父进程崩溃/SIGKILL 不会运行它的 exit handler；stdin EOF 是子进程唯一可靠信号。
+  // 立即退出以清理插件遗留的 interval/server/句柄，避免宿主成为孤儿。
+  process.exit(0);
+};
+process.stdin.on('end', onParentDisconnected);
+process.stdin.on('close', onParentDisconnected);
 process.stdin.on('data', (chunk: string) => {
   buffer += chunk;
+  bufferBytes += Buffer.byteLength(chunk, 'utf8');
   for (;;) {
     const nl = buffer.indexOf(NL);
     if (nl < 0) break;
     const line = buffer.slice(0, nl);
     buffer = buffer.slice(nl + 1);
+    const frameBytes = Buffer.byteLength(line, 'utf8') + 1;
+    bufferBytes = Math.max(0, bufferBytes - frameBytes);
+    if (frameBytes > MAX_HOST_FRAME_BYTES) {
+      toStderr('plugin host inbound frame exceeds limit', frameBytes);
+      process.exit(70);
+      return;
+    }
     const msg = parseLine(line);
     if (!msg || typeof msg !== 'object') continue;
     if ('type' in (msg as object) && (msg as { type?: string }).type === 'abort') {
@@ -198,6 +236,10 @@ process.stdin.on('data', (chunk: string) => {
       continue;
     }
     if ('id' in (msg as object)) void handle(msg as HostRequest);
+  }
+  if (bufferBytes > MAX_HOST_FRAME_BYTES) {
+    toStderr('plugin host unterminated input frame exceeds limit', bufferBytes);
+    process.exit(70);
   }
 });
 

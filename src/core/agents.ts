@@ -78,13 +78,19 @@ export function parseAgentFile(text: string, source: "builtin" | "file" = "file"
   const name = fields.name;
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return { error: "name 缺失或含非法字符" };
 
-  const tools = fields.tools
-    ? fields.tools
+  // `tools:` 写成空值（手误删掉名字、只留冒号）必须是错误，不能当成"没写"。
+  // 没写 = 全部工具；写空 = 作者想限制但漏填 —— 后者悄悄给全工具，等于放权。
+  const rawTools = fields.tools?.trim();
+  if (rawTools === "") {
+    return { error: "tools 为空；要么省略（= 全部工具），要么写出至少一个工具名" };
+  }
+  const tools = rawTools
+    ? rawTools
         .split(",")
         .map((t) => t.trim())
         .filter(Boolean)
     : undefined;
-  if (fields.tools !== undefined && tools && tools.length === 0) {
+  if (tools && tools.length === 0) {
     return { error: "tools 为空；要么省略（= 全部工具），要么写出至少一个工具名" };
   }
 

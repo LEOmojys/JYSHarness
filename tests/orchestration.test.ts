@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { executeCall, prepareCall } from "../src/tools/registry.ts";
@@ -51,6 +51,43 @@ test("orchestration: concurrent tool calls keep independent checkpoints", async 
   assert.ok(second && second.restored.length === 1, JSON.stringify(second));
   assert.equal(existsSync(path.join(root, "a.txt")), false, "a.txt must be rolled back");
   assert.equal(existsSync(path.join(root, "b.txt")), false, "b.txt must be rolled back");
+});
+
+test("checkpoint undo retains failed files after a partial restore", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "jys-ckpt-partial-"));
+  const good = path.join(root, "good.txt");
+  const blockedDir = path.join(root, "blocked");
+  const blocked = path.join(blockedDir, "bad.txt");
+  mkdirSync(blockedDir, { recursive: true });
+  writeFileSync(good, "before-good");
+  writeFileSync(blocked, "before-bad");
+
+  const store = new CheckpointStore();
+  const frame = store.beginCall();
+  await store.track(frame, async () => {
+    store.record(good);
+    store.record(blocked);
+    writeFileSync(good, "after-good");
+    writeFileSync(blocked, "after-bad");
+  });
+  store.commitCall(frame);
+  rmSync(blockedDir, { recursive: true, force: true });
+  writeFileSync(blockedDir, "directory obstruction");
+
+  const partial = store.undoLast();
+  assert.ok(partial);
+  assert.deepEqual(partial!.restored, [good]);
+  assert.equal(store.depth(), 1, "失败路径的检查点应保留，不能随成功项一起丢弃");
+  assert.equal(readFileSync(good, "utf8"), "before-good");
+
+  unlinkSync(blockedDir);
+  mkdirSync(blockedDir, { recursive: true });
+  writeFileSync(blocked, "after-bad");
+  const retry = store.undoLast();
+  assert.ok(retry);
+  assert.deepEqual(retry!.restored, [blocked]);
+  assert.equal(readFileSync(blocked, "utf8"), "before-bad");
+  assert.equal(store.depth(), 0);
 });
 
 test("orchestration: two sub-agents run concurrently and both report back", async () => {

@@ -160,22 +160,39 @@ export function resolveWorkspaceSettingsPath(workspaceRoot: string): string {
 function readJson(file: string): Record<string, unknown> {
   if (!existsSync(file)) return {};
   try {
-    return JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed as Record<string, unknown>;
   } catch {
+    // 损坏时先把原件改名留档，再返回空对象。
+    //
+    // 直接返回 {} 是最危险的做法：下一次保存（设置面板、rememberWorkspace、
+    // writeSecret）会以 {} 为基准写回，把 model / permissions / mcpServers /
+    // 其余厂商的 Key 一次清空。留一份 .corrupt-* 至少还能手工恢复。
+    try {
+      renameSync(file, file + ".corrupt-" + Date.now());
+    } catch (err) {
+      // 备份失败时必须拒绝读写：返回 {} 会让后续 save 以空对象覆盖损坏原件。
+      throw new Error("配置文件损坏且无法备份，已拒绝覆盖：" + file + "（" + (err instanceof Error ? err.message : String(err)) + ")");
+    }
     return {};
   }
 }
 
 function writeJson(file: string, data: unknown, privateFile = false): void {
   mkdirSync(path.dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
+  // 原子替换：直接 writeFileSync 中途崩溃会留下半截 JSON，而半截 JSON 会被
+  // readJson 当成损坏（见上面的留档逻辑）—— 一次崩溃就丢整份配置。
+  const tmp = file + "." + process.pid + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
   if (privateFile) {
     try {
-      chmodSync(file, 0o600);
+      chmodSync(tmp, 0o600);
     } catch {
       /* best effort: Windows ACLs ignore POSIX modes */
     }
   }
+  renameSync(tmp, file);
 }
 
 /** Keys are stored per provider and never returned by the API. */

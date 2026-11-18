@@ -70,6 +70,27 @@ const SENSITIVE = [
   ".harness/plugins",
 ];
 
+function nonCanonicalWindowsPath(raw: string): string | null {
+  if (process.platform !== "win32") return null;
+  const slash = String.fromCharCode(92);
+  const value = raw.replace(/\//g, slash);
+  if (value.startsWith(slash + slash + "?" + slash) || value.startsWith(slash + slash + "." + slash)) {
+    return "extended/device path prefixes are not accepted";
+  }
+  const parts = value.split(slash);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i] as string;
+    if (!part || part === "." || part === "..") continue;
+    if (i === 0 && /^[a-zA-Z]:$/.test(part)) continue;
+    // Win32 会忽略尾随点/空格；NTFS 冒号可以指定 alternate data stream。
+    if (/[. ]$/.test(part)) return "trailing dot/space alias: " + JSON.stringify(part);
+    if (part.includes(":")) return "alternate data stream is not accepted: " + part;
+    const device = part.split(".", 1)[0] ?? part;
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(device)) return "reserved device name: " + part;
+  }
+  return null;
+}
+
 function touchesList(root: string, target: string, list: string[]): string | null {
   const rel = path.relative(root, target).split(path.sep).join("/");
   for (const p of list) {
@@ -98,6 +119,18 @@ export function guardPath(
 
   if (mode === "danger-full-access") {
     return { decision: null, resolved };
+  }
+
+  const nonCanonical = nonCanonicalWindowsPath(raw);
+  if (nonCanonical) {
+    return {
+      decision: {
+        behavior: "deny",
+        reason: "hardcoded_deny",
+        message: "Refusing non-canonical Windows path: " + nonCanonical,
+      },
+      resolved,
+    };
   }
 
   const inside = isInside(workspaceRoot, resolved);

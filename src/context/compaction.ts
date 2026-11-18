@@ -266,13 +266,18 @@ export interface SummarySplit {
 /**
  * 决定"摘要哪一段、保留哪一段"。
  * tail 必须从一条安全边界开始：不能停在孤立的 tool_result 上。
+ *
+ * 并且**至少要留 1 条 tail**：当消息条数少但每条很大时（一次大文件 Read 就够），
+ * 旧实现会返回 older=[]，调用方随即把整段历史（含用户刚发的指令）替换成一条摘要。
  */
 export function splitForSummary(messages: Message[], keepRecent: number): SummarySplit {
   const first = messages[0];
   const keepHead = !!first && first.role === "user" && !isToolResultOnly(first);
   const floor = keepHead ? 1 : 0;
-  if (messages.length <= keepRecent + floor) return { anchor: null, older: [], tail: messages };
-  let start = Math.max(floor, messages.length - keepRecent);
+  // 能给 tail 的条数：至少 1，至多 keepRecent，且必须给 older 留出位置。
+  const tailTarget = Math.max(0, Math.min(keepRecent, messages.length - floor - 1));
+  if (tailTarget < 1) return { anchor: null, older: [], tail: messages };
+  let start = Math.max(floor, messages.length - tailTarget);
   while (start < messages.length && isToolResultOnly(messages[start])) start++;
   if (start <= floor || start >= messages.length) return { anchor: null, older: [], tail: messages };
   return {

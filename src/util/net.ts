@@ -42,8 +42,19 @@ export function isPrivateAddress(ip: string): boolean {
     if (a === 172 && b >= 16 && b <= 31) return true;
     return false;
   }
-  const lower = ip.toLowerCase();
-  if (lower === "::1") return true;
+  const lower = ip.toLowerCase().replace(/^\[|\]$/g, "");
+  // 全零地址：多数平台上等价于本机
+  if (lower === "::" || lower === "::1") return true;
+  // IPv4-mapped IPv6：fetch 接受 `[::ffff:127.0.0.1]`，URL 解析后是 `[::ffff:7f00:1]`。
+  // 不还原成 v4 就等于留了一条"访问本机"的旁路（SSRF 检查形同虚设）。
+  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+  if (mapped) return isPrivateAddress(mapped[1] as string);
+  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1] as string, 16);
+    const lo = parseInt(hexMapped[2] as string, 16);
+    return isPrivateAddress([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join("."));
+  }
   if (lower.startsWith("fe80:")) return true;
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
   return false;
