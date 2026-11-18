@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { branchPaths, conflictedFiles, linkDependencies, rebaseWorktree, resolveAndCommit, runVerify, verifyBranches, withRepoLock } from "../src/core/worktreeOps.ts";
@@ -53,6 +53,35 @@ test("lock: times out instead of hanging forever", async () => {
   assert.equal(blocked.ok, false);
   assert.match(blocked.ok === false ? blocked.error : "", /占用/);
   await held;
+});
+
+test("lock: a timed-out waiter cannot let later callers overtake the holder", async () => {
+  const dir = repo();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const held = withRepoLock(dir, () => gate);
+  try {
+    for (let i = 0; i < 2; i++) {
+      const result = await withRepoLock(dir, () => "entered", { waitMs: 30, pollMs: 5 });
+      assert.equal(result.ok, false);
+    }
+  } finally {
+    release();
+    await held;
+  }
+  assert.equal((await withRepoLock(dir, () => "entered")).ok, true);
+});
+
+test("lock: an old lock still belongs to its live owner", async () => {
+  const dir = repo();
+  mkdirSync(path.join(dir, ".harness"));
+  const file = path.join(dir, ".harness", "repo.lock");
+  writeFileSync(file, String(process.ppid));
+  const old = new Date(Date.now() - 20 * 60_000);
+  utimesSync(file, old, old);
+  const result = await withRepoLock(dir, () => "entered", { waitMs: 30, pollMs: 5 });
+  assert.equal(result.ok, false);
+  assert.equal(readFileSync(file, "utf8"), String(process.ppid));
 });
 
 test("verify: reports pass and fail with output tail", async () => {
@@ -109,6 +138,27 @@ test("rebase: replays the task branch onto a moved base", async () => {
   assert.equal(res.ok, true, res.detail);
   assert.ok(existsSync(path.join(a.path, "main.txt")), "应包含主分支的新提交");
   assert.ok(existsSync(path.join(a.path, "task.txt")));
+});
+
+test("rebase: preserves an existing rebase and partially resolved files", () => {
+  const dir = repo();
+  const name = "草稿 文档.txt";
+  writeFileSync(path.join(dir, name), "start\n");
+  assert.equal(git(dir, ["add", "."]).status, 0);
+  assert.equal(git(dir, ["commit", "-qm", "base file"]).status, 0);
+  assert.equal(git(dir, ["switch", "-c", "task"]).status, 0);
+  writeFileSync(path.join(dir, name), "task\n");
+  assert.equal(git(dir, ["commit", "-qam", "task"]).status, 0);
+  assert.equal(git(dir, ["switch", "main"]).status, 0);
+  writeFileSync(path.join(dir, name), "main\n");
+  assert.equal(git(dir, ["commit", "-qam", "main"]).status, 0);
+  assert.equal(git(dir, ["switch", "task"]).status, 0);
+  assert.notEqual(git(dir, ["rebase", "main"]).status, 0);
+  writeFileSync(path.join(dir, name), "partial resolution\n");
+  assert.equal(rebaseWorktree(dir, "main").ok, false);
+  assert.equal(readFileSync(path.join(dir, name), "utf8"), "partial resolution\n");
+  assert.deepEqual(conflictedFiles(dir), [name]);
+  assert.equal(git(dir, ["rebase", "--abort"]).status, 0);
 });
 
 test("merge: resolver hook resolves a conflict and the merge completes", async () => {

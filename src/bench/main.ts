@@ -38,6 +38,10 @@ if (modeArg === "verified") {
     versions: args.get("versions")?.split(",").filter(Boolean),
     limit: Number(args.get("limit") ?? 2),
   });
+  if (picked.length === 0) {
+    console.error("没有匹配的可运行实例，请检查仓库、版本和数量筛选条件。");
+    process.exit(2);
+  }
   const loaded = await loadSettings(process.cwd());
   const resolved = createProvider({ settings: loaded.settings });
   console.log("SWE-bench Verified：从 " + all.length + " 条里选 " + picked.length + " 条 | 模型 " + resolved.model);

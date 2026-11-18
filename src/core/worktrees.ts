@@ -143,8 +143,8 @@ async function ensureExcluded(repoRoot: string): Promise<void> {
 }
 
 const excludeChecked = new Set<string>();
-async function ensureExcludedOnce(repoRoot: string): Promise<void> {
-  const key = path.resolve(repoRoot).toLowerCase();
+export async function ensureExcludedOnce(repoRoot: string): Promise<void> {
+  const key = path.resolve(repoRoot);
   if (excludeChecked.has(key)) return;
   excludeChecked.add(key);
   await ensureExcluded(repoRoot);

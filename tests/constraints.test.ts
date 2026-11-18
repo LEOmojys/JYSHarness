@@ -31,6 +31,24 @@ test("constraints: a clean repo passes", () => {
   assert.equal(report.errors, 0, JSON.stringify(report.findings));
 });
 
+test("constraints: --types reports compiler diagnostics and an unexplained nonzero exit", () => {
+  const root = tempRepo();
+  write(root, "tsconfig.json", "{}");
+  const compiler = "node_modules/typescript/bin/tsc";
+  write(root, compiler, 'console.log("src/core/a.ts(1,7): error TS2322: type mismatch"); process.exitCode = 2;');
+  const check = () => runChecks({ root, types: true }).findings.filter((f) => f.rule === "types");
+  const [diagnostic] = check();
+  assert.equal(diagnostic?.level, "error");
+  assert.equal(diagnostic.file, "src/core/a.ts");
+  assert.equal(diagnostic.line, 1);
+  write(root, compiler, "process.exitCode = 3;");
+  const [failure] = check();
+  assert.equal(failure?.level, "error");
+  assert.match(failure.message, /3/);
+  write(root, compiler, "process.exitCode = 0;");
+  assert.deepEqual(check(), []);
+});
+
 test("constraints: a broken relative import is an error with file:line", () => {
   const root = tempRepo();
   write(root, "src/core/b.ts", "import { x } from \"./missing.ts\";" + String.fromCharCode(10));
@@ -40,6 +58,30 @@ test("constraints: a broken relative import is an error with file:line", () => {
   assert.equal(hit.level, "error");
   assert.equal(hit.file, "src/core/b.ts");
   assert.equal(hit.line, 1);
+});
+
+test("constraints: generated benchmark workspaces are excluded while source directories remain checked", () => {
+  const root = tempRepo();
+  for (const dir of ["tools", "tmp", "datasets", "swe-work"]) {
+    write(root, "bench/" + dir + "/generated.js", "\n".repeat(1300));
+    write(root, "src/" + dir + "/broken.ts", 'import "./missing.ts";');
+  }
+  const report = runChecks({ root, entropy: true });
+  assert.deepEqual(report.findings.filter((f) => f.rule === "imports.resolve").map((f) => f.file), [
+    "src/datasets/broken.ts", "src/swe-work/broken.ts", "src/tmp/broken.ts", "src/tools/broken.ts",
+  ]);
+  assert.equal(report.findings.filter((f) => f.rule === "entropy.size").length, 0);
+});
+
+test("constraints: real benchmark imports are checked alongside embedded fixture source", () => {
+  const root = tempRepo();
+  write(root, "src/bench/tasks.ts", [
+    `const fixture = 'import { sum } from "../src/sum.js";';`,
+    'import { task } from "./missing.ts";',
+    'const run = () => import("./missing-runner.ts");',
+  ].join("\n"));
+  const report = runChecks({ root });
+  assert.deepEqual(report.findings.filter((f) => f.rule === "imports.resolve").map((f) => f.line), [2, 3]);
 });
 
 test("constraints: core importing the server layer is rejected", () => {

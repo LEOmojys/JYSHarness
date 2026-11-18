@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { discoverPlugins, loadPlugins } from "../src/plugins/loader.ts";
+import { shutdownHosts } from "../src/plugins/host/client.ts";
 import { Session } from "../src/core/session.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { emptyRuleSet } from "../src/permissions/rules.ts";
@@ -83,11 +84,38 @@ test("plugins: a broken plugin is isolated, others still load", async () => {
   await writePlugin(root, "throws", { entry: "export function activate() { throw new Error(\"boom\"); }" });
   await writePlugin(root, "noentry", { manifest: { name: "noentry", entry: "missing.ts" } });
   await writePlugin(root, "disabled", { manifest: { name: "disabled", enabled: false }, entry: GOOD_PLUGIN });
+  await writePlugin(root, "bad-ui", { manifest: { name: "bad-ui", ui: 123 }, entry: GOOD_PLUGIN });
+  await writePlugin(root, "bad-range", { manifest: { name: "bad-range", dependencies: { good: 1 } } });
 
   const loaded = await loadPlugins(root, logger);
   assert.deepEqual(loaded.plugins.map((p) => p.name), ["good"]);
-  assert.deepEqual(loaded.errors.map((e) => e.plugin).sort(), ["badjson", "noentry", "throws"]);
+  assert.deepEqual(loaded.errors.map((e) => e.plugin).sort(), ["bad-range", "bad-ui", "badjson", "noentry", "throws"]);
   assert.equal(loaded.tools.length, 1);
+});
+
+test("plugins: an isolated prompt-only plugin resolves installed dependencies", async (t) => {
+  const root = await tempWorkspace();
+  t.after(() => shutdownHosts());
+  await writePlugin(root, "base", { entry: "export function activate() {}" });
+  await writePlugin(root, "isolated", {
+    manifest: { name: "isolated", isolation: "process", dependencies: { base: "^1.0.0" } },
+    entry: "export function activate(api) { api.addPromptSection('isolated conventions'); }",
+  });
+
+  const loaded = await loadPlugins(root, logger);
+  assert.deepEqual(loaded.errors, []);
+  assert.deepEqual(loaded.promptSections, ["isolated conventions"]);
+});
+
+test("plugins: accepts the full set of lifecycle hook events", async () => {
+  const root = await tempWorkspace();
+  await writePlugin(root, "events", {
+    entry: "export function activate(api) { api.on('PostToolUseFailure', () => ({})); api.on('PreCompact', () => ({})); }",
+  });
+  const loaded = await loadPlugins(root, logger);
+  assert.deepEqual(loaded.warnings, []);
+  assert.equal(loaded.hooks.PostToolUseFailure?.length, 1);
+  assert.equal(loaded.hooks.PreCompact?.length, 1);
 });
 
 test("plugins: entry escaping the plugin folder is rejected", async () => {

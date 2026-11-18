@@ -1,6 +1,6 @@
 /** `jys serve` / `jys desktop` — expose the session over HTTP and open a shell. */
 import path from "node:path";
-import { parseArgs, createRuntime, HELP } from "./bootstrap.ts";
+import { parseArgs, createRuntime, loadRuntimeSettings, HELP } from "./bootstrap.ts";
 import { Session } from "../core/session.ts";
 import { connectMcpServers } from "../mcp/index.ts";
 import { createProvider } from "../providers/index.ts";
@@ -45,23 +45,23 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
     workspaceRoot?: string,
     resume?: { sessionId: string; resumeMessages: import("../core/types.ts").Message[] },
   ): Promise<Session> => {
+    const root = workspaceRoot ?? runtime.session.workspaceRoot;
+    const { loaded, settings } = loadRuntimeSettings(args, root, logger);
     const fresh = new Session({
-      workspaceRoot: workspaceRoot ?? runtime.session.workspaceRoot,
+      workspaceRoot: root,
       sessionId: resume?.sessionId,
       resumeMessages: resume?.resumeMessages,
-      settings: runtime.settings,
-      rules: runtime.loaded.rules,
+      settings,
+      rules: loaded.rules,
       provider: runtime.resolved.provider,
       model: runtime.resolved.model,
       logger,
       approve: async () => "deny",
-      hooks: runtime.settings.hooks,
-      compaction: runtime.settings.compaction,
-      contextWindow: runtime.settings.contextWindow,
-      enableSubagent: runtime.settings.enableSubagent !== false && !args.noSubagent,
+      hooks: settings.hooks,
+      compaction: settings.compaction,
+      contextWindow: settings.contextWindow,
+      enableSubagent: settings.enableSubagent !== false && !args.noSubagent,
     });
-    // Plugins are per-workspace behavior; apply them to every new session too.
-    if (runtime.plugins.plugins.length) fresh.applyPlugins(runtime.plugins);
     if (mcp.tools.length) fresh.setExtensionTools(mcp.tools);
     return fresh;
   };
@@ -96,6 +96,7 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
 
   const server = await startServer({
     session: runtime.session,
+    initialPlugins: runtime.plugins,
     makeSession,
     buildProvider,
     reloadMcp,

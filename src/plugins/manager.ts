@@ -9,14 +9,15 @@
  *   2. **拒绝覆盖**已存在的同名插件（除非 --force），避免误删用户改过的版本；
  *   3. 写 `plugin.lock.json` 记录来源与安装时间，便于 `list` 显示与日后更新。
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { configHome } from "../core/configStore.ts";
 import { discoverPlugins, readManifest, resolveEntry } from "./loader.ts";
 import { shutdownHost } from "./host/client.ts";
-import { checkCompat, harnessVersion } from "./compat.ts";
+import { checkCompat, harnessVersion, isPluginName } from "./compat.ts";
+import { isInside, realResolve } from "../sandbox/paths.ts";
 
 const NL = String.fromCharCode(10);
 
@@ -37,19 +38,29 @@ export interface InstallResult {
   error?: string;
 }
 
-function pluginsRoot(workspaceRoot: string, target: "project" | "user"): string {
-  return target === "user" ? path.join(configHome(), "plugins") : path.join(workspaceRoot, ".harness", "plugins");
+export function pluginDestination(workspaceRoot: string, name: string, target: "project" | "user" = "project"): string {
+  if (!isPluginName(name)) throw new Error("插件名无效：" + name);
+  const base = realResolve(target === "user" ? configHome() : workspaceRoot);
+  let dir = base;
+  for (const segment of target === "user" ? ["plugins", name] : [".harness", "plugins", name]) {
+    dir = path.join(dir, segment);
+    if (lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("安装路径包含目录链接：" + dir);
+  }
+  return dir;
 }
 
 /** 判断来源是 git URL 还是本地目录。 */
+const GITHUB_SHORTHAND = /^[a-z\d][a-z\d-]*\/[\w.-]+$/i;
+
 export function isGitSource(src: string): boolean {
-  return /^(git@|https?:\/\/.+\.git$|ssh:\/\/)/.test(src.trim()) || /^[\w.-]+\/[\w.-]+$/.test(src.trim()) && src.includes("/") === true && !existsSync(src);
+  return /^(git@|https?:\/\/.+\.git$|ssh:\/\/)/.test(src) || (GITHUB_SHORTHAND.test(src) && !existsSync(src));
 }
 
 /** 从 git 克隆到临时目录（浅克隆），失败返回错误说明。 */
 function cloneToTemp(url: string): { ok: true; dir: string } | { ok: false; error: string } {
-  const tmp = path.join(os.tmpdir(), "jys-plugin-" + Date.now().toString(36));
-  const args = ["clone", "--depth", "1", "--quiet", url, tmp];
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "jys-plugin-"));
+  const remote = GITHUB_SHORTHAND.test(url) ? "https://github.com/" + url : url;
+  const args = ["clone", "--depth", "1", "--quiet", "--", remote, tmp];
   const res = spawnSync("git", args, { encoding: "utf8", timeout: 180_000 });
   if (res.status !== 0) {
     rmSync(tmp, { recursive: true, force: true });
@@ -103,7 +114,7 @@ export function installPlugin(workspaceRoot: string, source: string, opts: Insta
   const target = opts.target ?? "project";
   let srcDir = source;
   let cleanup: string | null = null;
-  let resolvedSource = source;
+  let resolvedSource = path.resolve(source);
 
   if (isGitSource(source)) {
     const cloned = cloneToTemp(source);
@@ -134,18 +145,18 @@ export function installPlugin(workspaceRoot: string, source: string, opts: Insta
     }
 
     // 兼容性：装之前就告诉用户合不合适
-    const compat = checkCompat(manifest, new Map([[manifest.name, manifest.version ?? "0.0.0"]]));
+    const available = new Map(listInstalled(workspaceRoot)
+      .filter((plugin) => plugin.enabled && (target === "project" || plugin.source === "user"))
+      .map((plugin) => [plugin.name, plugin.version]));
+    const compat = checkCompat(manifest, available);
     const fatal = compat.find((i) => i.severity === "error");
     if (fatal) return { ok: false, error: "不兼容（harness " + harnessVersion() + "）：" + fatal.message };
 
-    const root = pluginsRoot(workspaceRoot, target);
-    const dest = path.join(root, manifest.name);
-    if (existsSync(dest)) {
-      if (!opts.force) return { ok: false, error: "已安装：" + manifest.name + "（加 --force 覆盖）" };
-      rmSync(dest, { recursive: true, force: true });
-    }
+    const dest = pluginDestination(workspaceRoot, manifest.name, target);
+    const root = path.dirname(dest);
+    if (existsSync(dest) && !opts.force) return { ok: false, error: "已安装：" + manifest.name + "（加 --force 覆盖）" };
+    if (isInside(realResolve(pluginDir), realResolve(root))) return { ok: false, error: "安装目录不能位于插件源目录内" };
     mkdirSync(root, { recursive: true });
-    copyTree(pluginDir, dest);
 
     // 安装锁：记录来源，便于 list 显示与后续更新
     const lock = {
@@ -156,25 +167,52 @@ export function installPlugin(workspaceRoot: string, source: string, opts: Insta
       installedAt: new Date().toISOString(),
       harnessAtInstall: harnessVersion(),
     };
-    writeFileSync(path.join(dest, "plugin.lock.json"), JSON.stringify(lock, null, 2) + NL, "utf8");
-
-    if (opts.disabled) {
-      const mp = path.join(dest, "plugin.json");
-      const raw = JSON.parse(readFileSync(mp, "utf8")) as Record<string, unknown>;
-      raw.enabled = false;
-      writeFileSync(mp, JSON.stringify(raw, null, 2) + NL, "utf8");
+    const transaction = mkdtempSync(path.join(root, ".install-"));
+    const staged = path.join(transaction, "new");
+    const backup = path.join(transaction, "previous");
+    let keepBackup = false;
+    try {
+      copyTree(pluginDir, staged);
+      const mp = path.join(staged, "plugin.json");
+      const stagedManifest = readManifest(mp);
+      resolveEntry(staged, stagedManifest);
+      writeFileSync(path.join(staged, "plugin.lock.json"), JSON.stringify(lock, null, 2) + NL, "utf8");
+      if (opts.disabled) {
+        writeFileSync(mp, JSON.stringify({ ...stagedManifest, enabled: false }, null, 2) + NL, "utf8");
+      }
+      if (existsSync(dest)) {
+        if (!opts.force) return { ok: false, error: "已安装：" + manifest.name };
+        shutdownHost(dest);
+        renameSync(dest, backup);
+      }
+      try {
+        renameSync(staged, dest);
+      } catch (err) {
+        if (existsSync(backup)) {
+          keepBackup = true;
+          renameSync(backup, dest);
+          keepBackup = false;
+        }
+        throw err;
+      }
+    } finally {
+      if (!keepBackup) rmSync(transaction, { recursive: true, force: true });
     }
-
-    // 覆盖安装后必须让旧宿主的子进程退出，否则继续跑旧代码
-    shutdownHost(dest);
     return { ok: true, name: manifest.name, dir: dest, source: resolvedSource };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
     if (cleanup) rmSync(cleanup, { recursive: true, force: true });
   }
 }
 
 export function uninstallPlugin(workspaceRoot: string, name: string, target: "project" | "user" = "project"): InstallResult {
-  const dir = path.join(pluginsRoot(workspaceRoot, target), name);
+  let dir: string;
+  try {
+    dir = pluginDestination(workspaceRoot, name, target);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
   if (!existsSync(dir)) return { ok: false, error: "未安装：" + name };
   // 先杀宿主再删目录：否则子进程还引用着已删代码（Windows 下还可能占用句柄）
   shutdownHost(dir);
@@ -203,9 +241,12 @@ export function listInstalled(workspaceRoot: string): InstalledPlugin[] {
     } catch {
       continue;
     }
-    let lock: { source?: string; installedAt?: string } = {};
+    let source: string | undefined;
+    let installedAt: string | undefined;
     try {
-      lock = JSON.parse(readFileSync(path.join(d.dir, "plugin.lock.json"), "utf8"));
+      const lock = JSON.parse(readFileSync(path.join(d.dir, "plugin.lock.json"), "utf8"));
+      if (typeof lock?.source === "string") source = lock.source;
+      if (typeof lock?.installedAt === "string") installedAt = lock.installedAt;
     } catch {
       /* 手放的插件没有 lock 文件，正常 */
     }
@@ -216,8 +257,8 @@ export function listInstalled(workspaceRoot: string): InstalledPlugin[] {
       dir: d.dir,
       source: d.source,
       enabled: manifest.enabled !== false,
-      installedFrom: lock.source,
-      installedAt: lock.installedAt,
+      installedFrom: source,
+      installedAt,
       permissions: manifest.contributes?.permissions ?? [],
       panels: Array.isArray(declared) ? declared.length : 0,
     });

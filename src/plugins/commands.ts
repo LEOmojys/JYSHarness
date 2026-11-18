@@ -6,6 +6,7 @@
  * 既是循环依赖风险，又会把一个重型模块（bootstrap/serve）拉进请求路径。
  */
 import { loadPlugins } from "./loader.ts";
+import type { PluginRuntime } from "./types.ts";
 import { Logger } from "../util/log.ts";
 
 export interface PluginCommandHit {
@@ -19,16 +20,15 @@ export interface PluginCommandHit {
  * 返回 null = 没有插件认领这个命令，调用方继续按"未知命令"处理。
  * 名字既接受 "/board" 也接受 "board"（registerCommand 时两种写法都有人用）。
  */
-export async function findPluginCommand(workspaceRoot: string, name: string, arg: string): Promise<PluginCommandHit | null> {
+export async function findPluginCommand(
+  workspaceRoot: string,
+  name: string,
+  arg: string,
+  runtimes?: readonly PluginRuntime[],
+): Promise<PluginCommandHit | null> {
   const wanted = name.startsWith("/") ? name : "/" + name;
-  let loaded;
-  try {
-    loaded = await loadPlugins(workspaceRoot, new Logger("error"));
-  } catch (err) {
-    // 插件加载失败不该让命令入口整个炸掉：报出来，交给调用方当"未知命令"或提示
-    throw new Error("插件加载失败：" + (err instanceof Error ? err.message : String(err)));
-  }
-  for (const runtime of loaded.runtimes) {
+  const active = runtimes ?? (await loadPlugins(workspaceRoot, new Logger("error"))).runtimes;
+  for (const runtime of active) {
     for (const cmd of runtime.commands) {
       const alias = cmd.name.startsWith("/") ? cmd.name : "/" + cmd.name;
       if (alias !== wanted) continue;

@@ -31,17 +31,15 @@ const lockFile = (repoRoot: string) => path.join(repoRoot, ".harness", "repo.loc
  * 判断一把锁是否已经失效。
  *
  * owner-dead  持有者 pid 不在进程表里（崩溃残留）→ 可立即回收
- * self        锁是本进程持有的（重入）→ 不该等，直接失败
- * too-old     pid 有效但超过 10 分钟 → 认为卡死，回收
- * unreadable  pid 读不出来且文件已存在超过 2 秒（避开"刚创建还没写入"的竞态）→ 回收
+ * too-old     pid 无效且超过 10 分钟 → 回收
  */
-function staleReason(file: string): "owner-dead" | "self" | "too-old" | "unreadable" | "live" {
+function staleReason(file: string): "owner-dead" | "too-old" | "live" {
   const STALE_MS = 10 * 60_000;
   let age = 0;
   try {
     age = Date.now() - statSync(file).mtimeMs;
   } catch {
-    return "unreadable"; // 文件刚被释放：下一轮会成功
+    return "live"; // 文件可能刚被释放，下一轮重新争取锁。
   }
   let pid = 0;
   try {
@@ -50,7 +48,7 @@ function staleReason(file: string): "owner-dead" | "self" | "too-old" | "unreada
     // 编程错误（忘了 import、传错参数）必须炸出来，不能被当成"锁还活着"静默降级。
     // 实测踩过：readFileSync 没导入 → ReferenceError 被这里吞掉 → 陈旧锁永远回收不了。
     if (err instanceof ReferenceError || err instanceof TypeError) throw err;
-    return age > 2_000 ? "unreadable" : "live";
+    return "live";
   }
   if (Number.isInteger(pid) && pid > 0) {
     // 同 pid 只可能是"上一次运行崩溃留下的"（本进程持有的锁在进程内排队阶段就挡住了），
@@ -58,7 +56,7 @@ function staleReason(file: string): "owner-dead" | "self" | "too-old" | "unreada
     if (pid === process.pid) return "owner-dead";
     try {
       process.kill(pid, 0);
-      return age > STALE_MS ? "too-old" : "live";
+      return "live";
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       // ESRCH = 进程不存在；EPERM = 存在但没权限（仍然算活着）
@@ -119,7 +117,10 @@ async function withInProcessLock<T>(
 
   if (!acquired) {
     release();
-    if (inProcChains.get(key) === mine) inProcChains.delete(key);
+    // A timed-out ticket remains behind its predecessor until the holder releases.
+    void mine.then(() => {
+      if (inProcChains.get(key) === mine) inProcChains.delete(key);
+    });
     return { ran: false, error: "仓库被另一个操作占用（本进程排队超时 " + waitMs + "ms）：" + key };
   }
   try {
@@ -136,7 +137,8 @@ export async function withRepoLock<T>(
   fn: () => Promise<T> | T,
   opts: LockOptions = {},
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
-  const key = path.resolve(repoRoot).toLowerCase();
+  const canonical = canonicalPath(repoRoot);
+  const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
   const waitMs = opts.waitMs ?? 30_000;
   const res = await withInProcessLock(key, waitMs, () => withFileLock(repoRoot, fn, opts));
   // 原样透传文件锁的结果，避免双层包裹把 ok:false 洗成 ok:true
@@ -152,13 +154,15 @@ async function withFileLock<T>(
   const pollMs = opts.pollMs ?? 100;
   const file = lockFile(repoRoot);
   mkdirSync(path.dirname(file), { recursive: true });
-  const staleMs = 10 * 60_000;
   const started = Date.now();
   for (;;) {
     try {
       writeFileSync(file, String(process.pid), { flag: "wx" });
       break;
     } catch (err) {
+      if (!(err instanceof Error && "code" in err && err.code === "EEXIST")) {
+        return { ok: false, error: "无法创建仓库锁：" + file + "：" + String(err) };
+      }
       /**
        * 陈旧锁回收。两种情形：
        *   1. 持有者进程已经不存在（崩溃/被杀）→ **立即**回收；
@@ -166,11 +170,7 @@ async function withFileLock<T>(
        * 只按 mtime 判的话，崩溃一次就要等满 10 分钟，实测用户会以为"卡死了"。
        */
       const stale = staleReason(file);
-      if (stale === "owner-dead") {
-        rmSync(file, { force: true });
-        continue;
-      }
-      if (stale === "too-old" || stale === "unreadable") {
+      if (stale === "owner-dead" || stale === "too-old") {
         rmSync(file, { force: true });
         continue;
       }
@@ -327,12 +327,15 @@ export interface RebaseResult {
  * 冲突时立刻 `rebase --abort`：留下半 rebase 状态会让人分不清"现在是哪个分支"。
  */
 export function rebaseWorktree(worktreePath: string, onto: string): RebaseResult {
-  const head = git(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (head.status !== 0) return { ok: false, files: [], detail: "读取工作树分支失败，可能不是 git 工作树" };
-  const r = git(worktreePath, ["rebase", onto]);
+  const gitDir = git(worktreePath, ["rev-parse", "--absolute-git-dir"]);
+  if (gitDir.status !== 0) return { ok: false, files: [], detail: "读取工作树失败，可能不是 git 工作树" };
+  const stateDir = gitDir.stdout.trimEnd();
+  if (["rebase-merge", "rebase-apply"].some((name) => existsSync(path.join(stateDir, name)))) {
+    return { ok: false, files: conflictedFiles(worktreePath), detail: "工作树已有进行中的 rebase 或 am，请先完成当前操作" };
+  }
+  const r = git(worktreePath, ["rebase", "--", onto]);
   if (r.status === 0) return { ok: true, files: [], detail: "已 rebase 到 " + onto };
-  const conflicted = git(worktreePath, ["diff", "--name-only", "--diff-filter=U"]);
-  const files = String(conflicted.stdout ?? "").trim().split(/\r?\n/).filter(Boolean);
+  const files = conflictedFiles(worktreePath);
   git(worktreePath, ["rebase", "--abort"]);
   return { ok: false, files, detail: String(r.stderr ?? "").trim().slice(0, 300) || "rebase 失败" };
 }
@@ -343,8 +346,8 @@ export type ConflictResolver = (ctx: { repoRoot: string; files: string[]; branch
 
 /** 当前未解决的冲突文件。 */
 export function conflictedFiles(repoRoot: string): string[] {
-  const r = git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]);
-  return String(r.stdout ?? "").trim().split(/\r?\n/).filter(Boolean);
+  const r = git(repoRoot, ["diff", "--name-only", "--diff-filter=U", "-z"]);
+  return String(r.stdout ?? "").split("\0").filter(Boolean);
 }
 
 /**

@@ -10,9 +10,10 @@
 import { loadSettings } from "../core/config.ts";
 import { createProvider } from "../providers/index.ts";
 import { Session } from "../core/session.ts";
-import { emptyRuleSet } from "../permissions/rules.ts";
 import { Logger } from "../util/log.ts";
-import { conflictedFiles } from "../core/worktreeOps.ts";
+import path from "node:path";
+import { realResolve } from "../sandbox/paths.ts";
+import { conflictedFiles, runVerify } from "../core/worktreeOps.ts";
 
 const NL = String.fromCharCode(10);
 
@@ -32,9 +33,8 @@ export function conflictPrompt(files: string[], branch: string, verify?: string)
     "## 要求",
     "1. 读冲突文件，找到 <<<<<<< / ======= / >>>>>>> 标记；",
     "2. **保留双方意图**：不要简单选一边，除非一边明显是旧的错误实现；",
-    "3. 改完把文件加入暂存区（git add），让冲突标记消失；",
-    "4. 不要执行 git commit、git merge --abort、git checkout -- 等会改变合并状态的命令；",
-    verify ? "5. 最后运行验证命令确认没破坏功能：" + verify : "5. 确认没有遗留的冲突标记。",
+    "3. 用 Edit 或 Write 逐个保存解决后的冲突文件。暂存、验证和提交由程序负责。",
+    verify ? "4. 程序将在提交前运行验证命令：" + verify : "4. 确认没有遗留的冲突标记。",
     "",
     "完成后用一句话说明你把冲突怎么合起来的。",
   ].join(NL);
@@ -46,39 +46,56 @@ export async function resolveConflictsWithAgent(
   branch: string,
   opts: AgentResolveOptions = {},
 ): Promise<{ ok: boolean; detail: string }> {
+  if (!opts.verify?.trim()) return { ok: false, detail: "缺少提交前验证命令 --verify" };
   const files = conflictedFiles(repoRoot);
   if (!files.length) return { ok: false, detail: "没有冲突文件" };
 
-  const loaded = await loadSettings(repoRoot);
+  const loaded = loadSettings(repoRoot);
   const resolved = createProvider({ settings: loaded.settings });
   const session = new Session({
     workspaceRoot: repoRoot,
     settings: {
-      // bypassPermissions：解决冲突期间不该弹审批，否则无人值守会卡死
-      permissionMode: "bypassPermissions",
-      sandboxMode: "workspace-write",
+      permissionMode: loaded.settings.permissionMode === "plan" ? "plan" : "acceptEdits",
+      sandboxMode: loaded.settings.sandboxMode === "read-only" ? "read-only" : "workspace-write",
       maxTurns: opts.maxTurns ?? 20,
       maxTokens: 4_096,
       enableSubagent: false,
     },
-    rules: emptyRuleSet(),
+    rules: loaded.rules,
     provider: resolved.provider,
     model: resolved.model,
     logger: new Logger("error"),
-    approve: async () => "allow",
+    approve: async () => "deny",
     enableSubagent: false,
   });
   await session.init();
 
+  const remaining = new Set(files.map((file) => path.resolve(session.workspaceRoot, file)));
+  const targets = new Set(remaining);
+  session.tools = session.tools.filter((tool) => ["Read", "Grep", "Glob", "Write", "Edit"].includes(tool.name))
+    .map((tool) => tool.isReadOnly ? tool : { ...tool, async call(input, ctx) {
+      const target = typeof input.file_path === "string" ? realResolve(path.resolve(ctx.cwd, input.file_path)) : "";
+      if (!targets.has(target)) return { isError: true, content: "只能编辑本次合并的冲突文件。" };
+      const result = await tool.call(input, ctx);
+      if (!result.isError) remaining.delete(target);
+      return result;
+    } });
+
+  let completed = false;
   try {
     for await (const ev of session.send(conflictPrompt(files, branch, opts.verify), new AbortController().signal)) {
-      if (opts.verbose && ev.type === "tool_end") console.log("      tool: " + String((ev as { name?: string }).name));
+      if (opts.verbose && ev.type === "tool_end") console.log("      tool: " + ev.name);
+      if (ev.type === "done") {
+        if (ev.reason !== "completed") return { ok: false, detail: ev.error ?? ev.reason };
+        completed = true;
+      }
     }
   } catch (err) {
     return { ok: false, detail: "agent 执行失败：" + (err instanceof Error ? err.message : String(err)) };
   }
 
-  const still = conflictedFiles(repoRoot);
-  if (still.length) return { ok: false, detail: "仍有冲突标记：" + still.join(", ") };
+  if (!completed || remaining.size) return { ok: false, detail: "agent 未完成全部冲突文件的编辑" };
+  const verification = await runVerify(repoRoot, opts.verify);
+  if (!verification.ok) return { ok: false, detail: "提交前验证失败：" + verification.tail };
   return { ok: true, detail: "agent 已解决冲突" };
 }

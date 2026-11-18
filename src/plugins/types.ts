@@ -172,6 +172,7 @@ export interface PluginCommand {
 }
 
 export interface PluginRuntime {
+  pluginDir: string;
   pluginId: string;
   routes: PluginRoute[];
   panels: PluginPanel[];

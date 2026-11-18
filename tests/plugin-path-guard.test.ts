@@ -50,6 +50,19 @@ test("plugins: existing toolCheck is respected, not overwritten", () => {
   void root;
 });
 
+test("plugins: path checks include optional destinations and preserve the strongest decision", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "jys-paths-"));
+  const file = { type: "string" };
+  const tool = withDefaultsPathGuard(pluginTool({
+    inputSchema: { type: "object", properties: { path: file, dest: file } },
+  }));
+  const check = tool.toolCheck;
+  assert.ok(check);
+  assert.equal(check({ dest: "AGENTS.md" }, ctxFor(root))?.behavior, "ask");
+  assert.equal(check({ path: "AGENTS.md", dest: ".git/config" }, ctxFor(root))?.behavior, "deny");
+  assert.equal(check({ path: "a.txt", dest: "b.txt" }, ctxFor(root)), null);
+});
+
 test("plugins: tools without path-like inputs are left untouched", () => {
   const tool = withDefaultsPathGuard(pluginTool({ inputSchema: { type: "object", properties: { query: { type: "string" } } } }));
   assert.equal(tool.toolCheck, undefined, "没有路径参数就不该乱加校验");

@@ -8,9 +8,10 @@
  *
  * 安全：资产读取必须做**目录包含校验**，否则 `..%2f..%2fetc/passwd` 就能读任意文件。
  */
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { PluginRuntime } from "./types.ts";
+import { isInside } from "../sandbox/paths.ts";
 
 export const PLUGIN_ROUTE_PREFIX = "/plugin/";
 export const PLUGIN_ASSET_PREFIX = "/plugin-assets/";
@@ -31,7 +32,7 @@ export function parsePluginAsset(pathname: string): { id: string; file: string }
   const tail = pathname.slice(PLUGIN_ASSET_PREFIX.length);
   const slash = tail.indexOf("/");
   const id = decodeURIComponent(slash < 0 ? tail : tail.slice(0, slash));
-  const file = slash < 0 ? "" : tail.slice(slash + 1);
+  const file = slash < 0 ? "" : decodeURIComponent(tail.slice(slash + 1));
   if (!id) return null;
   return { id, file };
 }
@@ -39,11 +40,15 @@ export function parsePluginAsset(pathname: string): { id: string; file: string }
 /** 资产路径解析：必须落在插件 ui 目录内，否则返回 null（防目录穿越）。 */
 export function resolveAssetPath(runtime: PluginRuntime | undefined, file: string): string | null {
   if (!runtime?.uiDir || !file) return null;
-  const abs = path.resolve(runtime.uiDir, file);
-  const rel = path.relative(runtime.uiDir, abs);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  if (!existsSync(abs) || !statSync(abs).isFile()) return null;
-  return abs;
+  try {
+    const root = realpathSync.native(runtime.pluginDir);
+    const ui = realpathSync.native(runtime.uiDir);
+    if (!isInside(root, ui)) return null;
+    const abs = realpathSync.native(path.resolve(ui, file));
+    return isInside(ui, abs) && statSync(abs).isFile() ? abs : null;
+  } catch {
+    return null;
+  }
 }
 
 const MIME: Record<string, string> = {
@@ -62,10 +67,18 @@ export function mimeFor(file: string): string {
 
 /** 资产响应（流式，避免把大文件整块读进内存）。 */
 export function pipeAsset(abs: string, res: import("node:http").ServerResponse): void {
-  res.writeHead(200, {
-    "content-type": mimeFor(abs),
-    // 插件资产必须禁缓存：开发期改了 JS 要立刻生效
-    "cache-control": "no-store",
+  const stream = createReadStream(abs);
+  res.once("close", () => stream.destroy());
+  stream.once("error", () => {
+    if (res.headersSent) res.destroy();
+    else if (!res.destroyed) res.writeHead(404).end();
   });
-  createReadStream(abs).pipe(res);
+  stream.once("open", () => {
+    if (res.destroyed) return stream.destroy();
+    res.writeHead(200, {
+      "content-type": mimeFor(abs),
+      "cache-control": "no-store",
+    });
+    stream.pipe(res);
+  });
 }

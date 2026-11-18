@@ -5,8 +5,9 @@
  * 而 JYSHarness 的技能发现本来就认扁平 .md，所以两者在格式上天然兼容 ——
  * 缺的只是一个"把它们放到位"的命令，而不是转换器。
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { constants, copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { parseArgs } from "node:util";
 import { configHome } from "../core/configStore.ts";
 import { discoverSkillsWithWarnings } from "../core/skills.ts";
 
@@ -20,17 +21,23 @@ function usage(): string {
 }
 
 export async function runSkill(argv: string[], workspace: string): Promise<number> {
-  // 跳过前置 flag：调用方可能写成 jys --workspace X skill list，此时 argv[0] 是 --workspace
-  const action = argv.find((x, i) => !x.startsWith("--") && !String(argv[i - 1] ?? "").startsWith("--")) ?? "list";
-  const rest = argv.slice(1);
-  const flag = (name: string) => {
-    const i = rest.indexOf("--" + name);
-    return i >= 0 ? rest[i + 1] : undefined;
-  };
+  let parsed;
+  try {
+    parsed = parseArgs({ args: argv, allowPositionals: true, options: {
+      json: { type: "boolean" }, to: { type: "string" }, help: { type: "boolean", short: "h" },
+    } });
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 2;
+  }
+  const { values, positionals } = parsed;
+  const [action = "list", src] = positionals;
+  if (values.help) { console.log(usage()); return 0; }
 
   if (action === "list") {
+    if (src !== undefined || values.to !== undefined) { console.error(usage()); return 2; }
     const res = discoverSkillsWithWarnings(workspace);
-    if (rest.includes("--json")) {
+    if (values.json) {
       console.log(JSON.stringify({ skills: res.skills.map((s) => ({ name: s.name, description: s.description, source: s.source, dir: s.dir })), warnings: res.warnings }, null, 2));
       return 0;
     }
@@ -44,12 +51,11 @@ export async function runSkill(argv: string[], workspace: string): Promise<numbe
   }
 
   if (action === "import-dsh") {
-    // 位置参数 = 动作之后、且不是某个 flag 的值（--to project 里的 project 不算）
-    // rest 已经是"去掉动作名"后的参数，不能再切一次（切了会把目录吞掉）
-    const positional = rest.filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--to");
-    const src = positional[0];
-    if (!src) { console.log(usage()); return 2; }
-    const to = flag("to") === "user" ? "user" : "project";
+    const to = values.to ?? "project";
+    if (!src || positionals.length !== 2 || values.json || (to !== "user" && to !== "project")) {
+      console.error(usage());
+      return 2;
+    }
     const target = to === "user" ? path.join(configHome(), "skills") : path.join(workspace, ".harness", "skills");
     if (!existsSync(src) || !statSync(src).isDirectory()) {
       console.error("不是目录：" + src);
@@ -59,17 +65,15 @@ export async function runSkill(argv: string[], workspace: string): Promise<numbe
 
     let copied = 0;
     let skipped = 0;
-    const files = readdirSync(src).filter((f) => f.toLowerCase().endsWith(".md"));
-    for (const f of files) {
-      const from = path.join(src, f);
-      const dest = path.join(target, f);
-      // 幂等：已存在就跳过，不覆盖用户改过的版本
-      if (existsSync(dest)) {
+    for (const entry of readdirSync(src, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md")) continue;
+      try {
+        copyFileSync(path.join(src, entry.name), path.join(target, entry.name), constants.COPYFILE_EXCL);
+        copied++;
+      } catch (err) {
+        if (!(err instanceof Error && "code" in err && err.code === "EEXIST")) throw err;
         skipped++;
-        continue;
       }
-      copyFileSync(from, dest);
-      copied++;
     }
 
     const after = discoverSkillsWithWarnings(workspace);

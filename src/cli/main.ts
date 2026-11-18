@@ -3,7 +3,6 @@
  * CLI front-end. The REPL is deliberately thin: all policy lives in the core.
  * Rendering is event-driven, which is why the loop can stream.
  */
-import path from "node:path";
 import { createInterface } from "node:readline";
 import { findPluginCommand } from "../plugins/commands.ts";
 import { pathToFileURL } from "node:url";
@@ -14,7 +13,7 @@ import type { Session } from "../core/session.ts";
 import { describeDecision, type PermissionDecision } from "../permissions/engine.ts";
 import { formatRule } from "../permissions/rules.ts";
 import { describeHooks } from "../hooks/hooks.ts";
-import { parseArgs, createRuntime, HELP } from "./bootstrap.ts";
+import { parseArgs, createRuntime, HELP, readGlobalOption } from "./bootstrap.ts";
 
 class Prompter {
   private rl;
@@ -87,31 +86,34 @@ function renderToolResult(name: string, body: string, isError: boolean | undefin
  * 于是 `jys --workspace X skill list` 把 X 当成了动作名。
  */
 function splitGlobalFlags(argv: string[]): { workspace: string; rest: string[] } {
-  const VALUE_FLAGS = new Set(["--provider", "--model", "--script", "--mode", "--sandbox", "--resume", "--max-turns", "--agent-mode", "--port"]);
-  const BOOL_FLAGS = new Set(["-y", "--yes", "--no-subagent", "--debug", "--open"]);
   let workspace = process.cwd();
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--workspace") {
-      workspace = path.resolve(argv[++i] ?? ".");
-      continue;
+    const option = readGlobalOption(argv, i);
+    if (!option || option.values.mode === "help") rest.push(a);
+    else {
+      workspace = option.values.workspace ?? workspace;
+      i += option.size - 1;
     }
-    if (VALUE_FLAGS.has(a)) { i++; continue; }
-    if (BOOL_FLAGS.has(a)) continue;
-    rest.push(a);
   }
   return { workspace, rest };
 }
+const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check", "worktree", "skill"]);
+
+function subcommandIndex(argv: string[]): number {
+  for (let i = 0; i < argv.length;) {
+    const option = readGlobalOption(argv, i);
+    if (!option) return SUBCOMMANDS.has(argv[i]) ? i : -1;
+    if (option.values.print) return -1;
+    i += option.size;
+  }
+  return -1;
+}
+
 async function main(): Promise<void> {
-  // Sub-commands that reuse the same runtime but a different front-end.
-  //
-  // The token can appear anywhere: launchers prepend flags\, e.g.
-  //   main.ts --workspace <dir> serve --port 4317
-  // Looking only at argv[2] silently turned "serve" into a one-shot prompt.
   const argv = process.argv.slice(2);
-  const SUBCOMMANDS = new Set(["serve", "desktop", "repl", "chat", "plugin", "check", "worktree", "skill"]);
-  const subIndex = argv.findIndex((a) => SUBCOMMANDS.has(a));
+  const subIndex = subcommandIndex(argv);
   const sub = subIndex >= 0 ? argv[subIndex] : undefined;
   const rest = subIndex >= 0 ? argv.filter((_, i) => i !== subIndex) : argv;
 
@@ -289,7 +291,7 @@ async function main(): Promise<void> {
     const t = line.trim();
     if (!t) continue;
     if (t.startsWith("/")) {
-      const done = await handleSlash(t, session, prompter, resolved, interactive);
+      const done = await handleSlash(t, session, prompter, resolved, interactive, runtime.plugins.runtimes);
       if (done) break;
       continue;
     }
@@ -315,6 +317,7 @@ export async function handleSlash(
   prompter: Prompter,
   resolved: { provider: { id: string }; model: string; note: string },
   interactive: boolean,
+  runtimes?: readonly import("../plugins/types.ts").PluginRuntime[],
 ): Promise<boolean> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
   const arg = rest.join(" ");
@@ -419,7 +422,7 @@ export async function handleSlash(
     default: {
       // 插件命令：/demo-ping 这类由插件 registerCommand() 注册。
       // 放在 default 分支而不是预先枚举 —— 插件是动态的，枚举不可能覆盖。
-      const hit = await findPluginCommand(session.workspaceRoot, cmd, arg);
+      const hit = await findPluginCommand(session.workspaceRoot, cmd, arg, runtimes);
       if (hit) {
         console.log(hit.output);
         return false;

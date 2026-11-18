@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadPlugins } from "../src/plugins/loader.ts";
-import { shutdownHosts, shutdownHost } from "../src/plugins/host/client.ts";
+import { hostCount, shutdownHosts, shutdownHost } from "../src/plugins/host/client.ts";
 import { Logger } from "../src/util/log.ts";
 
 const NL = String.fromCharCode(10);
@@ -43,7 +44,6 @@ test("stale host: reinstall/upgrade must be picked up after invalidating the hos
   assert.equal((await t1.call({}, ctxFor(ws))).content, "v1");
 
   // 模拟"用户升级了插件代码"：写入 v2
-  makeIsolated("v2"); // 同目录，内容改成 v2（新版 makeIsolated 会新建 tmp，所以这里直接改原文件）
   writeFileSync(
     path.join(dir, "index.ts"),
     [
@@ -71,5 +71,48 @@ test("stale host: reinstall/upgrade must be picked up after invalidating the hos
   const fresh = await loadPlugins(ws, new Logger("error"));
   const tFresh = fresh.tools.find((t) => t.name === "Version")!;
   assert.equal((await tFresh.call({}, ctxFor(ws))).content, "v2", "清理宿主后必须加载新代码");
+  assert.equal((await t1.call({}, ctxFor(ws))).isError, true, "an invalidated proxy must stay closed");
   shutdownHosts();
+});
+
+test("user plugin hosts are scoped to the workspace and invalidated by plugin directory", async (t) => {
+  const base = mkdtempSync(path.join(os.tmpdir(), "jys-user-host-"));
+  const previous = process.env.HARNESS_HOME;
+  process.env.HARNESS_HOME = base;
+  t.after(() => {
+    shutdownHosts();
+    if (previous === undefined) delete process.env.HARNESS_HOME;
+    else process.env.HARNESS_HOME = previous;
+  });
+  const dir = path.join(base, "plugins", "shared");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({ name: "shared", isolation: "process" }));
+  writeFileSync(path.join(dir, "index.mjs"), `
+    export function activate(api) {
+      api.registerCommand({name: "/root", run: () => api.workspaceRoot});
+    }
+  `);
+  const a = mkdtempSync(path.join(base, "workspace-"));
+  const b = mkdtempSync(path.join(base, "workspace-"));
+  async function loadCommand(ws: string) {
+    const loaded = await loadPlugins(ws, new Logger("error"));
+    assert.deepEqual(loaded.errors, []);
+    const cmd = loaded.runtimes[0]?.commands[0];
+    assert.ok(cmd);
+    return cmd;
+  }
+  const cmdA = await loadCommand(a);
+  const cmdB = await loadCommand(b);
+  const signal = new AbortController().signal;
+  assert.equal(await cmdA.run("", { workspaceRoot: a, signal }), a);
+  assert.equal(await cmdB.run("", { workspaceRoot: b }), b);
+  assert.equal(getEventListeners(signal, "abort").length, 0);
+  shutdownHosts(a);
+  assert.equal(hostCount(), 1);
+  await assert.rejects(() => Promise.resolve(cmdA.run("", { workspaceRoot: a })));
+  assert.equal(await cmdB.run("", { workspaceRoot: b }), b);
+  await loadCommand(a);
+  assert.equal(shutdownHost(dir), true);
+  assert.equal(hostCount(), 0);
+  await assert.rejects(() => Promise.resolve(cmdB.run("", { workspaceRoot: b })));
 });

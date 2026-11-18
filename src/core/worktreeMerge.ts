@@ -10,7 +10,7 @@
  *      卷进合并提交里。
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 const git = (cwd: string, args: string[]) =>
@@ -24,6 +24,7 @@ export interface MergePreflight {
   files: string[];
   /** 分支是否已存在于目标（无需合并） */
   alreadyMerged: boolean;
+  error?: string;
 }
 
 export interface MergeOutcome {
@@ -56,25 +57,24 @@ export function currentBranch(repoRoot: string): string | null {
 
 /** 工作区是否干净（含未跟踪文件）。 */
 export function isClean(repoRoot: string): { clean: boolean; detail: string } {
-  const r = git(repoRoot, ["status", "--porcelain"]);
+  const r = git(repoRoot, ["status", "--porcelain", "--untracked-files=normal"]);
+  if (r.status !== 0) return { clean: false, detail: gitError(r) };
   const out = String(r.stdout ?? "").trim();
   return out ? { clean: false, detail: out.split("\n").slice(0, 5).join(" | ") } : { clean: true, detail: "" };
 }
 
 /** 分支是否已合进目标（git merge-base --is-ancestor 返回 0 即为已合）。 */
 export function alreadyMerged(repoRoot: string, into: string, branch: string): boolean {
-  return git(repoRoot, ["merge-base", "--is-ancestor", branch, into]).status === 0;
+  return git(repoRoot, ["merge-base", "--is-ancestor", "--", branch, into]).status === 0;
+}
+
+function gitError(r: ReturnType<typeof git>): string {
+  return (r.error?.message || r.stderr?.trim() || r.stdout?.trim() || "git 操作失败").slice(0, 400);
 }
 
 /** 无副作用预检：不切分支、不改工作区、不建 index。 */
 export function preflight(repoRoot: string, into: string, branch: string): MergePreflight {
-  if (alreadyMerged(repoRoot, into, branch)) return { branch, conflicts: false, files: [], alreadyMerged: true };
-  const r = git(repoRoot, ["merge-tree", "--write-tree", "--name-only", into, branch]);
-  const stdout = String(r.stdout ?? "");
-  // 退出码 0 = 可干净合并；非 0 = 冲突（stdout 里带 CONFLICT 行）
-  if (r.status === 0) return { branch, conflicts: false, files: [], alreadyMerged: false };
-  const files = parseMergeTreeConflicts(stdout);
-  return { branch, conflicts: true, files, alreadyMerged: false };
+  return preflightAll(repoRoot, into, [branch])[0];
 }
 
 /**
@@ -84,29 +84,41 @@ export function preflight(repoRoot: string, into: string, branch: string): Merge
  * 但真实流程是先合 a、再合 b —— 那时才冲突。只做"每个分支独立 vs 当前 main"
  * 会把冲突藏起来，等真正合并时才炸，用户看到的是"预检说没问题，合到一半失败"。
  *
- * 做法：把前面分支依次并进一个**累积树**（merge-tree 输出的 tree，不落地），
- * 再用 `--merge-base <累积树>` 判下一个分支；一旦冲突就停止推演。全程不碰工作区。
+ * 快进时直接使用分支提交。分叉时用两个父提交和合并结果生成临时提交，
+ * 让下一次预检能从完整历史中选出真实的共同祖先。全程不移动引用或改动工作区。
  */
 export function preflightAll(repoRoot: string, into: string, branches: string[]): MergePreflight[] {
   const out: MergePreflight[] = [];
-  const baseRes = git(repoRoot, ["rev-parse", into + "^{tree}"]);
-  let baseTree = String(baseRes.stdout ?? "").trim();
-  if (baseRes.status !== 0 || !baseTree) return branches.map((b) => preflight(repoRoot, into, b));
-
-  for (const branch of branches) {
-    if (alreadyMerged(repoRoot, into, branch)) {
-      out.push({ branch, conflicts: false, files: [], alreadyMerged: true });
-      continue;
+  let tip = into;
+  for (const [index, branch] of branches.entries()) {
+    const step: MergePreflight = { branch, conflicts: false, files: [], alreadyMerged: false };
+    out.push(step);
+    if (alreadyMerged(repoRoot, tip, branch)) {
+      step.alreadyMerged = true;
+    } else if (alreadyMerged(repoRoot, branch, tip)) {
+      tip = branch;
+    } else {
+      const r = git(repoRoot, ["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", "--", tip, branch]);
+      const [tree, ...paths] = String(r.stdout ?? "").split("\0");
+      if (r.status === 1 && /^[0-9a-f]{40,64}$/.test(tree)) {
+        step.conflicts = true;
+        step.files = paths.filter(Boolean);
+        break;
+      }
+      if (r.status !== 0) {
+        step.error = gitError(r);
+        break;
+      }
+      if (index + 1 < branches.length) {
+        const commit = git(repoRoot, ["-c", "user.name=JYSHarness", "-c", "user.email=preflight@localhost",
+          "commit-tree", tree, "-p", tip, "-p", branch, "-m", "worktree merge preflight"]);
+        if (commit.status !== 0) {
+          step.error = gitError(commit);
+          break;
+        }
+        tip = commit.stdout.trim();
+      }
     }
-    const r = git(repoRoot, ["merge-tree", "--write-tree", "--name-only", "--merge-base", baseTree, into, branch]);
-    const stdout = String(r.stdout ?? "");
-    if (r.status !== 0) {
-      out.push({ branch, conflicts: true, files: parseMergeTreeConflicts(stdout), alreadyMerged: false });
-      break; // 冲突之后的分支结论都会失真，停止推演
-    }
-    const mergedTree = stdout.split(/\r?\n/)[0]?.trim() ?? "";
-    if (mergedTree && /^[0-9a-f]{7,}$/i.test(mergedTree)) baseTree = mergedTree;
-    out.push({ branch, conflicts: false, files: [], alreadyMerged: false });
   }
   return out;
 }
@@ -122,23 +134,27 @@ export function preflightAll(repoRoot: string, into: string, branches: string[])
  * 于是冲突标记会被悄悄提交进主干。这里在读回内容后直接拦住。
  */
 function finalizeResolved(repoRoot: string, files: string[]): { ok: true } | { ok: false; error: string } {
-  if (files.length) git(repoRoot, ["add", "--", ...files]);
+  const unresolved = git(repoRoot, ["diff", "--name-only", "--diff-filter=U", "-z"]);
+  if (unresolved.status !== 0) return { ok: false, error: gitError(unresolved) };
+  const pending = new Set(unresolved.stdout.split("\0"));
+  const toStage = files.filter(rel => pending.has(rel) || existsSync(path.join(repoRoot, rel)));
+  if (toStage.length) {
+    const add = git(repoRoot, ["--literal-pathspecs", "add", "--", ...toStage]);
+    if (add.status !== 0) return { ok: false, error: gitError(add) };
+  }
   // git add 之后仍未合并的（.gitattributes 特殊处理、文件被删等）说明还没真解决
-  const still = String(git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]).stdout ?? "").trim();
+  const unmerged = git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]);
+  if (unmerged.status !== 0) return { ok: false, error: gitError(unmerged) };
+  const still = unmerged.stdout.trim();
   if (still) return { ok: false, error: "resolver 返回成功，但这些文件仍是未合并状态：" + still };
 
-  const marked: string[] = [];
-  for (const rel of files) {
-    const abs = path.join(repoRoot, rel);
-    try {
-      const text = readFileSync(abs, "utf8");
-      if (/^<{7}( |$)/m.test(text) && /^>{7}( |$)/m.test(text)) marked.push(rel);
-    } catch {
-      /* 二进制或已删除：没有标记可查 */
-    }
-  }
-  if (marked.length) {
-    return { ok: false, error: "resolver 返回成功，但文件里仍有冲突标记（<<<<<<< / >>>>>>>）：" + marked.join(", ") };
+  const markers = git(repoRoot, ["--literal-pathspecs", "grep", "--cached", "-I", "-E", "-l", "-z", "--all-match",
+    "-e", "^<{7}( |$)", "-e", "^>{7}( |$)", "--", ...files]);
+  if (markers.status !== 1) {
+    const error = markers.status === 0
+      ? "resolver 返回成功，但文件里仍有冲突标记（<<<<<<< / >>>>>>>）：" + markers.stdout.split("\0").filter(Boolean).join(", ")
+      : gitError(markers);
+    return { ok: false, error };
   }
   return { ok: true };
 }
@@ -158,58 +174,70 @@ export function mergeBranches(
     resolve?: (ctx: { repoRoot: string; branch: string; files: string[] }) => { ok: boolean; detail?: string };
   },
 ): MergeOutcome {
-  const into = opts.into ?? currentBranch(repoRoot);
-  if (!into) return { ok: false, into: "", merged: [], error: "当前处于分离 HEAD 状态，请先 checkout 到一个分支" };
-
-  const dirty = isClean(repoRoot);
-  if (!dirty.clean) {
-    return { ok: false, into, merged: [], error: "主工作区有未提交改动，先提交或 stash：" + dirty.detail };
-  }
-
-  const merged: string[] = [];
+  const state = prepareMerge(repoRoot, opts.into);
+  if (state.error) return state;
   for (const branch of opts.branches) {
-    if (!branch || branch === into) continue;
-    if (alreadyMerged(repoRoot, into, branch)) continue;
-
-    const args = ["merge", "--no-edit"];
-    if (opts.noFf) args.push("--no-ff");
-    args.push("-m", opts.message ?? "merge " + branch);
-    args.push(branch);
-    const r = git(repoRoot, args);
-    if (r.status !== 0) {
-      const conflicted = git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]);
-      const files = String(conflicted.stdout ?? "").trim().split(/\r?\n/).filter(Boolean);
-      // 有 resolver 就先留在冲突现场让它解；没有就立刻回滚，不留半合并仓库
-      if (opts.resolve) {
-        const fixed = opts.resolve({ repoRoot, branch, files });
-        if (fixed.ok) {
-          // resolver 只负责解决冲突内容；暂存与提交由这里统一做
-          const staged = finalizeResolved(repoRoot, files);
-          if (staged.ok) {
-            const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
-            if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
-              merged.push(branch);
-              continue;
-            }
-          }
-          git(repoRoot, ["merge", "--abort"]);
-          return {
-            ok: false,
-            into,
-            merged,
-            blocked: { branch, files },
-            error: (!staged.ok ? staged.error : fixed.detail ?? "提交失败").slice(0, 400),
-          };
-        }
-        git(repoRoot, ["merge", "--abort"]);
-        return { ok: false, into, merged, blocked: { branch, files }, error: (fixed.detail ?? "冲突未解决").slice(0, 400) };
+    if (!branch || branch === state.into) continue;
+    const step = mergeStep(repoRoot, branch, opts);
+    if (step.status === "skipped") continue;
+    if (step.status === "error") return mergeFailure(repoRoot, state, step.error);
+    if (step.status === "conflict") {
+      const files = step.files;
+      let resolved: Resolution;
+      try {
+        resolved = opts.resolve?.({ repoRoot, branch, files }) ?? { ok: false };
+      } catch (err) {
+        resolved = { ok: false, detail: String(err) };
       }
-      git(repoRoot, ["merge", "--abort"]);
-      return { ok: false, into, merged, blocked: { branch, files }, error: String(r.stderr ?? "").trim().slice(0, 400) };
+      const failure = finishMerge(repoRoot, state, branch, files, resolved);
+      if (failure) return failure;
     }
-    merged.push(branch);
+    state.merged.push(branch);
   }
-  return { ok: true, into, merged };
+  return state;
+}
+
+type Resolution = { ok: boolean; detail?: string };
+
+function prepareMerge(repoRoot: string, target?: string): MergeOutcome {
+  const current = currentBranch(repoRoot);
+  const into = target ?? current ?? "";
+  let error: string | undefined;
+  if (!current) error = "当前处于分离 HEAD 状态，请先 checkout 到一个分支";
+  else if (current !== into) error = "请先切换到目标分支 " + into + "（当前为 " + current + "）";
+  else if (mergeInProgress(repoRoot)) error = "请先完成当前正在进行的合并";
+  else {
+    const dirty = isClean(repoRoot);
+    if (!dirty.clean) error = "主工作区有未提交改动或状态不可读，先检查或 stash：" + dirty.detail;
+  }
+  return { ok: !error, into, merged: [], error };
+}
+
+function mergeInProgress(repoRoot: string): boolean {
+  return git(repoRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).status === 0;
+}
+
+function mergeFailure(repoRoot: string, state: MergeOutcome, error: string): MergeOutcome {
+  if (mergeInProgress(repoRoot)) {
+    const abort = git(repoRoot, ["merge", "--abort"]);
+    if (abort.status !== 0) error += "；回滚失败：" + gitError(abort);
+  }
+  return { ...state, ok: false, error };
+}
+
+function finishMerge(repoRoot: string, state: MergeOutcome, branch: string, files: string[], resolved: Resolution): MergeOutcome | undefined {
+  let error = resolved.detail ?? "冲突未解决";
+  if (resolved.ok) {
+    const staged = finalizeResolved(repoRoot, files);
+    if (staged.ok) {
+      const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
+      if (commit.status === 0) return;
+      error = gitError(commit);
+    } else {
+      error = staged.error;
+    }
+  }
+  return { ...mergeFailure(repoRoot, state, error), blocked: { branch, files } };
 }
 
 // ---------------------------------------------------------------- 异步编排（给 agent 解冲突用）
@@ -219,17 +247,17 @@ export function mergeStep(
   repoRoot: string,
   branch: string,
   opts: { noFf?: boolean; message?: string } = {},
-): { status: "merged" | "skipped" | "conflict" | "error"; files?: string[]; error?: string } {
+): { status: "merged" | "skipped" } | { status: "conflict"; files: string[] } | { status: "error"; error: string } {
   if (alreadyMerged(repoRoot, currentBranch(repoRoot) ?? "HEAD", branch)) return { status: "skipped" };
   const args = ["merge", "--no-edit"];
   if (opts.noFf) args.push("--no-ff");
-  args.push("-m", opts.message ?? "merge " + branch, branch);
+  args.push("-m", opts.message ?? "merge " + branch, "--", branch);
   const r = git(repoRoot, args);
   if (r.status === 0) return { status: "merged" };
-  const conflicted = git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]);
-  const files = String(conflicted.stdout ?? "").trim().split(/\r?\n/).filter(Boolean);
-  if (files.length) return { status: "conflict", files };
-  return { status: "error", error: String(r.stderr ?? "").trim().slice(0, 400) };
+  const conflicted = git(repoRoot, ["diff", "-z", "--name-only", "--diff-filter=U"]);
+  const files = String(conflicted.stdout ?? "").split("\0").filter(Boolean);
+  if (files.length && mergeInProgress(repoRoot)) return { status: "conflict", files };
+  return { status: "error", error: gitError(r) };
 }
 
 /**
@@ -251,40 +279,25 @@ export async function mergeBranchesAsync(
 ): Promise<MergeOutcome> {
   const resolveFn = opts.resolve ?? opts.resolver;
   if (!resolveFn) return { ok: false, into: "", merged: [], error: "mergeBranchesAsync 需要 resolve（或 resolver）回调" };
-  const into = opts.into ?? currentBranch(repoRoot);
-  if (!into) return { ok: false, into: "", merged: [], error: "当前处于分离 HEAD 状态，请先 checkout 到一个分支" };
-  const dirty = isClean(repoRoot);
-  if (!dirty.clean) return { ok: false, into, merged: [], error: "主工作区有未提交改动，先提交或 stash：" + dirty.detail };
-
-  const merged: string[] = [];
+  const state = prepareMerge(repoRoot, opts.into);
+  if (state.error) return state;
   for (const branch of opts.branches) {
-    if (!branch || branch === into) continue;
+    if (!branch || branch === state.into) continue;
     const step = mergeStep(repoRoot, branch, { noFf: opts.noFf });
-    if (step.status === "skipped" || step.status === "merged") {
-      if (step.status === "merged") merged.push(branch);
-      continue;
-    }
-    if (step.status === "error") {
-      git(repoRoot, ["merge", "--abort"]);
-      return { ok: false, into, merged, error: step.error ?? "merge 失败" };
-    }
-    // 冲突：交给 resolver（agent），它只改文件，暂存与提交由这里统一做
-    const files = step.files ?? [];
-    const fixed = await resolveFn({ repoRoot, branch, files });
-    if (fixed.ok) {
-      const staged = finalizeResolved(repoRoot, files);
-      if (staged.ok) {
-        const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
-        if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
-          merged.push(branch);
-          continue;
-        }
+    if (step.status === "skipped") continue;
+    if (step.status === "error") return mergeFailure(repoRoot, state, step.error);
+    if (step.status === "conflict") {
+      const files = step.files;
+      let resolved: Resolution;
+      try {
+        resolved = await resolveFn({ repoRoot, branch, files });
+      } catch (err) {
+        resolved = { ok: false, detail: String(err) };
       }
-      git(repoRoot, ["merge", "--abort"]);
-      return { ok: false, into, merged, blocked: { branch, files }, error: (!staged.ok ? staged.error : "提交失败").slice(0, 400) };
+      const failure = finishMerge(repoRoot, state, branch, files, resolved);
+      if (failure) return failure;
     }
-    git(repoRoot, ["merge", "--abort"]);
-    return { ok: false, into, merged, blocked: { branch, files }, error: fixed.detail ?? "冲突未解决" };
+    state.merged.push(branch);
   }
-  return { ok: true, into, merged };
+  return state;
 }

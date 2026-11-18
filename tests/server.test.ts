@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Session } from "../src/core/session.ts";
@@ -14,6 +14,45 @@ const logger = new Logger("error");
 async function tempWorkspace(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), "mh-srv-"));
 }
+
+test("plugin routes and commands share state and reload only their workspace", async (t) => {
+  const previousHome = process.env.HARNESS_HOME;
+  process.env.HARNESS_HOME = await tempWorkspace();
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HARNESS_HOME;
+    else process.env.HARNESS_HOME = previousHome;
+  });
+  const a = await tempWorkspace();
+  const b = await tempWorkspace();
+  for (const [root, name] of [[a, "Alpha"], [b, "Beta"]]) {
+    const dir = path.join(root, ".harness", "plugins", name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ name, contributes: { permissions: ["http-route"] } }));
+    await writeFile(path.join(dir, "index.mjs"), `export function activate(api) {
+      let calls = 0;
+      api.registerRoute({ method: "GET", path: "counter", handler: () => ({ text: String(++calls) }) });
+      api.registerCommand({ name: "/counter", run: () => String(++calls) });
+      api.registerTool({ name: api.name, description: "test", inputSchema: { type: "object" }, call: async () => ({content: ""}) });
+    }`);
+  }
+  const h = await boot(a, [], true);
+  const post = (route: string, body: object) => fetch(h.server.url + route, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    assert.equal(await (await fetch(h.server.url + "plugin/Alpha/counter")).text(), "1");
+    const cmd = await post("api/command", { command: "/counter" });
+    assert.equal((await cmd.json()).output, "2");
+    const switched = await (await post("api/workspace", { path: b })).json();
+    assert.ok(switched.tools.some((tool: { name: string }) => tool.name === "Beta"));
+    assert.equal((await post("api/plugins", { action: "reload" })).status, 200);
+    const state = await (await fetch(h.server.url + "api/state?session=" + h.session.sessionId)).json();
+    assert.ok(state.tools.some((tool: { name: string }) => tool.name === "Alpha"));
+    assert.ok(state.tools.every((tool: { name: string }) => tool.name !== "Beta"));
+  } finally {
+    await h.stop();
+  }
+});
 
 interface Harness {
   server: RunningServer;

@@ -97,6 +97,45 @@ test("workspace: browse lists directories only", async () => {
   }
 });
 
+test("server: rule and behavior updates respect workspace boundaries and user overrides", async () => {
+  await withHome(async () => {
+    const a = await tempDir();
+    const b = await tempDir();
+    const first = makeSession(a);
+    await first.init();
+    const server = await startServer({
+      session: first, makeSession: async (root) => makeSession(root ?? a),
+      logger, port: 0, providerId: "mock",
+    });
+    const post = async (endpoint: string, body: object) => {
+      const response = await fetch(server.url + endpoint, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    try {
+      await post("api/rules", { ask: ["Glob"] });
+      await post("api/config", { permissionMode: "plan" });
+      await post("api/workspace", { path: b });
+      await post("api/rules", { ask: ["Read"] });
+      await post("api/config", { permissionMode: "acceptEdits", sandboxMode: "read-only" });
+      assert.equal(first.mode, "plan");
+      assert.equal(first.sandboxMode, "workspace-write");
+      assert.deepEqual(first.rules.ask.map((r) => r.ruleValue.toolName), ["Glob"]);
+
+      await post("api/config", { scope: "user", permissionMode: "default", sandboxMode: "read-only" });
+      assert.equal(first.mode, "plan", "the workspace permission mode overrides the user default");
+      assert.equal(first.sandboxMode, "read-only", "a workspace without an override inherits the user setting");
+      const state = await (await fetch(server.url + "api/state")).json();
+      assert.equal(state.mode, "acceptEdits");
+      assert.deepEqual(state.rules.map((r: { text: string }) => r.text), ["Read"]);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 test("server: switching workspace creates or reuses a session", async () => {
   await withHome(async () => {
     const rootA = await tempDir();

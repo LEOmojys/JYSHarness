@@ -1,7 +1,10 @@
 /** SWE-bench Verified 单实例编排：prepare → install → agent → score。 */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { Session } from "../core/session.ts";
+import { withRepoLock } from "../core/worktreeOps.ts";
+import type { ModelProvider } from "../providers/types.ts";
 import { emptyRuleSet } from "../permissions/rules.ts";
 import { Logger } from "../util/log.ts";
 import { SessionStore } from "../session/store.ts";
@@ -12,7 +15,7 @@ import { interpreterFor } from "./paths.ts";
 const NL = String.fromCharCode(10);
 
 export interface SweRunOptions {
-  provider: unknown;
+  provider: ModelProvider;
   model: string;
   maxTurns?: number;
   verbose?: boolean;
@@ -43,87 +46,95 @@ export async function runInstance(
   opts: SweRunOptions,
   extraDeps: string[] = [],
 ): Promise<SweResult> {
-  const logger = new Logger("error");
-  const dir = path.join(workRoot, inst.instance_id);
-  mkdirSync(dir, { recursive: true });
   const t0 = Date.now();
   const base = { instance_id: inst.instance_id, repo: inst.repo, version: inst.version, f2pPassed: 0, f2pTotal: inst.FAIL_TO_PASS.length, p2pFailed: 0, patchLines: 0, ms: 0 };
-
-  const prep = prepareRepo(dir, inst);
-  if (!prep.ok) return { ...base, resolved: false, stage: "prepare", detail: prep.detail, ms: Date.now() - t0 };
-  if (opts.verbose) console.log("    prepare: " + prep.detail);
+  const fail = (stage: SweResult["stage"], detail: string): SweResult =>
+    ({ ...base, stage, detail, resolved: false, ms: Date.now() - t0 });
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(inst.instance_id)) return fail("prepare", "无效的实例目录名");
 
   // 按官方 spec 选 Python 版本并锁依赖：装错版本会让 gold patch 都过不了（环境即坏）
   const spec = specFor(inst.repo, inst.version);
   if (!spec) {
-    return { ...base, resolved: false, stage: "install", detail: "没有 " + inst.repo + " " + inst.version + " 的官方环境 spec，跳过（避免用错版本得出假分数）", ms: Date.now() - t0 };
+    return fail("install", "没有 " + inst.repo + " " + inst.version + " 的官方环境 spec");
   }
   const interpreter = interpreterFor(spec.python);
   if (!interpreter) {
-    return { ...base, resolved: false, stage: "install", detail: "本机没有 Python " + spec.python + "（官方要求），无法复现该实例环境", ms: Date.now() - t0 };
+    return fail("install", "本机没有 Python " + spec.python + "（官方要求），无法复现该实例环境");
   }
-  const install = installRepo(dir, [...extraDeps, ...spec.pins], interpreter);
-  if (!install.ok) return { ...base, resolved: false, stage: "install", detail: install.detail, ms: Date.now() - t0 };
-  if (opts.verbose) console.log("    install: " + install.detail + " (python " + spec.python + ")");
+  const dir = path.join(workRoot, inst.instance_id);
+  const lock = await withRepoLock<SweResult>(path.join(workRoot, ".locks", inst.instance_id), async () => {
+    const prep = prepareRepo(dir, inst);
+    if (!prep.ok) return fail("prepare", prep.detail);
+    if (opts.verbose) console.log("    prepare: " + prep.detail);
+    const install = installRepo(dir, [...extraDeps, ...spec.pins], interpreter);
+    if (!install.ok) return fail("install", install.detail);
+    if (opts.verbose) console.log("    install: " + install.detail + " (python " + spec.python + ")");
 
-  // 模型干活
-  const session = new Session({
-    workspaceRoot: dir,
-    settings: {
-      permissionMode: "bypassPermissions",
-      sandboxMode: "workspace-write",
-      maxTurns: opts.maxTurns ?? 40,
-      maxTokens: 4_096,
+    // 模型干活
+    const session = new Session({
+      workspaceRoot: dir,
+      settings: {
+        permissionMode: "bypassPermissions",
+        sandboxMode: "workspace-write",
+        maxTurns: opts.maxTurns ?? 40,
+        maxTokens: 4_096,
+        enableSubagent: false,
+      },
+      rules: emptyRuleSet(),
+      provider: opts.provider,
+      model: opts.model,
+      logger: new Logger("error"),
+      approve: async () => "allow",
+      store: new SessionStore(path.join(dir, ".harness", "sessions")),
+      contextWindow: 100_000,
       enableSubagent: false,
-    },
-    rules: emptyRuleSet(),
-    provider: opts.provider as never,
-    model: opts.model,
-    logger,
-    approve: async () => "allow",
-    store: new SessionStore(path.join(dir, ".harness", "sessions")),
-    contextWindow: 100_000,
-    enableSubagent: false,
-  });
-  await session.init();
-  let agentError: string | undefined;
-  try {
-    for await (const ev of session.send(agentPrompt(inst), new AbortController().signal)) {
-      if (opts.verbose && ev.type === "tool_end") console.log("      tool: " + String((ev as { name?: string }).name));
+    });
+    await session.init();
+    let agentError: string | undefined;
+    try {
+      for await (const ev of session.send(agentPrompt(inst), new AbortController().signal)) {
+        if (opts.verbose && ev.type === "tool_end") console.log("      tool: " + ev.name);
+        if (ev.type === "done" && ev.reason !== "completed") agentError = ev.error ?? ev.reason;
+      }
+    } catch (err) {
+      agentError = err instanceof Error ? err.message : String(err);
     }
-  } catch (err) {
-    agentError = err instanceof Error ? err.message : String(err);
-  }
 
-  const patch = extractPatch(dir);
-  const patchLines = patch ? patch.split(NL).filter((l) => l.startsWith("+") || l.startsWith("-")).length : 0;
-  writeFileSync(path.join(workRoot, inst.instance_id + ".patch"), patch, "utf8");
-  if (opts.verbose) console.log("    patch: " + patchLines + " 行");
+    let patch: string;
+    const patchFile = path.join(workRoot, inst.instance_id + ".patch");
+    const tempFile = patchFile + "." + randomUUID() + ".tmp";
+    try {
+      patch = extractPatch(dir, inst);
+      writeFileSync(tempFile, patch, { flag: "wx" });
+      renameSync(tempFile, patchFile);
+    } catch (err) {
+      return fail("agent", err instanceof Error ? err.message : String(err));
+    } finally {
+      rmSync(tempFile, { force: true });
+    }
+    const patchLines = patch.split(NL).filter((l) => /^[+-]/.test(l) && !l.startsWith("+++ ") && !l.startsWith("--- ")).length;
+    base.patchLines = patchLines;
+    if (opts.verbose) console.log("    patch: " + patchLines + " 行");
 
-  // 官方流程：复位 → 应用模型 patch → 应用官方 test_patch → 跑测试
-  const reset = resetToBase(dir);
-  const applyModel = applyPatchFile(dir, patch, "model.patch");
-  const applyTests = applyPatchFile(dir, inst.test_patch, "test.patch");
-  if (!reset.ok || !applyModel.ok || !applyTests.ok) {
+    // 官方流程：复位 → 应用模型 patch → 应用官方 test_patch → 跑测试
+    const reset = resetToBase(dir, inst);
+    if (!reset.ok) return fail("test", reset.detail);
+    const applyModel = applyPatchFile(dir, patch, "model.patch");
+    if (!applyModel.ok) return fail("test", applyModel.detail);
+    const applyTests = applyPatchFile(dir, inst.test_patch, "test.patch");
+    if (!applyTests.ok) return fail("test", applyTests.detail);
+
+    const graded = grade(dir, inst);
     return {
       ...base,
-      resolved: false,
+      resolved: graded.resolved,
+      f2pPassed: graded.f2pPassed,
+      p2pFailed: graded.p2pFailed,
       patchLines,
-      stage: "test",
-      detail: "复位/应用 patch 失败: " + [reset.detail, applyModel.detail, applyTests.detail].filter((d) => d !== "reset" && d !== "applied model.patch" && d !== "applied test.patch").join(" | ").slice(0, 200),
+      stage: "done",
+      detail: (agentError ? "agent error: " + agentError.slice(0, 80) + " | " : "") + graded.detail,
       ms: Date.now() - t0,
     };
-  }
-
-  const graded = grade(dir, inst, inst.FAIL_TO_PASS, inst.PASS_TO_PASS);
-  return {
-    ...base,
-    resolved: graded.resolved,
-    f2pPassed: graded.f2pPassed,
-    p2pFailed: graded.p2pFailed,
-    patchLines,
-    stage: "done",
-    detail: (agentError ? "agent error: " + agentError.slice(0, 80) + " | " : "") + graded.detail,
-    ms: Date.now() - t0,
-  };
+  });
+  return lock.ok ? lock.value : fail("prepare", lock.error);
 }

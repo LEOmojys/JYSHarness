@@ -40,9 +40,9 @@ const SPECS: Record<string, Record<string, RepoSpec>> = {
 };
 
 export function specFor(repo: string, version: string): RepoSpec | null {
+  if (!Object.hasOwn(SPECS, repo)) return null;
   const byVersion = SPECS[repo];
-  if (!byVersion) return null;
-  return byVersion[version] ?? null;
+  return Object.hasOwn(byVersion, version) ? byVersion[version] : null;
 }
 
 /** 哪些 (仓库, 版本) 有官方 spec —— CLI 的 --list-specs 会打印它，方便挑能跑的实例。 */
