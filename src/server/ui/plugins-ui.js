@@ -11,63 +11,102 @@ let pluginPanels = [];
 const mounted = new Map();
 
 /**
- * 从 /api/config 拿到的 panels 应用进来（幂等，可重复调用）。
+ * 插槽表：名字 → 怎么渲染。
  *
- * 三个 slot 的挂载方式不同：
- *   sidebar    → 侧栏 tab 区加按钮，点击后在该视图里 mount
- *   settings   → 设置弹窗底部加一段区块（插件自己的设置界面就能进来）
- *   statusbar  → 底部状态栏右侧挂一个小部件（常驻展示类信息）
+ * 加一个插槽只需要在这里加一行（选择器 + 形态），不用改散落的 render 函数。
+ *   tabs   → 和"文件/待办"并列的 tab 按钮，点击在 panelBody 里 mount
+ *   inline → 直接挂在指定容器里的小部件（顶栏/状态栏）
+ *   block  → 挂在指定容器里的块（设置区块/输入框上方横幅/抽屉）
+ */
+const PLUGIN_SLOTS = {
+  sidebar: { mode: "tabs", selector: "panelTabs" },
+  statusbar: { mode: "inline", selector: null, fallbackSelector: ".composer-actions" },
+  header: { mode: "inline", selector: "pluginHeaderSlot" },
+  composer: { mode: "block", selector: "pluginComposerSlot" },
+  settings: { mode: "block", selector: "settingsBody", appendSection: true },
+  drawer: { mode: "block", selector: "pluginDrawerSlot" },
+};
+
+/** 未知插槽的统一兜底容器（放在抽屉里，保证"写了名字就一定看得见"）。 */
+const FALLBACK_SLOT = "drawer";
+
+function slotConfig(slot) {
+  return PLUGIN_SLOTS[slot] || PLUGIN_SLOTS[FALLBACK_SLOT];
+}
+
+/**
+ * 从 /api/config 拿到的 panels 应用进来（幂等，可重复调用）。
+ * 每种插槽的渲染都走同一个循环，顺序由面板的 order 决定。
  */
 function applyPluginPanels(panels) {
   pluginPanels = Array.isArray(panels) ? panels.filter((p) => p && p.id && p.asset) : [];
-  renderSidebarSlots();
-  renderStatusbarSlots();
-  renderSettingsSlots();
+  // 清掉上一轮的挂载点（插件重载/禁用要能立刻反映）
+  for (const node of document.querySelectorAll("[data-plugin-slot]")) node.remove();
+  for (const btn of document.querySelectorAll("#panelTabs [data-plugin-panel]")) btn.remove();
+  mounted.clear();
+
+  const bySlot = new Map();
+  for (const panel of pluginPanels) {
+    const cfg = slotConfig(panel.slot);
+    const key = panel.slot && PLUGIN_SLOTS[panel.slot] ? panel.slot : FALLBACK_SLOT;
+    if (!bySlot.has(key)) bySlot.set(key, []);
+    bySlot.get(key).push({ panel, cfg });
+  }
+  for (const [slot, items] of bySlot) {
+    items.sort((a, b) => (a.panel.order ?? 100) - (b.panel.order ?? 100) || String(a.panel.title).localeCompare(String(b.panel.title)));
+    if (items[0].cfg.mode === "tabs") renderTabSlot(slot, items);
+    else renderContainerSlot(slot, items);
+  }
 }
 
-function renderSidebarSlots() {
-  const host = $("panelTabs");
+/** tabs 形态：按钮进 tab 条，点击后在 panelBody 里 mount。 */
+function renderTabSlot(slot, items) {
+  const host = $(PLUGIN_SLOTS[slot].selector);
   if (!host) return;
-  for (const btn of host.querySelectorAll("[data-plugin-panel]")) btn.remove();
-  for (const panel of pluginPanels.filter((p) => (p.slot || "sidebar") === "sidebar")) {
+  for (const { panel } of items) {
     const btn = el("button", "plugin-tab");
     btn.dataset.pluginPanel = panel.plugin + ":" + panel.id;
+    btn.dataset.pluginSlot = slot;
     btn.textContent = (panel.icon ? panel.icon + " " : "") + panel.title;
-    btn.title = "插件面板：" + panel.plugin;
+    btn.title = "插件面板：" + panel.plugin + "（" + slot + "）";
     btn.addEventListener("click", () => openPluginPanel(panel, btn));
     host.appendChild(btn);
   }
 }
 
-function renderStatusbarSlots() {
-  const host = $("statusbar") || document.querySelector(".composer-meta") || document.querySelector("footer");
+/** inline / block 形态：直接生成容器并 mount（不需要点击）。 */
+function renderContainerSlot(slot, items) {
+  const cfg = PLUGIN_SLOTS[slot];
+  let host = cfg.selector ? $(cfg.selector) : null;
+  if (!host && cfg.fallbackSelector) host = document.querySelector(cfg.fallbackSelector);
   if (!host) return;
-  for (const node of host.querySelectorAll("[data-plugin-slot]")) node.remove();
-  for (const panel of pluginPanels.filter((p) => p.slot === "statusbar")) {
-    const wrap = el("span", "plugin-statusbar");
-    wrap.dataset.pluginSlot = panel.plugin + ":" + panel.id;
-    host.appendChild(wrap);
-    void mountInto(wrap, panel);
+
+  let section = null;
+  if (cfg.appendSection) {
+    section = el("div", "settings-plugin-section");
+    section.dataset.pluginSlot = "section:" + slot;
+    section.appendChild(el("div", "side-label", "插件"));
+    host.appendChild(section);
+    host = section;
+  }
+  for (const { panel } of items) {
+    const box = el("div", cfg.mode === "inline" ? "plugin-slot-inline" : "plugin-slot-block");
+    box.dataset.pluginSlot = slot + ":" + panel.plugin + ":" + panel.id;
+    box.title = panel.plugin + " · " + (panel.slot || "sidebar");
+    if (cfg.mode === "block") {
+      const title = el("div", "plugin-slot-title", (panel.icon ? panel.icon + " " : "") + panel.title);
+      box.appendChild(title);
+      const body = el("div", "plugin-slot-body");
+      box.appendChild(body);
+      host.appendChild(box);
+      void mountInto(body, panel);
+    } else {
+      host.appendChild(box);
+      void mountInto(box, panel);
+    }
   }
 }
 
-function renderSettingsSlots() {
-  const host = $("settingsBody");
-  if (!host) return;
-  for (const node of host.querySelectorAll("[data-plugin-slot]")) node.remove();
-  const items = pluginPanels.filter((p) => p.slot === "settings");
-  if (!items.length) return;
-  const section = el("div", "settings-plugin-section");
-  section.dataset.pluginSlot = "settings";
-  section.appendChild(el("div", "side-label", "插件设置"));
-  for (const panel of items) {
-    const box = el("div", "plugin-settings-block");
-    box.appendChild(el("div", "settings-label", (panel.icon ? panel.icon + " " : "") + panel.title));
-    section.appendChild(box);
-    void mountInto(box, panel);
-  }
-  host.appendChild(section);
-}
 
 /** 把插件资产 mount 到指定容器（sidebar 点击时也走这里）。 */
 async function mountInto(container, panel) {

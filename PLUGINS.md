@@ -683,3 +683,58 @@ DSH 的插件是 @deepseek-ai/cordis 的插件对象 —— 一个带 `apply(ctx
 
 测试：`tests/plugin-cancel.test.ts` **3 项**。
 
+
+## 任意 UI 插槽（六个内置 + 未知兜底）
+
+之前只有 sidebar / settings / statusbar 三个，且**未知槽位会被静默改写成 sidebar**。现在槽位名开放，并为插件提供了六个真实的挂载点。
+
+### 内置插槽
+
+| slot | 位置 | 形态 | 能放什么 |
+| --- | --- | --- | --- |
+| `sidebar`（默认） | 侧栏 tab（与"文件/待办/任务/技能/规则"并列） | tab | 主面板，点击后 mount |
+| `header` | 顶栏右侧（模式选择/设置按钮旁） | inline | 状态徽标、快捷开关 |
+| `statusbar` | 底部输入区右侧 | inline | 计数/状态小部件 |
+| `composer` | 输入框上方 | block | 横幅、提示条、快捷动作 |
+| `settings` | 设置弹窗底部（"插件"分组） | block | 插件自己的配置界面 |
+| `drawer` | 右侧抽屉 | block | 详情面板（点开才看） |
+
+### 未知槽位不再被丢弃
+
+写 `slot: "my-custom-slot"` 不会被改写成 sidebar，而是**原样保留**并集中渲染到抽屉的"插件"区域。
+取舍很清楚：静默改写会让插件作者以为写错了，而"看得见但位置不对"至少能发现问题。
+
+### 排序
+
+`order`（默认 100）控制同一插槽内的先后；order 相同则按 title 排，保证多次加载顺序稳定。
+
+```json
+"panels": [
+  { "id": "board",   "title": "看板",   "icon": "▦", "slot": "sidebar", "order": 1 },
+  { "id": "badge",   "title": "构建",   "icon": "●", "slot": "header",  "order": 2 },
+  { "id": "banner",  "title": "提示",   "icon": "◐", "slot": "composer","order": 3 },
+  { "id": "prefs",   "title": "配置",   "icon": "⚙", "slot": "settings","order": 4 },
+  { "id": "detail",  "title": "详情",   "icon": "▤", "slot": "drawer",  "order": 5 }
+]
+```
+
+### 实现方式
+
+UI 侧改成一张**插槽表**（`PLUGIN_SLOTS`）：名字 → 选择器 + 形态（tabs / inline / block）。
+加一个新插槽只需在表里加一行，不用再改散落的 render 函数（之前是三个各写一遍的函数，容易漏）。
+
+### 实测（真实浏览器，六个插槽同一屏可见）
+
+| 插槽 | 实测结果 |
+| --- | --- |
+| sidebar | 侧栏出现「▦ 侧栏面板」，点开显示 `sidebar:p-side` |
+| header | 顶栏右侧显示 `header:p-head` |
+| statusbar | 输入区右侧显示 `statusbar:p-status` |
+| composer | 输入框上方出现「◐ 横幅」块，内容 `composer:p-comp` |
+| settings | 设置弹窗底部「插件」分组里出现「⚙ 设置块」 |
+| drawer | 抽屉里出现「▤ 抽屉块」 |
+| 未知槽 | `my-custom-slot` 的面板出现在抽屉兜底区（`? 未知槽 / my-custom-slot:p-weird`），**没有被丢掉** |
+| 控制台异常 | 0 |
+
+测试：`tests/plugin-slots.test.ts` **5 项**（全部内置槽位不被改写、未知槽位保留、默认值、order 排序、order 相同时顺序稳定）。
+

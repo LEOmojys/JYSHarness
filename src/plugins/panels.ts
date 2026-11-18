@@ -17,6 +17,18 @@ export interface PanelDecl extends PluginPanel {
   asset: string;
 }
 
+/** UI 认识的内置插槽。不在这里的名字会进兜底区域（而不是被丢掉）。 */
+export const KNOWN_SLOTS = ["sidebar", "settings", "statusbar", "header", "composer", "drawer"] as const;
+
+export function isKnownSlot(slot: string): boolean {
+  return (KNOWN_SLOTS as readonly string[]).includes(slot);
+}
+
+/** 同一插槽内按 order 排序（order 相同则按 title，保证顺序稳定）。 */
+export function sortPanels(panels: PanelDecl[]): PanelDecl[] {
+  return [...panels].sort((a, b) => (a.order ?? 100) - (b.order ?? 100) || a.title.localeCompare(b.title));
+}
+
 export function assetUrl(pluginId: string, file = "index.js"): string {
   return "/plugin-assets/" + encodeURIComponent(pluginId) + "/" + file;
 }
@@ -40,12 +52,16 @@ export function pluginPanelDirs(workspaceRoot: string): { dir: string; panels: P
     const panels: PanelDecl[] = [];
     for (const p of declared) {
       if (!p?.id || !p?.title) continue;
-      const slot = p.slot === "settings" || p.slot === "statusbar" ? p.slot : "sidebar";
+      // 槽位名**不再限定**在这三个里：插件可以写 header/composer/drawer，
+      // 甚至写自己的名字 —— 未知名字由 UI 集中渲染到"插件"区域，不会被静默丢弃。
+      const slot = typeof p.slot === "string" && p.slot.trim() ? p.slot.trim() : "sidebar";
+      const order = Number.isFinite(p.order) ? Number(p.order) : 100;
       panels.push({
         id: p.id,
         title: p.title,
         icon: p.icon,
         slot,
+        order,
         plugin: id,
         asset: assetUrl(id),
       });

@@ -148,12 +148,18 @@ export interface PluginPanel {
   /** 图标字符（可选，单字符/emoji） */
   icon?: string;
   /**
-   * 挂载点：
-   *   sidebar    侧栏面板（默认，和"文件/待办"并列）
+   * 挂载点。支持的内置插槽见 KNOWN_SLOTS：
+   *   sidebar    侧栏面板（与"文件/待办/任务"并列；默认值）
    *   settings   设置弹窗里的独立区块
    *   statusbar  底部状态栏右侧的小部件
+   *   header     顶栏右侧（模式选择/设置按钮旁边）
+   *   composer   输入框上方的一条横幅
+   *   drawer     右侧抽屉（点开才显示）
+   * 写别的名字不会被丢掉：会集中渲染到抽屉里的"插件"区域，并在 /api/config 里给出告警。
    */
-  slot?: "sidebar" | "settings" | "statusbar";
+  slot?: string;
+  /** 同一插槽内的排序，小的在前（默认 100） */
+  order?: number;
 }
 
 export interface PluginCommand {

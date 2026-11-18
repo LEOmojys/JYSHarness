@@ -46,6 +46,7 @@
           <span class="tag mono" id="sandboxTag">—</span>
         </div>
         <div class="topbar-right">
+          <span class="plugin-slot-header" id="pluginHeaderSlot"></span>
           <select id="agentModeSelect" title="工作模式">
             <option value="default">普通模式</option>
             <option value="makePlugin">插件开发</option>
@@ -77,6 +78,7 @@
       <section class="transcript" id="transcript"></section>
 
       <footer class="composer">
+        <div class="plugin-slot-composer" id="pluginComposerSlot"></div>
         <div class="attachments hidden" id="attachments"></div>
         <textarea id="input" rows="1" placeholder="给 Agent 发消息…   Enter 发送 · Shift+Enter 换行 · Ctrl+K 命令 · 可直接粘贴图片"></textarea>
         <div class="composer-actions">
@@ -95,6 +97,7 @@
         <button class="icon-btn" id="drawerClose">×</button>
       </div>
       <pre class="drawer-body" id="drawerBody"></pre>
+      <div class="plugin-slot-drawer" id="pluginDrawerSlot"></div>
     </aside>
   </div>
 

@@ -382,3 +382,21 @@ select { background: var(--panel-2); color: var(--text); border: 1px solid var(-
 .settings-plugin-section { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
 .plugin-settings-block { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
 
+
+/* ---------------- 插件插槽：inline / block 形态 ---------------- */
+.plugin-slot-header { display: inline-flex; align-items: center; gap: 6px; }
+.plugin-slot-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.plugin-slot-inline:empty { display: none; }
+.plugin-slot-composer { display: flex; flex-direction: column; gap: 6px; }
+.plugin-slot-composer:empty { display: none; }
+.plugin-slot-drawer:empty { display: none; }
+.plugin-slot-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.plugin-slot-title { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.plugin-slot-body { font-size: 12px; color: var(--fg); line-height: 1.6; }
+

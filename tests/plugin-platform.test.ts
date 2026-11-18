@@ -161,7 +161,7 @@ test("capability permissions work when declared", async () => {
   assert.equal(res.runtimes[0].panels.length, 1);
 });
 
-test("slots: unknown slot falls back to sidebar", () => {
+test("slots: unknown slot keeps its name (UI shows it in the fallback area)", () => {
   const root = ws();
   const dir = path.join(root, ".harness", "plugins", "slotty");
   mkdirSync(dir, { recursive: true });
@@ -176,7 +176,8 @@ test("slots: unknown slot falls back to sidebar", () => {
   );
   const panels = pluginPanelDirs(root)[0].panels;
   assert.equal(panels.find((p) => p.id === "a")?.slot, "settings");
-  assert.equal(panels.find((p) => p.id === "b")?.slot, "sidebar");
+  // 语义升级：未知槽位不再被改写成 sidebar，而是原样保留，由 UI 放进兜底区域
+  assert.equal(panels.find((p) => p.id === "b")?.slot, "weird");
 });
 
 test("loader: incompatible plugin is rejected with a reason, not half-loaded", async () => {
