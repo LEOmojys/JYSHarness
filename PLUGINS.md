@@ -452,3 +452,75 @@ jys plugin list [--json]                   # 含来源、能力声明、面板�
 
 单测：`tests/plugin-platform.test.ts` 12 项（版本范围、依赖、安装/覆盖/卸载、入口逃逸、`--disabled`、repo 布局、权限强制、slot 回落、不兼容拒绝）。
 
+
+## 进程隔离执行（isolation: process）
+
+这是对"插件在同进程、崩溃会带走会话"这一缺口的补齐。清单里写一行就切换执行位置：
+
+```json
+{
+  "name": "my-plugin",
+  "isolation": "process"
+}
+```
+
+| | `in-process`（默认） | `process` |
+|---|---|---|
+| 加载方式 | 父进程 `import()` 插件入口 | 独立子进程（`src/plugins/host/child.ts`） |
+| 工具/路由/命令/hook | 直接调用函数 | 通过 stdio JSON-RPC 调用，父进程只持有**代理** |
+| 插件崩溃 | **带走整个会话** | 只有它的调用失败，会话继续；下次调用自动重启宿主 |
+| 插件卡死 | 会话卡死 | 按类超时（工具 120s / 路由 30s / 命令 30s / hook 10s） |
+| 内存 | 共享 | 独立 |
+| 沙箱 | 走父进程沙箱策略 | **不走**：子进程是独立 OS 进程，父进程的沙箱管不到它 |
+
+**必须说清的边界**：进程隔离解决的是"崩溃/卡死/内存污染"，**不是安全沙箱**。子进程拥有普通用户的全部权限。要真正的权限隔离，得配合系统级沙箱（低完整性令牌 / 容器），这是另一件事。
+
+### 协议（换行分隔 JSON over stdio）
+
+```
+子 → 父   {type:"ready", plugins:[描述...], errors, warnings}
+子 → 父   {type:"log", level, message}          ← 插件 console.* 被重定向到这里
+父 → 子   {id, method:"tool.call"|"route"|"command"|"hook", ...}
+子 → 父   {id, ok:true, result} | {id, ok:false, error}
+```
+
+三条硬性约束（都有测试守着）：
+
+1. **stdout 只走协议** —— 子进程启动第一件事是把 `console.*` 全部重定向到 stderr，否则插件一句 `console.log` 就会污染通道、父进程解析失败；
+2. **异常必须回响应** —— 子进程任何抛错都转成 `ok:false`，否则父进程永久等待；
+3. **只传可序列化的东西** —— 函数留在子进程，父进程拿到的是描述 + 代理。
+
+### 生命周期与缓存
+
+- 宿主按**插件目录**缓存（`hostFor()`）：服务端每个请求都会 `loadPlugins`，不缓存会漏进程；
+- 服务端 `close()` 与进程 `exit` 都会 `shutdownHosts()`，实测关闭服务端后宿主进程**立即退出**，无孤儿；
+- 崩溃后 `request()` 会尝试重启一次（自愈），失败才返回错误。
+
+### 超时可配置
+
+```bash
+HARNESS_PLUGIN_TOOL_TIMEOUT_MS=300000   # 工具（默认 120s）
+HARNESS_PLUGIN_ROUTE_TIMEOUT_MS=30000   # 路由
+HARNESS_PLUGIN_COMMAND_TIMEOUT_MS=30000 # 命令
+HARNESS_PLUGIN_HOOK_TIMEOUT_MS=10000    # hook
+```
+
+注意：这些**每次调用时读取**。之前写成模块加载时求值，测试里设了 300ms 仍按默认跑完 —— 这是个真实的坑，已修。
+
+### 实测（真实进程 + 真实服务端 + 真实浏览器）
+
+| 验证项 | 结果 |
+| --- | --- |
+| 工具在子进程执行 | 父 `pid=18412`，工具返回 `child-pid:6384` |
+| 路由在子进程执行 | `GET /plugin/iso/whoami` → `{"pid":11676}`，与 harness 主进程不同 |
+| 命令在子进程执行 | `/who` → `cmd-pid:6384` |
+| hook 可 deny | `PreToolUse` 返回 `{decision:"deny", reason:"isolated-hook-says-no"}` |
+| 插件 `console.log` | 不污染协议，工具仍正常返回 `noisy-ok` |
+| 插件崩溃 | 工具返回 `[插件 isolated 执行失败] 插件宿主已退出（code=9…）`，父进程存活，下次调用返回新 pid（自愈） |
+| 插件卡死 | 300ms 超时生效，返回"插件调用超时" |
+| 宿主缓存 | 重复 `loadPlugins` → 宿主数仍为 1 |
+| 关闭服务端 | 宿主进程消失，端口释放，无孤儿 |
+| 与本进程插件混合 | 两种插件并存，in-process 的仍返回父进程 pid |
+
+单测：`tests/plugin-isolation.test.ts` **8 项**（子进程执行、路由/命令、日志不污染、崩溃自愈、超时、hook、缓存与关机、混合模式）。
+

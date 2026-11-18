@@ -993,6 +993,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     server.listen(port, host, () => resolve());
   });
 
+  // 兜底：无论从哪条路径退出，都别把插件宿主留成孤儿进程
+  if (!process.listenerCount("exit")) {
+    process.on("exit", () => {
+      void import("../plugins/host/client.ts").then((m) => m.shutdownHosts()).catch(() => undefined);
+    });
+  }
+
   const actualPort = (server.address() as { port: number }).port;
 
   return {
@@ -1011,6 +1018,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
       }
       clients.clear();
+      // 插件宿主是独立子进程：服务端关闭时必须一起收掉，否则会残留孤儿进程
+      const { shutdownHosts } = await import("../plugins/host/client.ts");
+      shutdownHosts();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };

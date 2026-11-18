@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import type { HookDefinition, HookEvent, HookPayload, HookResult } from "../hooks/hooks.ts";
 import { parseFrontmatter } from "../core/skills.ts";
 import { CAPABILITY_BY_KIND, checkCompat, hasPermission } from "./compat.ts";
+import { hostFor, type PluginHost } from "./host/client.ts";
 import type { Tool } from "../tools/types.ts";
 import type { Logger } from "../util/log.ts";
 import type {
@@ -187,7 +188,17 @@ function mergeHook(
   list.push(def);
 }
 
-export async function loadPlugins(workspaceRoot: string, logger: Logger): Promise<PluginLoadResult> {
+export interface LoadOptions {
+  /** 只加载这些目录（插件宿主子进程用它把单个插件搬过去） */
+  onlyDirs?: string[];
+  /**
+   * 强制在**本进程**加载（不再为 isolation=process 的插件拉起宿主）。
+   * 子进程自己调用 loadPlugins 时必须传 true，否则会无限递归拉起子进程。
+   */
+  forceInProcess?: boolean;
+}
+
+export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: LoadOptions = {}): Promise<PluginLoadResult> {
   const result: PluginLoadResult = {
     plugins: [],
     tools: [],
@@ -200,7 +211,12 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
   };
 
   // 先把所有可用插件名与版本收集起来，供依赖校验使用（依赖可以指向后面才加载的插件）
-  const discoveredAll = discoverPlugins(workspaceRoot);
+  let discoveredAll = discoverPlugins(workspaceRoot);
+  if (opts.onlyDirs?.length) {
+    const norm = (p: string) => path.resolve(p).toLowerCase();
+    const allow = new Set(opts.onlyDirs.map(norm));
+    discoveredAll = discoveredAll.filter((d) => allow.has(norm(d.dir)));
+  }
   const availableNames = new Map<string, string>();
   for (const d of discoveredAll) {
     try {
@@ -230,6 +246,13 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
       continue;
     }
     for (const issue of compat) result.warnings.push({ plugin: label, message: issue.message });
+
+    // ---- 进程隔离：不 import 插件入口，交给宿主子进程 ----
+    // 必须在 resolveEntry/import 之前分流，否则插件代码仍在父进程执行，隔离形同虚设。
+    if (manifest.isolation === "process" && !opts.forceInProcess) {
+      await loadInHost(discovered.dir, workspaceRoot, manifest, logger, result);
+      continue;
+    }
 
     const tools: Tool[] = [];
     const skills: SkillContribution[] = [];
@@ -371,8 +394,18 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
     const uiAbs = path.resolve(discovered.dir, uiRel);
     const uiInside = !path.relative(discovered.dir, uiAbs).startsWith("..");
     const uiDir = uiInside && existsSync(uiAbs) && statSync(uiAbs).isDirectory() ? uiAbs : null;
-    if (routes.length || panels.length || commands.length || uiDir) {
-      result.runtimes.push({ pluginId, routes, panels, commands, uiDir });
+    if (routes.length || panels.length || commands.length || uiDir || tools.length || skills.length || hooks.length) {
+      result.runtimes.push({
+        pluginId,
+        routes,
+        panels,
+        commands,
+        uiDir,
+        tools,
+        hooks,
+        skills,
+        promptSections: sections,
+      });
     }
 
     result.plugins.push({
@@ -387,5 +420,84 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
   }
 
   return result;
+}
+
+/**
+ * 进程隔离路径：为单个插件拉起宿主子进程，把它的贡献并进总结果。
+ *
+ * 合并的东西必须和"本进程加载"完全同构（tools/routes/commands/panels/hooks/skills/sections），
+ * 否则上层（Session、HTTP 服务）就得区分两种插件 —— 那是最容易出 bug 的地方。
+ */
+async function loadInHost(
+  pluginDir: string,
+  workspaceRoot: string,
+  manifest: PluginManifest,
+  logger: Logger,
+  result: PluginLoadResult,
+): Promise<void> {
+  const label = path.basename(pluginDir);
+  const onLog = (level: string, message: string) => {
+    if (!message) return;
+    if (level === "error") logger.warn("[plugin:" + label + "] " + message);
+    else logger.info("[plugin:" + label + "] " + message);
+  };
+
+  let contributions: Awaited<ReturnType<PluginHost["start"]>>;
+  try {
+    contributions = await hostFor(pluginDir, workspaceRoot, onLog).start();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    result.errors.push({ plugin: label, message: "进程隔离宿主启动失败：" + msg });
+    return;
+  }
+
+  if (contributions.descriptors.length === 0 && contributions.errors.length) {
+    for (const e of contributions.errors) result.errors.push({ plugin: label, message: e.message });
+    return;
+  }
+
+  const pluginId = (manifest.id ?? label).trim();
+  result.tools.push(...contributions.tools);
+  result.skills.push(...contributions.skills);
+  result.promptSections.push(...contributions.promptSections);
+  result.warnings.push(...contributions.warnings.map((w) => ({ plugin: label, message: w.message })));
+
+  for (const hook of contributions.hooks) {
+    mergeHook(result.hooks, hook.event as HookEvent, {
+      handler: async (payload: HookPayload): Promise<HookResult> => {
+        const out = await hook.handler(payload);
+        return (out ?? {}) as HookResult;
+      },
+    });
+  }
+
+  const uiRel = manifest.ui ?? "ui";
+  const uiAbs = path.resolve(pluginDir, uiRel);
+  const uiInside = !path.relative(pluginDir, uiAbs).startsWith("..");
+  const uiDir = uiInside && existsSync(uiAbs) && statSync(uiAbs).isDirectory() ? uiAbs : null;
+
+  result.runtimes.push({
+    pluginId,
+    routes: contributions.routes,
+    panels: contributions.panels,
+    commands: contributions.commands,
+    uiDir,
+    // 工具/hook 的真实函数在子进程里，父进程只持有代理：
+    // 这里放代理对象，保证"runtime 里能拿到本插件工具"的语义不变。
+    tools: contributions.tools,
+    hooks: contributions.hooks.map((h) => ({ event: h.event as HookEvent, handler: h.handler as unknown as PluginHookHandler })),
+    skills: contributions.skills,
+    promptSections: contributions.promptSections,
+  });
+
+  result.plugins.push({
+    name: manifest.name,
+    version: manifest.version ?? "0.0.0",
+    dir: pluginDir,
+    source: "project",
+    tools: contributions.tools.length,
+    skills: contributions.skills.length,
+    hooks: contributions.hooks.length,
+  });
 }
 

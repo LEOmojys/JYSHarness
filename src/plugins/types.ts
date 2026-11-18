@@ -27,6 +27,13 @@ export interface PluginManifest {
   panels?: PluginPanel[];
   /** 依赖的其它插件与版本范围，例如 { "team-conventions": "^1.0.0" } */
   dependencies?: Record<string, string>;
+  /**
+   * 执行位置：
+   *   in-process（默认）  在本进程内 import() 插件入口 —— 快，但插件崩了会带走会话；
+   *   process             在独立子进程里加载与执行 —— 崩溃隔离、卡死可超时、内存独立。
+   * 注意：进程隔离**不是安全沙箱**（子进程拥有普通用户全部权限）。
+   */
+  isolation?: "in-process" | "process";
   /** Default true; false keeps the plugin on disk but inactive. */
   enabled?: boolean;
 }
@@ -157,4 +164,13 @@ export interface PluginRuntime {
   commands: PluginCommand[];
   /** 静态资产根目录（绝对路径），null 表示这个插件没有 UI 资产 */
   uiDir: string | null;
+  // ---- 以下用于"进程隔离执行"：宿主子进程要按插件归属把这些东西搬过去 ----
+  /** 本插件注册的工具（真实函数，只在加载它的进程里有效） */
+  tools: Tool[];
+  /** 本插件注册的 hook（真实函数） */
+  hooks: { event: HookEvent; handler: PluginHookHandler }[];
+  /** 本插件贡献的内存技能（纯数据，可直接序列化） */
+  skills: SkillContribution[];
+  /** 本插件的固定提示段落 */
+  promptSections: string[];
 }
