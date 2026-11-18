@@ -363,3 +363,92 @@ export function activate(api) {
 | UI 能力有限 | 目前只有侧栏面板一个 slot；DSH 的 client 半可注册任意 slot/命令面板/设置页 |
 | 无版本解析 | `engines` 只是声明，不校验；也没有插件间依赖解析 |
 
+
+## 插件平台：安装、版本、权限、多 slot
+
+v2 让插件能贡献能力面；这一轮把它补成**能分发、能校验、能审计**的平台。
+
+### 1. 安装与卸载
+
+```bash
+jys plugin install ./my-plugin            # 本地目录
+jys plugin install plugin-dir --force      # 覆盖已安装的（默认拒绝）
+jys plugin install <git-url>               # git 源（浅克隆，需要网络）
+jys plugin install ./my-plugin --user      # 装到用户级（所有项目生效）
+jys plugin install ./my-plugin --disabled  # 装了但先不启用
+jys plugin uninstall my-plugin [--user]
+jys plugin list [--json]                   # 含来源、能力声明、面板数、是否停用
+```
+
+安装时做四件校验，任何一条不过就**不落盘**：
+
+| 校验 | 不通过的表现 |
+| --- | --- |
+| 清单合法（`name` 匹配 `[a-zA-Z0-9._-]`） | `清单无效：…` |
+| 入口在插件目录内（`../` 逃逸） | `入口无效：entry escapes the plugin folder` |
+| `engines.harness` 与当前版本兼容 | `不兼容（harness 0.2.0）：需要 harness >=99.0.0` |
+| 同名插件是否已存在 | `已安装：xxx（加 --force 覆盖）` |
+
+安装成功会写 `plugin.lock.json`（来源、安装时间、安装时的 harness 版本），`list` 据此显示来源。
+
+### 2. 版本与依赖校验
+
+- `engines.harness`：支持 `>=x.y.z`、`>x`、`<=`、`<`、`=`、`^x.y.z`（同 major）、`~x.y.z`（同 minor）、`*`，以及 `^1 || ^2` 多选；
+- `dependencies`：插件可声明依赖其它插件与版本范围，**缺依赖或版本不符直接拒绝加载**（不是"加载了但行为怪"）；
+- 加载期不兼容 → 进 `errors`，`jys plugin list` 会红字打出原因。
+
+不引入第三方 semver：需求只是"拦住明显不兼容"，为此加运行时依赖不划算（本项目运行时零依赖）。
+
+### 3. 能力声明是强制的
+
+`contributes.permissions` 不再只是展示字段：
+
+| 能力 | 需要声明 | 未声明的后果 |
+| --- | --- | --- |
+| `api.registerRoute()` | `http-route` | **拒绝注册**，告警写明原因 |
+| `api.registerPanel()` | `ui-panel` | **拒绝注册**，告警写明原因 |
+
+这不是安全沙箱（插件仍在同进程），但它把"这个插件对外开了接口"变成**安装前可见、加载时强制**的事实。
+
+### 4. 三个 UI slot
+
+| slot | 位置 | 典型用途 |
+| --- | --- | --- |
+| `sidebar`（默认） | 侧栏 tab（与"文件/待办"并列），点击后 mount | 主面板 |
+| `settings` | 设置弹窗底部的独立区块 | 插件自己的配置界面 |
+| `statusbar` | 底部状态栏右侧常驻小部件 | 状态/计数类信息 |
+
+```json
+"panels": [
+  { "id": "board",          "title": "团队看板", "slot": "sidebar" },
+  { "id": "board-settings", "title": "看板设置", "slot": "settings" },
+  { "id": "board-status",   "title": "看板",     "slot": "statusbar" }
+]
+```
+
+未识别的 `slot` 值回落到 `sidebar`（不让一个拼错毁掉整个插件）。
+
+### 5. 插件命令真的能用了
+
+`api.registerCommand()` 原来只收集不派发。现在 `/board` 这类命令在**两处**都能用：
+
+- REPL：`handleSlash` 的 default 分支先问插件；
+- Web：`POST /api/command` 同样先查插件命令，找到就把结果作为 notice 广播回界面。
+
+两处共用同一个 `runPluginCommand()`，返回 `null` 表示"没有插件认领"，调用方继续报 unknown command。
+
+### 实测（真实浏览器 + 真实 CLI）
+
+| 验证项 | 结果 |
+| --- | --- |
+| `jys plugin install ./my-plugin` | `已安装 team-board → …/.harness/plugins/team-board` |
+| 重复安装 | `安装失败：已安装：team-board（加 --force 覆盖）` |
+| `jys plugin list` | 显示 `来源 … · 能力 http-route,ui-panel · 面板 3` |
+| 命令 `/board` | `看板: 2 个任务待办`（REPL 与 API 同源） |
+| 侧栏 slot | 出现「▦ 团队看板」，点击显示 `任务: 写文档、修 bug` |
+| 设置 slot | 弹窗底部出现「插件设置」区块 |
+| 状态栏 slot | 显示「▦ 2」 |
+| 控制台异常 | 0 |
+
+单测：`tests/plugin-platform.test.ts` 12 项（版本范围、依赖、安装/覆盖/卸载、入口逃逸、`--disabled`、repo 布局、权限强制、slot 回落、不兼容拒绝）。
+

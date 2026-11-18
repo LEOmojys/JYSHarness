@@ -5,6 +5,7 @@
  */
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { findPluginCommand } from "../plugins/commands.ts";
 import { pathToFileURL } from "node:url";
 import { paint, Logger } from "../util/log.ts";
 import { describeSandbox, describeSandboxBackend } from "../sandbox/paths.ts";
@@ -415,9 +416,17 @@ export async function handleSlash(
     case "resume":
       console.log(paint.dim("  resume requires a fresh process: jys --resume <id>"));
       return false;
-    default:
+    default: {
+      // 插件命令：/demo-ping 这类由插件 registerCommand() 注册。
+      // 放在 default 分支而不是预先枚举 —— 插件是动态的，枚举不可能覆盖。
+      const hit = await findPluginCommand(session.workspaceRoot, cmd, arg);
+      if (hit) {
+        console.log(hit.output);
+        return false;
+      }
       console.log(paint.dim("  unknown command: /" + cmd + " (try /help)"));
       return false;
+    }
   }
 }
 

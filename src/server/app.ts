@@ -23,6 +23,7 @@ import { inspectPlugins, loadPlugins, setPluginEnabled } from "../plugins/loader
 import { createWorktree, listWorktrees, mainRepositoryRoot, removeWorktree } from "../core/worktrees.ts";
 import { parsePluginAsset, parsePluginRoute, pipeAsset, resolveAssetPath } from "../plugins/http.ts";
 import { pluginPanelDirs, type PanelDecl } from "../plugins/panels.ts";
+import { findPluginCommand } from "../plugins/commands.ts";
 import { spawn } from "node:child_process";
 import {
   browseDirectories,
@@ -583,7 +584,20 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         } else if (name === "jobs") {
           return json(res, 200, jobsFor(h.session));
         } else {
-          return json(res, 400, { error: "unknown command" });
+          // 插件命令：和 REPL 共用同一套查找（不用记哪些是内置、哪些是插件）。
+          // 用 plugins/commands.ts 而不是 import("../cli/main.ts")：避免服务端反向依赖 CLI。
+          const hit = await findPluginCommand(h.session.workspaceRoot, name, args.join(" "));
+          if (!hit) return json(res, 400, { error: "unknown command" });
+          broadcast({
+            type: "notice",
+            sessionId: h.session.sessionId,
+            level: "info",
+            code: "plugin_command",
+            params: { name, plugin: hit.plugin },
+            text: hit.output,
+          });
+          await emitState(h);
+          return json(res, 200, { ok: true, output: hit.output });
         }
         await emitState(h);
         return json(res, 200, { ok: true });

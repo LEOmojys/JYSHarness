@@ -307,13 +307,13 @@ jys plugin test                # 加载校验，出错返回非 0
 ```bash
 npm install       # 只为开发期工具链（运行时零依赖）
 npm run verify    # 6 套专项验证（崩溃恢复/并发/图片/长会话/沙箱/成本），52 项
-npm test          # 351 个单元/集成测试（自动发现 tests/*.test.ts）
+npm test          # 363 个单元/集成测试（自动发现 tests/*.test.ts）
 npm run typecheck # tsc --strict，src 必须 0 error
 npm run check     # 结构约束 + 熵检查 + 类型检查（= jys check --entropy --types）
 npm run e2e       # 跨模块端到端验收（24 项，真实文件与真实子进程）
 ```
 
-**351 个测试**，分二十四组：
+**363 个测试**，分二十四组：
 
 - 纯函数：权限管道、规则匹配、分区、路径包含、压缩、diff
 - 端到端（Mock Provider）：工具真实执行、危险命令拦截、用户拒绝、Hook 阻断、子 Agent、撤销

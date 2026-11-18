@@ -372,3 +372,13 @@ select { background: var(--panel-2); color: var(--text); border: 1px solid var(-
 .thinking-body { margin-top: 6px; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.55; color: var(--muted); max-height: 260px; overflow: auto; font-family: var(--mono); }
 @media (max-width: 768px) { .thinking { margin-left: 0; } }
 
+
+/* ---------------- 插件面板（三个 slot） ---------------- */
+.plugin-tab { color: var(--muted); }
+.plugin-tab.active { color: var(--fg); }
+.plugin-panel { padding: 10px 12px; font-size: 12px; line-height: 1.6; color: var(--fg); }
+.plugin-statusbar { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-left: 10px; }
+.plugin-statusbar:empty { display: none; }
+.settings-plugin-section { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+.plugin-settings-block { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+

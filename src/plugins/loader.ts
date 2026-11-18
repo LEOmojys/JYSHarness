@@ -10,6 +10,7 @@ import { configHome } from "../core/configStore.ts";
 import { pathToFileURL } from "node:url";
 import type { HookDefinition, HookEvent, HookPayload, HookResult } from "../hooks/hooks.ts";
 import { parseFrontmatter } from "../core/skills.ts";
+import { CAPABILITY_BY_KIND, checkCompat, hasPermission } from "./compat.ts";
 import type { Tool } from "../tools/types.ts";
 import type { Logger } from "../util/log.ts";
 import type {
@@ -198,7 +199,19 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
     warnings: [],
   };
 
-  for (const discovered of discoverPlugins(workspaceRoot)) {
+  // 先把所有可用插件名与版本收集起来，供依赖校验使用（依赖可以指向后面才加载的插件）
+  const discoveredAll = discoverPlugins(workspaceRoot);
+  const availableNames = new Map<string, string>();
+  for (const d of discoveredAll) {
+    try {
+      const m = readManifest(d.manifestPath);
+      if (m.enabled !== false) availableNames.set(m.name, m.version ?? "0.0.0");
+    } catch {
+      /* 坏清单留给下面报错 */
+    }
+  }
+
+  for (const discovered of discoveredAll) {
     const label = path.basename(discovered.dir);
     let manifest: PluginManifest;
     try {
@@ -209,10 +222,20 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
     }
     if (manifest.enabled === false) continue;
 
+    // 兼容性/依赖：明确报错而不是"加载了但行为怪"
+    const compat = checkCompat(manifest, availableNames);
+    const fatal = compat.filter((i) => i.severity === "error");
+    if (fatal.length) {
+      result.errors.push({ plugin: label, message: "兼容性校验失败：" + fatal.map((i) => i.message).join("；") });
+      continue;
+    }
+    for (const issue of compat) result.warnings.push({ plugin: label, message: issue.message });
+
     const tools: Tool[] = [];
     const skills: SkillContribution[] = [];
     const sections: string[] = [];
     const hooks: { event: HookEvent; handler: PluginHookHandler }[] = [];
+    const permissions = manifest.contributes?.permissions;
     const routes: PluginRoute[] = [];
     const panels: PluginPanel[] = [];
     const commands: PluginCommand[] = [];
@@ -256,6 +279,13 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
         skills.push({ name: skill.name, description: skill.description ?? "", content: skill.content });
       },
       registerRoute: (route) => {
+        // 能力声明强制：没在 contributes.permissions 里写 http-route 的插件不许开路由。
+        // 声明本身不是安全边界（插件仍在同进程），但它把"这个插件对外开了接口"变成
+        // 可审计的事实 —— 安装前能看见，而不是运行后才发现。
+        if (!hasPermission(permissions, CAPABILITY_BY_KIND.route)) {
+          warnings.push("拒绝注册路由 " + String(route?.path ?? "?") + "：未声明 contributes.permissions 含 \"http-route\"");
+          return;
+        }
         if (!route || typeof route.handler !== "function") {
           warnings.push("registerRoute needs a handler function");
           return;
@@ -273,6 +303,10 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger): Promis
         routes.push({ method, path: clean, handler: route.handler });
       },
       registerPanel: (panel) => {
+        if (!hasPermission(permissions, CAPABILITY_BY_KIND.panel)) {
+          warnings.push("拒绝注册面板 " + String(panel?.id ?? "?") + "：未声明 contributes.permissions 含 \"ui-panel\"");
+          return;
+        }
         if (!panel?.id || !panel?.title) {
           warnings.push("registerPanel needs id and title");
           return;

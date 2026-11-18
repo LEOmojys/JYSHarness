@@ -25,6 +25,8 @@ export interface PluginManifest {
   // 但只有这一处用，抽出去反而变成 dead export，所以内联回来。
   /** 声明式 UI 面板：UI 首屏就要展示，不能等 activate() 跑完才知道 */
   panels?: PluginPanel[];
+  /** 依赖的其它插件与版本范围，例如 { "team-conventions": "^1.0.0" } */
+  dependencies?: Record<string, string>;
   /** Default true; false keeps the plugin on disk but inactive. */
   enabled?: boolean;
 }
@@ -133,8 +135,13 @@ export interface PluginPanel {
   title: string;
   /** 图标字符（可选，单字符/emoji） */
   icon?: string;
-  /** 挂载点：目前支持 sidebar（侧栏面板） */
-  slot?: "sidebar";
+  /**
+   * 挂载点：
+   *   sidebar    侧栏面板（默认，和"文件/待办"并列）
+   *   settings   设置弹窗里的独立区块
+   *   statusbar  底部状态栏右侧的小部件
+   */
+  slot?: "sidebar" | "settings" | "statusbar";
 }
 
 export interface PluginCommand {

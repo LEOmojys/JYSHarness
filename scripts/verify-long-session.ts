@@ -96,9 +96,24 @@ const resumed = new Session({
   enableSubagent: false,
 });
 await resumed.init();
+// 判据用"这一轮有没有真的产出助手消息"，而不是"消息总数/助手数是否变大"。
+// 原因：恢复后的这一轮可能**触发压缩**，压缩会把总数和助手数压回原值
+// （实测 9 -> 9、助手 4 -> 4，但 done=completed 且有 assistant_message 事件）。
+// 用事件判断才和"能不能继续跑"这件事一一对应。
 const beforeCount = resumed.messages.length;
-for await (const _ev of resumed.send("恢复后再问一句", new AbortController().signal)) { /* drain */ }
-check("恢复后能继续跑", resumed.messages.length > beforeCount, beforeCount + " -> " + resumed.messages.length);
+let assistantEvents = 0;
+let compactedRounds = 0;
+let doneReason = "?";
+for await (const ev of resumed.send("恢复后再问一句", new AbortController().signal)) {
+  if (ev.type === "assistant_message") assistantEvents++;
+  if (ev.type === "compaction") compactedRounds++;
+  if (ev.type === "done") doneReason = String((ev as { reason?: string }).reason ?? "?");
+}
+check(
+  "恢复后能继续跑",
+  assistantEvents > 0 && doneReason === "completed",
+  "本轮助手消息 " + assistantEvents + " 条，done=" + doneReason + "，消息 " + beforeCount + " -> " + resumed.messages.length + (compactedRounds ? "（压缩 " + compactedRounds + " 次）" : ""),
+);
 check("压缩后的历史仍然在窗口内", resumed.contextTokens() <= WINDOW, resumed.contextTokens() + " / " + WINDOW);
 
 const failed = results.filter((r) => !r.ok);

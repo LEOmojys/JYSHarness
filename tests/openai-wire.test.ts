@@ -24,6 +24,19 @@ async function withServer(
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   const port = (server.address() as AddressInfo).port;
+  // 预热：确认 listen 后端口真的可连。
+  // 并行跑大量测试文件时，Windows 上偶发 "fetch failed"（进程还没开始 accept 就被连），
+  // 那不是被测逻辑的问题，等它能连上再开始，避免把环境抖动记成失败。
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try {
+      await fetch("http://127.0.0.1:" + port + "/__warmup");
+      break;
+    } catch {
+      if (Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
   try {
     await handler([String(port)]);
   } finally {

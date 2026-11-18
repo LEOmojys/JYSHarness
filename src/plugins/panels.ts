@@ -36,11 +36,12 @@ export function pluginPanelDirs(workspaceRoot: string): { dir: string; panels: P
     const panels: PanelDecl[] = [];
     for (const p of declared) {
       if (!p?.id || !p?.title) continue;
+      const slot = p.slot === "settings" || p.slot === "statusbar" ? p.slot : "sidebar";
       panels.push({
         id: p.id,
         title: p.title,
         icon: p.icon,
-        slot: p.slot ?? "sidebar",
+        slot,
         plugin: id,
         asset: assetUrl(id),
       });

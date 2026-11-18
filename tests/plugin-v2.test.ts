@@ -22,6 +22,8 @@ function makePlugin(withPanel = true): string {
       id: "demo-panel",
       version: "1.0.0",
       ui: "ui",
+      // 权限现在是强制的：没声明 http-route/ui-panel 的插件不许注册路由与面板
+      contributes: { permissions: ["http-route", "ui-panel"] },
       ...(withPanel ? { panels: [{ id: "p1", title: "面板一", icon: "◈" }] } : {}),
     }),
     "utf8",
@@ -58,7 +60,11 @@ test("plugin v2: invalid registrations become warnings, not crashes", async () =
   const ws = mkdtempSync(path.join(os.tmpdir(), "jys-v2bad-"));
   const dir = path.join(ws, ".harness", "plugins", "bad");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({ name: "bad" }), "utf8");
+  writeFileSync(
+    path.join(dir, "plugin.json"),
+    JSON.stringify({ name: "bad", contributes: { permissions: ["http-route", "ui-panel"] } }),
+    "utf8",
+  );
   writeFileSync(
     path.join(dir, "index.ts"),
     [

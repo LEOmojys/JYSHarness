@@ -56,7 +56,19 @@ async function boot(root: string, turns: MockTurn[], autoApprove: boolean): Prom
   });
 
   const controller = new AbortController();
-  const res = await fetch(server.url + "api/events", { signal: controller.signal });
+  // 首次连接加重试：并行跑大量测试文件时，Windows 上偶发 "fetch failed"
+  // （端口刚 listen 就绪、客户端立刻连），那是环境抖动，不是被测逻辑的问题。
+  let res: Response | null = null;
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    try {
+      res = await fetch(server.url + "api/events", { signal: controller.signal });
+      break;
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
   assert.equal(res.status, 200);
   const events: any[] = [];
   const reader = res.body!.getReader();
