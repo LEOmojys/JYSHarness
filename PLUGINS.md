@@ -637,3 +637,49 @@ DSH 的插件是 @deepseek-ai/cordis 的插件对象 —— 一个带 `apply(ctx
 
 `tests/plugin-lifecycle.test.ts`（升级/卸载/并发/不挂死）、`tests/plugin-guard.test.ts`（两种模式的路径守卫）、`tests/plugin-agent.test.ts`（两种模式的 Agent 循环）、`tests/plugin-stale.test.ts`（缓存失效复现与修复）。
 
+
+## 插件调用的取消语义
+
+进程隔离解决了"崩溃隔离"，但还留着一个问题：父进程超时后只是**不再等待**，子进程里那次调用还在算 —— 幽灵计算。这一轮补上。
+
+### 机制
+
+```
+父 → 子   {type:"abort", id, reason}      取消某次进行中的调用
+子：inflight.get(id)?.abort(reason)       → 插件的 ctx.signal 变成 aborted
+```
+
+触发点有三个：
+
+| 触发 | 行为 |
+| --- | --- |
+| 调用超时 | 先发 abort，再拒绝（子进程不会继续算下去） |
+| 会话中止（用户点停止 / 上游 abort） | 通过 `ctx.signal` 透传到子进程，立刻拒绝 |
+| 宿主关闭（`kill()` / 进程退出） | 对所有挂起调用逐个发 abort，再杀进程 |
+
+插件侧能拿到的地方：
+
+| 位置 | 字段 |
+| --- | --- |
+| 工具 | `call(input, ctx)` 的 `ctx.signal` |
+| 路由 | handler 的 `ctx.signal` |
+| 命令 | `run(arg, { workspaceRoot, signal })` |
+
+### 边界（必须说清）
+
+这是**协作式取消**：JS 没有跨进程强杀函数的手段。插件只有在检查 `signal.aborted`（或 `signal.addEventListener('abort')`）时才会提前退出；
+完全不看 signal 的插件，父进程只能做到"不再等待"，子进程仍会算完。
+
+子进程另有一道**安全上限**（10 分钟）：即使父进程崩溃失联，调用也会被宿主自己 abort，不会永久挂着。
+
+### 实测（从文件观察子进程，而不是只看父进程超时）
+
+| 场景 | 结果 |
+| --- | --- |
+| 工具超时 300ms，插件循环 5s | 父进程收到"超时"；子进程写下 `aborted-after:~300`，**没有跑到 5s** |
+| 会话 abort 400ms，插件循环 8s | 全链路 410ms 结束；子进程写下 `aborted-after:399` |
+| 不取消的正常调用 | 正常返回 `finished-normal`，宿主仍健康 |
+| 取消未知 id | 无操作，不崩溃 |
+
+测试：`tests/plugin-cancel.test.ts` **3 项**。
+

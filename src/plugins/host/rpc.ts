@@ -66,6 +66,21 @@ export interface HostResponse {
   error?: string;
 }
 
+/**
+ * 父 → 子：取消某个进行中的调用。
+ *
+ * 为什么需要：父进程超时后只是"不再等待"，子进程里那个函数还在跑 —— 也就是幽灵计算。
+ * 发 abort 之后，子进程会把对应 AbortController 停掉，插件代码可以通过 signal 感知并提前退出。
+ *
+ * 注意：**这依赖插件配合**。插件完全不看 signal 的话，JS 层面没有强制终止的手段
+ * （不像线程能 kill），所以文档里要写清楚这是"协作式取消"。
+ */
+export interface HostAbort {
+  type: "abort";
+  id: number;
+  reason?: string;
+}
+
 export type HostOutbound = HostReady | HostLog | HostResponse;
 
 export function encodeLine(obj: unknown): string {

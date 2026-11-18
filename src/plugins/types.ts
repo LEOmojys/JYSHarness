@@ -121,6 +121,11 @@ export interface PluginRequestContext {
   query: Record<string, string>;
   body: unknown;
   workspaceRoot: string;
+  /**
+   * 取消信号。父进程超时或客户端断开时会 abort —— 长任务应该监听它并提前返回。
+   * 只在进程隔离模式下有值（本进程模式没有跨进程的取消通道）。
+   */
+  signal?: AbortSignal;
 }
 
 export interface PluginRouteResponse {
@@ -154,7 +159,10 @@ export interface PluginPanel {
 export interface PluginCommand {
   name: string;
   description: string;
-  run: (args: string, ctx: { workspaceRoot: string }) => Promise<string> | string;
+  run: (
+    args: string,
+    ctx: { workspaceRoot: string; signal?: AbortSignal },
+  ) => Promise<string> | string;
 }
 
 export interface PluginRuntime {

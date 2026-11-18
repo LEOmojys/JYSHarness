@@ -15,7 +15,7 @@ import { loadPlugins } from '../loader.ts';
 import { Logger } from '../../util/log.ts';
 import type { ToolContext, ToolResult } from '../../tools/types.ts';
 import type { HookPayload } from '../../hooks/hooks.ts';
-import type { HostOutbound, HostRequest, PluginDescriptor } from './rpc.ts';
+import type { HostAbort, HostOutbound, HostRequest, PluginDescriptor } from './rpc.ts';
 import { encodeLine, parseLine } from './rpc.ts';
 
 const NL = String.fromCharCode(10);
@@ -45,15 +45,28 @@ const logger = new Logger('error');
  * 沙箱与审批**无法**跨进程沿用（子进程是独立 OS 进程），这里如实标为不限制，
  * 文档里也写明'进程隔离 ≠ 安全沙箱'。插件作者需要知道这个边界。
  */
-function toolCtx(timeoutMs: number): ToolContext {
+function toolCtx(signal: AbortSignal): ToolContext {
   return {
     workspaceRoot,
     cwd: workspaceRoot,
     sandbox: { mode: 'danger-full-access', workspaceRoot },
-    signal: AbortSignal.timeout(Math.max(1000, timeoutMs)),
+    signal,
     logger,
     depth: 0,
   };
+}
+
+/**
+ * 进行中的调用 → 它们的 AbortController。
+ * 收到父进程的 abort 消息时按 id 找到并停掉，插件通过 signal 感知后可以提前返回。
+ */
+const inflight = new Map<number, AbortController>();
+
+/** 单次调用的安全上限：即使父进程失联（崩溃/被杀），子进程也不会永远挂着。 */
+function safetyTimer(ms: number, controller: AbortController): NodeJS.Timeout {
+  const t = setTimeout(() => controller.abort(new Error('调用超过宿主安全上限')), ms);
+  (t as unknown as { unref?: () => void }).unref?.();
+  return t;
 }
 
 // ---- 3) 加载 ----
@@ -94,12 +107,16 @@ async function boot(): Promise<void> {
 
 // ---- 4) 请求处理 ----
 async function handle(req: HostRequest): Promise<void> {
+  // 每次调用一个可取消的 controller：父进程超时/中止时会按 id 停掉它
+  const controller = new AbortController();
+  const timer = safetyTimer(10 * 60_000, controller);
+  inflight.set(req.id, controller);
   try {
     if (req.method === 'tool.call') {
       const owner = runtimes.find((rt) => rt.tools.some((t) => t.name === req.toolName));
       const tool = owner?.tools.find((t) => t.name === req.toolName);
       if (!tool) throw new Error('unknown tool: ' + String(req.toolName));
-      const out: ToolResult = await tool.call(req.input ?? {}, toolCtx(tool.timeoutMs ?? 120000));
+      const out: ToolResult = await tool.call(req.input ?? {}, toolCtx(controller.signal));
       emit({ id: req.id, ok: true, result: { content: out.content, isError: Boolean(out.isError), metadata: out.metadata } });
       return;
     }
@@ -114,6 +131,8 @@ async function handle(req: HostRequest): Promise<void> {
         query: req.query ?? {},
         body: req.body,
         workspaceRoot: req.workspaceRoot ?? workspaceRoot,
+        // 路由也能感知取消（超时/客户端断开时父进程会发 abort）
+        signal: controller.signal,
       });
       emit({ id: req.id, ok: true, result: { status: out?.status ?? 200, json: out?.json, text: out?.text } });
       return;
@@ -123,7 +142,7 @@ async function handle(req: HostRequest): Promise<void> {
       const wanted = req.commandName ?? '';
       const hit = rt?.commands.find((c) => c.name === wanted || '/' + c.name === wanted || c.name === '/' + wanted);
       if (!hit) throw new Error('unknown command: ' + wanted);
-      const out = await hit.run(req.arg ?? '', { workspaceRoot: req.workspaceRoot ?? workspaceRoot });
+      const out = await hit.run(req.arg ?? '', { workspaceRoot: req.workspaceRoot ?? workspaceRoot, signal: controller.signal });
       emit({ id: req.id, ok: true, result: { output: typeof out === 'string' ? out : String(out) } });
       return;
     }
@@ -141,7 +160,17 @@ async function handle(req: HostRequest): Promise<void> {
     throw new Error('unknown method: ' + String(req.method));
   } catch (err) {
     emit({ id: req.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    clearTimeout(timer);
+    inflight.delete(req.id);
   }
+}
+
+/** 父进程发来的取消：按 id 停掉对应调用。 */
+function handleAbort(msg: HostAbort): void {
+  const controller = inflight.get(msg.id);
+  if (!controller) return;
+  controller.abort(new Error(msg.reason ?? '父进程取消了这次调用'));
 }
 
 // ---- 5) 入口 ----
@@ -163,7 +192,12 @@ process.stdin.on('data', (chunk: string) => {
     const line = buffer.slice(0, nl);
     buffer = buffer.slice(nl + 1);
     const msg = parseLine(line);
-    if (msg && typeof msg === 'object' && 'id' in (msg as object)) void handle(msg as HostRequest);
+    if (!msg || typeof msg !== 'object') continue;
+    if ('type' in (msg as object) && (msg as { type?: string }).type === 'abort') {
+      handleAbort(msg as HostAbort);
+      continue;
+    }
+    if ('id' in (msg as object)) void handle(msg as HostRequest);
   }
 });
 

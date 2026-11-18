@@ -189,6 +189,7 @@ export class PluginHost {
               "route",
               { pluginId: d.pluginId, httpMethod: r.method, path: r.path, query: ctx.query, body: ctx.body, workspaceRoot: ctx.workspaceRoot },
               timeoutFor("route"),
+              ctx.signal,
             );
             return out as { status?: number; json?: unknown; text?: string };
           },
@@ -208,6 +209,7 @@ export class PluginHost {
               "command",
               { pluginId: d.pluginId, commandName: c.name, arg, workspaceRoot: ctx.workspaceRoot },
               timeoutFor("command"),
+              ctx.signal,
             );
             return (out as { output?: string }).output ?? "";
           },
@@ -252,9 +254,10 @@ export class PluginHost {
       isReadOnly: t.isReadOnly,
       isDestructive: t.isDestructive,
       isConcurrencySafe: () => true,
-      call: async (input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult> => {
+      call: async (input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> => {
         try {
-          const out = await this.request("tool.call", { toolName: t.name, input }, timeoutFor("tool"));
+          // ctx.signal 是会话的取消信号：用户点停止时，子进程里的插件也会一起停
+          const out = await this.request("tool.call", { toolName: t.name, input }, timeoutFor("tool"), ctx?.signal);
           const r = out as { content?: string; isError?: boolean; metadata?: Record<string, unknown> };
           return { content: r.content ?? "", isError: Boolean(r.isError), metadata: r.metadata };
         } catch (err) {
@@ -268,7 +271,21 @@ export class PluginHost {
     };
   }
 
-  private async request(method: HostRequest["method"], payload: Partial<HostRequest>, timeoutMs: number): Promise<unknown> {
+  /** 父 → 子：告诉它这次调用已经没人等了，请停掉。 */
+  private sendAbort(id: number, reason: string): void {
+    try {
+      this.child?.stdin?.write(encodeLine({ type: "abort", id, reason }));
+    } catch {
+      /* 子进程已经没了，abort 也就没意义 */
+    }
+  }
+
+  private async request(
+    method: HostRequest["method"],
+    payload: Partial<HostRequest>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     if (this.dead || !this.child) {
       // 发现已死时尝试重启一次（插件自己退出后的自愈）
       try {
@@ -282,16 +299,43 @@ export class PluginHost {
     if (!child || !child.stdin) throw new Error("插件宿主不可用");
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const finish = (fn: () => void) => {
+        cleanup();
         this.pending.delete(id);
-        reject(new Error("插件调用超时（" + timeoutMs + "ms）：" + method));
+        fn();
+      };
+      const onAbort = () => {
+        // 会话被取消（用户按了停止 / 上游 abort）：立刻拒绝，并让子进程停掉
+        this.sendAbort(id, "父进程取消了调用");
+        finish(() => reject(new Error("插件调用被取消：" + method)));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const timer = setTimeout(() => {
+        // 超时也要通知子进程：否则那边会继续算下去（幽灵计算）
+        this.sendAbort(id, "父进程等待超时（" + timeoutMs + "ms）");
+        finish(() => reject(new Error("插件调用超时（" + timeoutMs + "ms）：" + method)));
       }, timeoutMs);
+
+      if (signal) {
+        if (signal.aborted) {
+          this.sendAbort(id, "父进程在调用前就已取消");
+          finish(() => reject(new Error("插件调用被取消：" + method)));
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
       this.pending.set(id, { resolve, reject, timer });
       child.stdin?.write(encodeLine({ id, method, ...payload }));
     });
   }
 
   kill(): void {
+    // 先让子进程停掉进行中的调用，再杀进程：被杀时至少它收到过取消通知
+    for (const id of this.pending.keys()) this.sendAbort(id, "宿主正在关闭");
     try {
       this.child?.kill();
     } catch {
