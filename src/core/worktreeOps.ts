@@ -10,7 +10,7 @@
  *   5. lock    —— 两个进程同时 worktree add/merge 会撞 index.lock。
  */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const git = (cwd: string, args: string[], timeout = 180_000) =>
@@ -28,13 +28,122 @@ export interface LockOptions {
 const lockFile = (repoRoot: string) => path.join(repoRoot, ".harness", "repo.lock");
 
 /**
+ * 判断一把锁是否已经失效。
+ *
+ * owner-dead  持有者 pid 不在进程表里（崩溃残留）→ 可立即回收
+ * self        锁是本进程持有的（重入）→ 不该等，直接失败
+ * too-old     pid 有效但超过 10 分钟 → 认为卡死，回收
+ * unreadable  pid 读不出来且文件已存在超过 2 秒（避开"刚创建还没写入"的竞态）→ 回收
+ */
+function staleReason(file: string): "owner-dead" | "self" | "too-old" | "unreadable" | "live" {
+  const STALE_MS = 10 * 60_000;
+  let age = 0;
+  try {
+    age = Date.now() - statSync(file).mtimeMs;
+  } catch {
+    return "unreadable"; // 文件刚被释放：下一轮会成功
+  }
+  let pid = 0;
+  try {
+    pid = Number(readFileSync(file, "utf8").trim());
+  } catch (err) {
+    // 编程错误（忘了 import、传错参数）必须炸出来，不能被当成"锁还活着"静默降级。
+    // 实测踩过：readFileSync 没导入 → ReferenceError 被这里吞掉 → 陈旧锁永远回收不了。
+    if (err instanceof ReferenceError || err instanceof TypeError) throw err;
+    return age > 2_000 ? "unreadable" : "live";
+  }
+  if (Number.isInteger(pid) && pid > 0) {
+    // 同 pid 只可能是"上一次运行崩溃留下的"（本进程持有的锁在进程内排队阶段就挡住了），
+    // 所以按陈旧处理，而不是让用户等到 mtime 过期。
+    if (pid === process.pid) return "owner-dead";
+    try {
+      process.kill(pid, 0);
+      return age > STALE_MS ? "too-old" : "live";
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      // ESRCH = 进程不存在；EPERM = 存在但没权限（仍然算活着）
+      return code === "ESRCH" ? "owner-dead" : "live";
+    }
+  }
+  return age > STALE_MS ? "too-old" : "live";
+}
+
+/**
  * 串行化会动 git 元数据的操作（worktree add/remove/merge/rebase）。
  *
  * 为什么必须有：`git worktree add` 与 `git merge` 都会写 .git/index 与 index.lock，
  * 两个任务同时触发时后到的直接失败（"Unable to create index.lock"）。
  * 这里用 O_EXCL 创建锁文件实现互斥，带超时轮询，进程崩溃留下的陈旧锁按 mtime 过期。
  */
+/**
+ * 进程内串行化：同一个仓库的多个调用在**本进程内排队**，不靠抢文件锁。
+ *
+ * 为什么必须有：文件锁只能表达"有别人占着"，无法表达"是本进程的另一个调用占着"。
+ * 只靠文件锁时，同进程的两个并发调用会互相等对方的文件锁（或者被误判成重入而直接失败）。
+ * 实测：早期版本让同进程第二个调用直接报错，破坏了"两个任务排队执行"的正常用法。
+ *
+ * 注意：这里**不做可重入**。在锁内部再拿同一把锁会死等 —— 这是经典互斥语义，
+ * 真要嵌套就得在外层把活干完，或者拆成两个不同的 key。
+ */
+const inProcChains = new Map<string, Promise<unknown>>();
+
+/**
+ * 排队拿到"进程内通行证"后执行 fn。
+ *
+ * 返回里用 `ran` 而不是 `ok`：fn 自己可能返回 {ok:false}（文件锁失败），
+ * 如果这里也用 ok，外层就会包成 {ok:true, value:{ok:false}} —— 调用方看到 ok:true
+ * 会以为拿到锁了（实测出现过，等于静默跳过互斥）。
+ */
+async function withInProcessLock<T>(
+  key: string,
+  waitMs: number,
+  fn: () => Promise<T>,
+): Promise<{ ran: true; value: T } | { ran: false; error: string }> {
+  const prev = inProcChains.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const mine = prev.then(() => gate);
+  inProcChains.set(key, mine);
+
+  // 等待也要受 waitMs 约束：调用方说"最多等 80ms"，就不能在进程内悄悄等 400ms。
+  let timer: NodeJS.Timeout | undefined;
+  const acquired = await Promise.race([
+    prev.then(() => true),
+    new Promise<boolean>((res) => {
+      timer = setTimeout(() => res(false), waitMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+
+  if (!acquired) {
+    release();
+    if (inProcChains.get(key) === mine) inProcChains.delete(key);
+    return { ran: false, error: "仓库被另一个操作占用（本进程排队超时 " + waitMs + "ms）：" + key };
+  }
+  try {
+    return { ran: true, value: await fn() };
+  } finally {
+    release();
+    // 队尾已经排空就清掉，避免长跑进程里 Map 无限增长
+    if (inProcChains.get(key) === mine) inProcChains.delete(key);
+  }
+}
+
 export async function withRepoLock<T>(
+  repoRoot: string,
+  fn: () => Promise<T> | T,
+  opts: LockOptions = {},
+): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  const key = path.resolve(repoRoot).toLowerCase();
+  const waitMs = opts.waitMs ?? 30_000;
+  const res = await withInProcessLock(key, waitMs, () => withFileLock(repoRoot, fn, opts));
+  // 原样透传文件锁的结果，避免双层包裹把 ok:false 洗成 ok:true
+  return res.ran ? res.value : { ok: false, error: res.error };
+}
+
+async function withFileLock<T>(
   repoRoot: string,
   fn: () => Promise<T> | T,
   opts: LockOptions = {},
@@ -50,13 +159,22 @@ export async function withRepoLock<T>(
       writeFileSync(file, String(process.pid), { flag: "wx" });
       break;
     } catch (err) {
-      // 陈旧锁：进程被杀时锁文件会留下，超过 10 分钟视为失效
-      try {
-        const age = Date.now() - statSync(file).mtimeMs;
-        if (age > staleMs) rmSync(file, { force: true });
-      } catch {
-        /* 锁刚被释放，重试即可 */
+      /**
+       * 陈旧锁回收。两种情形：
+       *   1. 持有者进程已经不存在（崩溃/被杀）→ **立即**回收；
+       *   2. 锁文件存在但 pid 读不出来（极端竞态）→ 按 mtime 超过 10 分钟回收。
+       * 只按 mtime 判的话，崩溃一次就要等满 10 分钟，实测用户会以为"卡死了"。
+       */
+      const stale = staleReason(file);
+      if (stale === "owner-dead") {
+        rmSync(file, { force: true });
+        continue;
       }
+      if (stale === "too-old" || stale === "unreadable") {
+        rmSync(file, { force: true });
+        continue;
+      }
+
       if (Date.now() - started > waitMs) {
         return { ok: false, error: "仓库被另一个操作占用（" + file + "）：" + (err instanceof Error ? err.message : String(err)) };
       }

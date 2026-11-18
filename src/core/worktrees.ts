@@ -107,8 +107,14 @@ export async function listWorktrees(repoRoot: string): Promise<WorktreeInfo[]> {
 }
 
 export function validateWorktreeName(name: string): string | null {
-  if (!name || !name.trim()) return "名字不能为空";
-  if (!/^[a-zA-Z0-9._-]+$/.test(name.trim())) return "只能包含字母、数字、点、下划线、连字符";
+  const n = name.trim();
+  if (!n) return "名字不能为空";
+  if (!/^[a-zA-Z0-9._-]+$/.test(n)) return "只能包含字母、数字、点、下划线、连字符";
+  // "." 与 ".." 能通过上面的字符集，但它们是路径片段：拼进 .harness/worktrees/ 之后
+  // 会指向 .harness 本身（实测 create 只是"碰巧"被 existsSync 挡住，没挡住的话就是路径穿越）。
+  if (n === "." || n === "..") return "名字不能是 . 或 ..";
+  // 纯点号（"..."）同样没有意义，且在某些文件系统上行为不确定
+  if (/^\.+$/.test(n)) return "名字不能只有点";
   return null;
 }
 
@@ -158,9 +164,26 @@ export async function createWorktree(
   await ensureExcluded(repoRoot);
   mkdirSync(path.dirname(target), { recursive: true });
 
-  const res = await git(repoRoot, ["worktree", "add", "-b", branch, target, base ?? "HEAD"]);
+  /**
+   * 分支已存在时**复用它**，而不是报错。
+   *
+   * 场景：工作树目录被手工删掉（或磁盘清理），但 jys/<name> 分支还在 —— 直接 -b 会失败
+   * "a branch named 'jys/x' already exists"（实测）。而用户的意图显然是"把这个工作树找回来"，
+   * 那条分支上往往就有之前的提交，重建后正好接上。想要全新分支就自己删分支，或用别的名字。
+   */
+  const exists = await git(repoRoot, ["rev-parse", "--verify", "--quiet", "refs/heads/" + branch]);
+  const branchExists = exists.code === 0;
+  const args = branchExists ? ["worktree", "add", target, branch] : ["worktree", "add", "-b", branch, target, base ?? "HEAD"];
+  const res = await git(repoRoot, args);
   if (res.code !== 0) {
-    return { ok: false, error: (res.stderr || res.stdout).trim() || "git worktree add 失败" };
+    const msg = (res.stderr || res.stdout).trim();
+    // git 里仍有残留元数据（目录被删但没 prune）时，先 prune 再试一次
+    if (/already registered|is a missing but already registered/i.test(msg)) {
+      await git(repoRoot, ["worktree", "prune"]);
+      const retry = await git(repoRoot, args);
+      if (retry.code === 0) return { ok: true, path: target, branch, copied: copyLocalConfig(repoRoot, target) };
+    }
+    return { ok: false, error: msg || "git worktree add 失败" };
   }
   return { ok: true, path: target, branch, copied: copyLocalConfig(repoRoot, target) };
 }

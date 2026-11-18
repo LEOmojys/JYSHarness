@@ -10,6 +10,8 @@
  *      卷进合并提交里。
  */
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 const git = (cwd: string, args: string[]) =>
   spawnSync("git", args, { cwd, encoding: "utf8", timeout: 120_000, maxBuffer: 32 * 1024 * 1024 });
@@ -110,6 +112,38 @@ export function preflightAll(repoRoot: string, into: string, branches: string[])
 }
 
 /**
+ * resolver 交回 ok 之后的收尾：暂存 → 检查冲突标记 → 允许提交。
+ *
+ * 为什么编排侧要兜底 add：约定是"resolver 只解内容、提交由编排做"，但实际有 resolver
+ * 只改文件不 add（agent 版提示词里有这一步，自定义 resolver 常常漏）。漏了就会
+ * commit 失败 → 报"冲突未解决"，让人以为自己的解决没生效。
+ *
+ * 更要紧的是**标记检查**：`git add` 会把带 `<<<<<<<` 的文件也标记为已解决，
+ * 于是冲突标记会被悄悄提交进主干。这里在读回内容后直接拦住。
+ */
+function finalizeResolved(repoRoot: string, files: string[]): { ok: true } | { ok: false; error: string } {
+  if (files.length) git(repoRoot, ["add", "--", ...files]);
+  // git add 之后仍未合并的（.gitattributes 特殊处理、文件被删等）说明还没真解决
+  const still = String(git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]).stdout ?? "").trim();
+  if (still) return { ok: false, error: "resolver 返回成功，但这些文件仍是未合并状态：" + still };
+
+  const marked: string[] = [];
+  for (const rel of files) {
+    const abs = path.join(repoRoot, rel);
+    try {
+      const text = readFileSync(abs, "utf8");
+      if (/^<{7}( |$)/m.test(text) && /^>{7}( |$)/m.test(text)) marked.push(rel);
+    } catch {
+      /* 二进制或已删除：没有标记可查 */
+    }
+  }
+  if (marked.length) {
+    return { ok: false, error: "resolver 返回成功，但文件里仍有冲突标记（<<<<<<< / >>>>>>>）：" + marked.join(", ") };
+  }
+  return { ok: true };
+}
+
+/**
  * 依次合并。遇到冲突立即 `git merge --abort` 并停止，返回已合并的部分与冲突信息。
  * 恒返回结构化结果：调用方不需要解析 git 输出。
  */
@@ -149,12 +183,23 @@ export function mergeBranches(
       if (opts.resolve) {
         const fixed = opts.resolve({ repoRoot, branch, files });
         if (fixed.ok) {
-          // resolver 只负责解决冲突内容；提交由这里统一做，避免它忘记提交
-          const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
-          if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
-            merged.push(branch);
-            continue;
+          // resolver 只负责解决冲突内容；暂存与提交由这里统一做
+          const staged = finalizeResolved(repoRoot, files);
+          if (staged.ok) {
+            const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
+            if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
+              merged.push(branch);
+              continue;
+            }
           }
+          git(repoRoot, ["merge", "--abort"]);
+          return {
+            ok: false,
+            into,
+            merged,
+            blocked: { branch, files },
+            error: (!staged.ok ? staged.error : fixed.detail ?? "提交失败").slice(0, 400),
+          };
         }
         git(repoRoot, ["merge", "--abort"]);
         return { ok: false, into, merged, blocked: { branch, files }, error: (fixed.detail ?? "冲突未解决").slice(0, 400) };
@@ -199,10 +244,13 @@ export async function mergeBranchesAsync(
     into?: string;
     branches: string[];
     noFf?: boolean;
-    resolve?: unknown;
-    resolver: (ctx: { repoRoot: string; branch: string; files: string[] }) => Promise<{ ok: boolean; detail?: string }>;
+    /** 与同步版同名（推荐）。历史上这里叫 resolver，两个都接受。 */
+    resolve?: (ctx: { repoRoot: string; branch: string; files: string[] }) => Promise<{ ok: boolean; detail?: string }>;
+    resolver?: (ctx: { repoRoot: string; branch: string; files: string[] }) => Promise<{ ok: boolean; detail?: string }>;
   },
 ): Promise<MergeOutcome> {
+  const resolveFn = opts.resolve ?? opts.resolver;
+  if (!resolveFn) return { ok: false, into: "", merged: [], error: "mergeBranchesAsync 需要 resolve（或 resolver）回调" };
   const into = opts.into ?? currentBranch(repoRoot);
   if (!into) return { ok: false, into: "", merged: [], error: "当前处于分离 HEAD 状态，请先 checkout 到一个分支" };
   const dirty = isClean(repoRoot);
@@ -220,20 +268,23 @@ export async function mergeBranchesAsync(
       git(repoRoot, ["merge", "--abort"]);
       return { ok: false, into, merged, error: step.error ?? "merge 失败" };
     }
-    // 冲突：交给 resolver（agent），它只改文件，提交由这里统一做
-    const fixed = await opts.resolver({ repoRoot, branch, files: step.files ?? [] });
+    // 冲突：交给 resolver（agent），它只改文件，暂存与提交由这里统一做
+    const files = step.files ?? [];
+    const fixed = await resolveFn({ repoRoot, branch, files });
     if (fixed.ok) {
-      const still = String(git(repoRoot, ["diff", "--name-only", "--diff-filter=U"]).stdout ?? "").trim();
-      if (!still) {
+      const staged = finalizeResolved(repoRoot, files);
+      if (staged.ok) {
         const commit = git(repoRoot, ["commit", "--no-verify", "-m", "merge " + branch + "（冲突已解决）"]);
         if (commit.status === 0 || /nothing to commit/i.test(String(commit.stderr ?? ""))) {
           merged.push(branch);
           continue;
         }
       }
+      git(repoRoot, ["merge", "--abort"]);
+      return { ok: false, into, merged, blocked: { branch, files }, error: (!staged.ok ? staged.error : "提交失败").slice(0, 400) };
     }
     git(repoRoot, ["merge", "--abort"]);
-    return { ok: false, into, merged, blocked: { branch, files: step.files ?? [] }, error: fixed.detail ?? "冲突未解决" };
+    return { ok: false, into, merged, blocked: { branch, files }, error: fixed.detail ?? "冲突未解决" };
   }
   return { ok: true, into, merged };
 }
