@@ -12,6 +12,7 @@ import type { HookDefinition, HookEvent, HookPayload, HookResult } from "../hook
 import { parseFrontmatter } from "../core/skills.ts";
 import { CAPABILITY_BY_KIND, checkCompat, hasPermission } from "./compat.ts";
 import { hostFor, type PluginHost } from "./host/client.ts";
+import { findCordisPlugin, runCordisPlugin } from "./cordis.ts";
 import type { Tool } from "../tools/types.ts";
 import type { Logger } from "../util/log.ts";
 import type {
@@ -355,12 +356,20 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
       // Node caches ESM by URL forever; a reload must bust it or the old code wins.
       const stamp = Math.floor(statSync(entry).mtimeMs).toString(36);
       const url = pathToFileURL(entry).href + "?v=" + stamp + "-" + Math.random().toString(36).slice(2, 7);
-      const mod = (await import(url)) as { activate?: unknown; default?: unknown };
+      const mod = (await import(url)) as Record<string, unknown>;
       const activate = (mod.activate ?? mod.default) as ((a: PluginApi) => unknown) | undefined;
-      if (typeof activate !== "function") {
-        throw new Error("entry must export activate(api) (or a default function)");
+      if (typeof activate === "function") {
+        await activate(api);
+      } else {
+        // 不是我们的 activate(api) —— 试一次 Cordis 插件（DSH 格式：{ apply(ctx), inject }）
+        const cordis = findCordisPlugin(mod);
+        if (!cordis) throw new Error("entry must export activate(api) 或 Cordis 的 apply(ctx) 插件对象");
+        const outcome = runCordisPlugin(cordis, label, api, (m) => warnings.push(m), {
+          permissions: manifest.contributes?.permissions,
+        });
+        if (!outcome.ok) throw new Error(outcome.reason ?? "Cordis 插件加载失败");
+        logger.info("plugin " + label + ": 以 Cordis 兼容模式加载");
       }
-      await activate(api);
     } catch (err) {
       result.errors.push({ plugin: label, message: err instanceof Error ? err.message : String(err) });
       continue;

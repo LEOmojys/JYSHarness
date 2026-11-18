@@ -524,3 +524,69 @@ HARNESS_PLUGIN_HOOK_TIMEOUT_MS=10000    # hook
 
 单测：`tests/plugin-isolation.test.ts` **8 项**（子进程执行、路由/命令、日志不污染、崩溃自愈、超时、hook、缓存与关机、混合模式）。
 
+
+## 与 DSH 插件的兼容性（实测结论）
+
+一句话：**格式层能适配（已实现），实现层不兼容。**
+
+DSH 的插件是 @deepseek-ai/cordis 的插件对象 —— 一个带 `apply(ctx, config)` 的对象外加 `inject` 依赖声明
+（判定逻辑见 `cordis/src/registry.ts`：`typeof object.apply === 'function'`）。所以"兼容"要看三层：
+
+| 层 | 内容 | 结论 | 证据 |
+| --- | --- | --- | --- |
+| ① 入口契约 | `activate(api)` vs Cordis `apply(ctx)` + `inject` | **可适配，已实现** | `src/plugins/cordis.ts`，5 项测试 |
+| ② 依赖与服务面 | 插件 `import` `@deepseek-ai/dsh-*`，用 `ctx.llm/sessions/sandbox/guard/jobs/fs` | **不兼容** | 这台机器的 DSH 只装了 8 个包（cordis/cosmokit/schemastery/deque/timeout/brand/api-gateway/typert-protocol）；`dsh-core`、`dsh-tools`、`dsh-session`、`dsh-llm`、`dsh-sandbox`、`dsh-guard` **全部缺失** |
+| ③ 浏览器半 | client 插件是 React 组件，编译进 DSH 的 `apps/web`（HMR + `window.__DSH_BOOT__`） | **不兼容** | 本平台 UI 是经典脚本 + slot mount，两套渲染模型 |
+
+### ① 层做了什么（可用的部分）
+
+`src/plugins/cordis.ts` 给 Cordis 插件一个 ctx 门面，把这一小部分映射到本平台：
+
+| Cordis API | 映射到 |
+| --- | --- |
+| `ctx.tools.register({ name, parameters, execute })` | `api.registerTool()`（接受 `execute/call/handler` 三种命名、`parameters/inputSchema` 两种 schema 字段） |
+| `ctx.commands.register({ name, run })` | `api.registerCommand()`（名字自动补 `/` 前缀） |
+| `ctx.skills.register({ name, content })` | `api.addSkill()` |
+| `ctx.on('PreToolUse' …)` | `api.on(HookEvent)`；其它事件名只在本插件内部派发 |
+| `ctx.logger()` / `ctx.effect()` / `ctx.emit()` | 日志 / 清理收集 / 局部事件 |
+| `ctx.provide(name, v)` / `ctx.get(name)` | 插件私有服务注册表 |
+
+**inject 会被强制校验**：声明了 `llm`/`sessions` 这类本平台不提供的服务，插件直接**拒绝加载**并说明缺什么，不会留下半截贡献。
+
+### ② 层为什么不兼容（不可用的部分）
+
+不是"没实现"，而是**依赖不存在**：DSH 的插件代码 `import { ... } from '@deepseek-ai/dsh-tools'`，
+这些包在 DSH 安装目录里没有（应用是打包的 asar，只带了 8 个支撑包）。就算把包凑齐，
+那些插件要的 `ctx` 服务面（会话、模型、沙箱、审批、任务、文件系统）也得逐一对齐 —— 那等于重做 DSH 内核。
+
+### 什么真的能搬过来
+
+| 形式 | 兼容性 | 怎么用 |
+| --- | --- | --- |
+| **MCP 服务器** | ✅ 通用（标准协议） | 配置写进 `mcpServers`，工具注册为 `mcp__<server>__<tool>` |
+| **技能（`*.md` + frontmatter）** | ✅ 直接可用 | `jys skill import-dsh <dir>`，实测 23 个全通，支持 `whenToUse`/`enabled` |
+| **纯逻辑 Cordis 插件**（只用 tools/commands/skills） | ⚠️ 可用（经适配层） | 放进 `.harness/plugins/<name>/`，入口导出 `{ apply(ctx) }` 即可 |
+| **依赖 dsh-* 包或 ctx 深度服务的插件** | ❌ | 会以"inject 了本平台不提供的服务"或 import 失败拒绝，原因明确 |
+| **client 插件（React）** | ❌ | 需按本平台 slot 重写浏览器半 |
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| 真实 DSH 包能否 import | `dsh-deque` ✅、`cordis` ✅（零依赖），说明 cordis 本身可加载 |
+| DSH 插件依赖的包 | `dsh-core`/`dsh-tools`/`dsh-session`/`dsh-llm`/`dsh-sandbox`/`dsh-guard` **全部缺失** |
+| Cordis 风格插件（只注册工具） | ✅ 加载成功，工具调用返回正常 |
+| Cordis 风格插件（`inject: {llm, sessions}`） | ✅ 按预期拒绝，错误含"不提供 / llm" |
+| Cordis `ctx.on('PreToolUse')` | ✅ 接进 hook 管线，可返回 deny |
+| 误判防护 | 修掉一个真 bug：任何函数都有 `Function.prototype.apply`，导致 `activate` 被误认成 Cordis 插件 → 改为要求**自有 apply** |
+
+单测：`tests/cordis-compat.test.ts` **5 项**。
+
+### 结论怎么用
+
+想在 DSH 与本平台之间复用，按这个顺序：
+1. **技能**直接搬（`jys skill import-dsh`）；
+2. **MCP 服务器**直接配；
+3. **纯逻辑插件**用 `apply(ctx)` 形态写，两边都能跑（本平台走适配层）；
+4. **需要 DSH 内核服务的插件**别想着搬 —— 重写更划算。
+
