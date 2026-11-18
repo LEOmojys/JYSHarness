@@ -251,7 +251,7 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
     // ---- 进程隔离：不 import 插件入口，交给宿主子进程 ----
     // 必须在 resolveEntry/import 之前分流，否则插件代码仍在父进程执行，隔离形同虚设。
     if (manifest.isolation === "process" && !opts.forceInProcess) {
-      await loadInHost(discovered.dir, workspaceRoot, manifest, logger, result);
+      await loadInHost(discovered.dir, workspaceRoot, manifest, logger, result, discovered.source);
       continue;
     }
 
@@ -364,9 +364,7 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
         // 不是我们的 activate(api) —— 试一次 Cordis 插件（DSH 格式：{ apply(ctx), inject }）
         const cordis = findCordisPlugin(mod);
         if (!cordis) throw new Error("entry must export activate(api) 或 Cordis 的 apply(ctx) 插件对象");
-        const outcome = runCordisPlugin(cordis, label, api, (m) => warnings.push(m), {
-          permissions: manifest.contributes?.permissions,
-        });
+        const outcome = runCordisPlugin(cordis, label, api, (m) => warnings.push(m));
         if (!outcome.ok) throw new Error(outcome.reason ?? "Cordis 插件加载失败");
         logger.info("plugin " + label + ": 以 Cordis 兼容模式加载");
       }
@@ -428,6 +426,24 @@ export async function loadPlugins(workspaceRoot: string, logger: Logger, opts: L
     });
   }
 
+  // 命令名冲突检测：/deploy 这种名字如果两个插件都注册，先加载的那个会静默生效，
+  // 用户只会觉得"某个插件的命令没反应"。所以显式报出来。
+  const commandOwner = new Map<string, string>();
+  for (const rt of result.runtimes) {
+    for (const cmd of rt.commands) {
+      const name = cmd.name.startsWith("/") ? cmd.name : "/" + cmd.name;
+      const prev = commandOwner.get(name);
+      if (prev && prev !== rt.pluginId) {
+        result.warnings.push({
+          plugin: rt.pluginId,
+          message: "命令 " + name + " 与插件 " + prev + " 重名，实际生效的是先加载的那个",
+        });
+      } else {
+        commandOwner.set(name, rt.pluginId);
+      }
+    }
+  }
+
   return result;
 }
 
@@ -443,6 +459,7 @@ async function loadInHost(
   manifest: PluginManifest,
   logger: Logger,
   result: PluginLoadResult,
+  source: "project" | "user",
 ): Promise<void> {
   const label = path.basename(pluginDir);
   const onLog = (level: string, message: string) => {
@@ -503,7 +520,7 @@ async function loadInHost(
     name: manifest.name,
     version: manifest.version ?? "0.0.0",
     dir: pluginDir,
-    source: "project",
+    source,
     tools: contributions.tools.length,
     skills: contributions.skills.length,
     hooks: contributions.hooks.length,

@@ -8,6 +8,7 @@
  */
 import path from "node:path";
 import { discoverPlugins, readManifest } from "./loader.ts";
+import { hasPermission } from "./compat.ts";
 import type { PluginPanel } from "./types.ts";
 
 export interface PanelDecl extends PluginPanel {
@@ -32,6 +33,9 @@ export function pluginPanelDirs(workspaceRoot: string): { dir: string; panels: P
     if (manifest.enabled === false) continue;
     const declared = (manifest as { panels?: PluginPanel[] }).panels ?? [];
     if (!declared.length) continue;
+    // 清单声明的面板同样要 ui-panel 权限：否则"只在 manifest 里写 panels"
+    // 就能绕过 registerPanel 的能力校验，规则就自相矛盾了。
+    if (!hasPermission(manifest.contributes?.permissions, "ui-panel")) continue;
     const id = (manifest as { id?: string }).id ?? path.basename(discovered.dir);
     const panels: PanelDecl[] = [];
     for (const p of declared) {

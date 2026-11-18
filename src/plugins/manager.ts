@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { configHome } from "../core/configStore.ts";
 import { discoverPlugins, readManifest, resolveEntry } from "./loader.ts";
+import { shutdownHost } from "./host/client.ts";
 import { checkCompat, harnessVersion } from "./compat.ts";
 
 const NL = String.fromCharCode(10);
@@ -164,6 +165,8 @@ export function installPlugin(workspaceRoot: string, source: string, opts: Insta
       writeFileSync(mp, JSON.stringify(raw, null, 2) + NL, "utf8");
     }
 
+    // 覆盖安装后必须让旧宿主的子进程退出，否则继续跑旧代码
+    shutdownHost(dest);
     return { ok: true, name: manifest.name, dir: dest, source: resolvedSource };
   } finally {
     if (cleanup) rmSync(cleanup, { recursive: true, force: true });
@@ -173,6 +176,8 @@ export function installPlugin(workspaceRoot: string, source: string, opts: Insta
 export function uninstallPlugin(workspaceRoot: string, name: string, target: "project" | "user" = "project"): InstallResult {
   const dir = path.join(pluginsRoot(workspaceRoot, target), name);
   if (!existsSync(dir)) return { ok: false, error: "未安装：" + name };
+  // 先杀宿主再删目录：否则子进程还引用着已删代码（Windows 下还可能占用句柄）
+  shutdownHost(dir);
   rmSync(dir, { recursive: true, force: true });
   return { ok: true, name, dir };
 }

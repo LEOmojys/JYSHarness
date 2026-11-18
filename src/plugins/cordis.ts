@@ -14,7 +14,7 @@
  *   - 插件的浏览器半（React 打进 DSH 的 apps/web）→ 结构上不兼容。
  * 所以"能用"的范围是：纯逻辑、只注册工具/命令/技能的 Cordis 插件。
  */
-import type { PluginApi, PluginCommand, PluginRoute } from "./types.ts";
+import type { PluginApi, PluginCommand } from "./types.ts";
 import type { Tool } from "../tools/types.ts";
 
 /** Cordis 插件对象的形状（够用就好，不追求完整类型）。 */
@@ -133,7 +133,6 @@ export function runCordisPlugin(
   pluginId: string,
   api: PluginApi,
   warn: (m: string) => void,
-  opts: { permissions?: string[]; routes?: PluginRoute[] } = {},
 ): { ok: boolean; reason?: string } {
   const needs = declaredInject(plugin);
   const missing = needs.filter((name) => !(SUPPORTED_SERVICES as readonly string[]).includes(name));
@@ -212,7 +211,7 @@ export function runCordisPlugin(
     return { ok: false, reason: "Cordis 插件 apply() 抛出异常：" + (err instanceof Error ? err.message : String(err)) };
   }
 
-  // 插件声明的路由（Cordis 里通常走 ctx.provide 的 http 服务，这里只支持显式给出）
-  for (const r of opts.routes ?? []) api.registerRoute(r);
+  // 说明：Cordis 插件的 HTTP 路由通常通过 ctx.provide 暴露 http 服务，
+  // 我们不解这种服务，所以 Cordis 插件只支持工具/命令/技能（已在文档里写明）。
   return { ok: true };
 }

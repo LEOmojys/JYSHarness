@@ -167,7 +167,11 @@ test("slots: unknown slot falls back to sidebar", () => {
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     path.join(dir, "plugin.json"),
-    JSON.stringify({ name: "slotty", panels: [{ id: "a", title: "A", slot: "settings" }, { id: "b", title: "B", slot: "weird" }] }),
+    JSON.stringify({
+      name: "slotty",
+      contributes: { permissions: ["ui-panel"] },
+      panels: [{ id: "a", title: "A", slot: "settings" }, { id: "b", title: "B", slot: "weird" }],
+    }),
     "utf8",
   );
   const panels = pluginPanelDirs(root)[0].panels;
@@ -186,3 +190,50 @@ test("loader: incompatible plugin is rejected with a reason, not half-loaded", a
   assert.equal(res.errors.length, 1);
   assert.match(res.errors[0].message, /兼容性校验失败/);
 });
+
+test("panels: manifest-declared panels require ui-panel permission", () => {
+  const root = ws();
+  const noPerm = path.join(root, ".harness", "plugins", "noperm");
+  mkdirSync(noPerm, { recursive: true });
+  writeFileSync(
+    path.join(noPerm, "plugin.json"),
+    JSON.stringify({ name: "noperm", panels: [{ id: "p", title: "P" }] }),
+    "utf8",
+  );
+  assert.equal(pluginPanelDirs(root).length, 0, "没有 ui-panel 权限的面板不该出现");
+
+  const withPerm = path.join(root, ".harness", "plugins", "withperm");
+  mkdirSync(withPerm, { recursive: true });
+  writeFileSync(
+    path.join(withPerm, "plugin.json"),
+    JSON.stringify({ name: "withperm", contributes: { permissions: ["ui-panel"] }, panels: [{ id: "q", title: "Q" }] }),
+    "utf8",
+  );
+  const dirs = pluginPanelDirs(root);
+  assert.equal(dirs.length, 1);
+  assert.equal(dirs[0].panels[0].id, "q");
+});
+
+
+test("commands: duplicate names across plugins produce a warning naming both", async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), "jys-dup-"));
+  for (const name of ["alpha", "beta"]) {
+    const dir = path.join(ws, ".harness", "plugins", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({ name }), "utf8");
+    writeFileSync(
+      path.join(dir, "index.ts"),
+      [
+        "export function activate(api) {",
+        "  api.registerCommand({ name: '/deploy', description: 'd', run: () => '" + name + "' });",
+        "}",
+      ].join(NL) + NL,
+      "utf8",
+    );
+  }
+  const loaded = await loadPlugins(ws, new Logger("error"));
+  const dup = loaded.warnings.filter((w) => w.message.includes("/deploy"));
+  assert.equal(dup.length, 1, "应有一条重名告警，实际: " + JSON.stringify(loaded.warnings));
+  assert.match(dup[0].message, /alpha|beta/);
+});
+

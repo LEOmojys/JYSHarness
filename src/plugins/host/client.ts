@@ -95,6 +95,22 @@ export class PluginHost {
       this.child = child;
       this.dead = false;
 
+      // 关键：不让孩子占住父进程的事件循环。
+      // 否则一次性命令（jys plugin list / jys check / REPL 退出）会**挂住不退出** ——
+      // 实测：带进程隔离插件时 `timeout 8 node main.ts plugin list` 退出码 124（被杀），
+      // 只有本进程插件时正常返回 0。unref 之后父进程可以正常结束，
+      // 而挂起中的 RPC 仍有 setTimeout 定时器兜着，不会提前退出。
+      // 类型上 Readable/Writable 没有 unref（只有 net.Socket 有），
+      // 但 Windows 上子进程的 stdio 底层确实是 Socket，所以运行时探测后再调。
+      const maybeUnref = (s: unknown) => {
+        const fn = (s as { unref?: () => void } | undefined)?.unref;
+        if (typeof fn === "function") fn.call(s);
+      };
+      child.unref();
+      maybeUnref(child.stdin);
+      maybeUnref(child.stdout);
+      maybeUnref(child.stderr);
+
       const bootTimer = setTimeout(() => {
         this.kill();
         reject(new Error("宿主启动超时（10s）：插件初始化太慢或卡住"));
@@ -294,6 +310,19 @@ export class PluginHost {
 // ---- 宿主缓存：同一个插件目录只拉一次子进程 ----
 const hosts = new Map<string, PluginHost>();
 
+// 进程退出兜底：无论从哪条路径退出（CLI 一次性命令、REPL、服务端、异常），
+// 都不把宿主留成孤儿进程。unref 之后事件循环能正常排空，这里才有机会执行。
+process.once("exit", () => {
+  for (const h of hosts.values()) {
+    try {
+      h.kill();
+    } catch {
+      /* 已经死了 */
+    }
+  }
+  hosts.clear();
+});
+
 export function hostFor(pluginDir: string, workspaceRoot: string, onLog: (level: string, message: string) => void): PluginHost {
   const key = path.resolve(pluginDir).toLowerCase();
   const existing = hosts.get(key);
@@ -301,6 +330,22 @@ export function hostFor(pluginDir: string, workspaceRoot: string, onLog: (level:
   const host = new PluginHost(path.resolve(pluginDir), workspaceRoot, onLog);
   hosts.set(key, host);
   return host;
+}
+
+/**
+ * 关掉**单个**插件的宿主。
+ *
+ * 为什么必须有：子进程里已经加载过插件模块，代码改动不会自动生效。
+ * 升级/覆盖安装/编辑插件后如果不杀宿主，就会继续跑旧代码 —— 实测复现过：
+ * 把 index.ts 改成 v2，工具仍返回 v1。
+ */
+export function shutdownHost(pluginDir: string): boolean {
+  const key = path.resolve(pluginDir).toLowerCase();
+  const host = hosts.get(key);
+  if (!host) return false;
+  host.kill();
+  hosts.delete(key);
+  return true;
 }
 
 /** 关掉所有宿主（插件重载/进程退出时调用）。 */

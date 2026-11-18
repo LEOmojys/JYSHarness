@@ -173,6 +173,8 @@ async function list(argv: string[], flags: Set<string>): Promise<void> {
     console.log("");
     return;
   }
+  // 一次全量读取，避免在循环里对每个插件重新 discover 一遍（原来是 O(n²)）
+  const installedByName = new Map(listInstalled(args.workspace).map((m) => [m.name, m]));
   for (const err of result.errors) console.log("  " + paint.red("x") + " " + err.plugin + ": " + err.message);
   for (const warn of result.warnings) console.log("  " + paint.yellow("!") + " " + warn.plugin + ": " + warn.message);
   for (const plugin of result.plugins) {
@@ -186,7 +188,7 @@ async function list(argv: string[], flags: Set<string>): Promise<void> {
     );
     console.log(paint.dim("    " + plugin.dir));
     // 来源与能力声明：安装前就能看见"这个插件对外开了什么"
-    const meta = listInstalled(args.workspace).find((p) => p.name === plugin.name);
+    const meta = installedByName.get(plugin.name);
     if (meta) {
       const bits: string[] = [];
       if (meta.installedFrom) bits.push("来源 " + meta.installedFrom);

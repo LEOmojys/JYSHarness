@@ -590,3 +590,50 @@ DSH 的插件是 @deepseek-ai/cordis 的插件对象 —— 一个带 `apply(ctx
 3. **纯逻辑插件**用 `apply(ctx)` 形态写，两边都能跑（本平台走适配层）；
 4. **需要 DSH 内核服务的插件**别想着搬 —— 重写更划算。
 
+
+## 插件实现审查报告（本轮）
+
+按"能不能真的用"为标准逐项实测，发现并修复 3 个真 bug、2 个一致性问题、1 个性能问题。
+
+### 修掉的 bug
+
+| # | 问题 | 现象（实测） | 修法 |
+| --- | --- | --- | --- |
+| 1 | **宿主缓存不失效** | 覆盖安装/改代码后，工具仍返回旧值（v1 而非 v2） | 新增 `shutdownHost(dir)`；安装、卸载、启停、reload 全部调用 |
+| 2 | **一次性命令挂死** | 带进程隔离插件时 `jys plugin list` 永不退出（`timeout 8` → 退出码 124）；只有本进程插件时正常 0 | 子进程 `unref()` + stdio 运行时探测 unref + 模块级 `process.once("exit")` 清理 |
+| 3 | **函数被误判成 Cordis 插件** | 任何函数都自带 `Function.prototype.apply`，导致 `activate` 走进 Cordis 分支 | 判定改为要求**自有 apply**（class static apply 仍支持） |
+
+### 一致性问题
+
+| # | 问题 | 影响 | 修法 |
+| --- | --- | --- | --- |
+| 4 | 清单 `panels` 绕过 `ui-panel` 权限 | 只要写进 manifest 就能显示 UI，规则自相矛盾 | `pluginPanelDirs` 也校验权限 |
+| 5 | 命令重名静默覆盖 | 两个插件都注册 `/deploy`，先加载的生效，用户以为"命令没反应" | 加载期检测并告警，指出两个插件名 |
+
+### 性能
+
+| # | 问题 | 修法 |
+| --- | --- | --- |
+| 6 | `jys plugin list` 在循环里对每个插件重新 `discover`（O(n²)） | 提到循环外，一次读取 |
+
+### 逐项验证（真实进程/真实服务端/真实 Agent 循环）
+
+| 验证项 | 结果 |
+| --- | --- |
+| 两种模式工具并存 | `isoVersion → iso-v1`（子进程）、`inprocVersion → inproc-v1`（本进程） |
+| 崩溃隔离 | `isoCrash → [插件 iso 执行失败] 插件宿主已退出（code=9）`，其它工具不受影响 |
+| 路由按插件命名空间隔离 | 两个插件都注册 `GET /info`，分别命中各自实现 |
+| 命令 | `/iso`、`/inproc` 均可用；重名会告警 |
+| 面板 | `config.panels` 同时列出 `inproc:inproc-p`、`iso:iso-p` |
+| 资产 | `/plugin-assets/iso/index.js`、`/plugin-assets/inproc/index.js` 均 200 |
+| **Agent 循环** | 模型可见 `IsoVersion` → `tool_end` 命中 → 结果 `iso-v1-from-child` 回传 → `completed`（两种模式各一条测试） |
+| 路径守卫 | 插件工具漏写 `toolCheck` 时，`assemble` 兜底拦截越界写入（两种模式） |
+| 并发 | 20 个并发调用无串台（响应按 id 配对） |
+| 升级 | 安装 v1 → 使用 → 覆盖安装 v2 → 重新加载拿到 v2 |
+| 卸载 | 有活宿主时卸载不报错、目录删除、宿主退出、工具消失 |
+| 一次性命令退出 | 带进程隔离插件时退出码 0（修复前 124） |
+
+### 回归测试（新增 12 项）
+
+`tests/plugin-lifecycle.test.ts`（升级/卸载/并发/不挂死）、`tests/plugin-guard.test.ts`（两种模式的路径守卫）、`tests/plugin-agent.test.ts`（两种模式的 Agent 循环）、`tests/plugin-stale.test.ts`（缓存失效复现与修复）。
+

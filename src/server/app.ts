@@ -794,6 +794,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
         if (body.action === "setEnabled" && body.dir) {
           setPluginEnabled(body.dir, body.enabled !== false);
+          // 启停后必须让宿主失效：否则重新启用时仍用旧代码跑
+          const { shutdownHost } = await import("../plugins/host/client.ts");
+          shutdownHost(body.dir);
         } else if (body.action === "open" && body.dir) {
           try {
             if (process.platform === "win32") spawn("explorer.exe", [body.dir], { detached: true }).unref();
@@ -814,6 +817,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           return json(res, 400, { error: "unknown action" });
         }
 
+        // reload 动作要先让全部宿主失效，否则"重新加载"只是读了缓存的旧贡献
+        if (body.action === "reload") {
+          const { shutdownHosts } = await import("../plugins/host/client.ts");
+          shutdownHosts();
+        }
         const loaded = await loadPlugins(ws, logger);
         for (const h of sessions.values()) h.session.applyPlugins(loaded);
         for (const h of sessions.values()) await emitState(h);
