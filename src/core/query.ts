@@ -868,8 +868,8 @@ async function timedExecute(
   if (feedback) content += feedback;
   recordToolResult(state, call, result.content, Boolean(result.isError));
   await recordObservation(state, call, params.toolContext.cwd);
-
-  return { result: { ...result, content: pruneResult(content) }, durationMs: Date.now() - started };
+  const durationMs = Date.now() - started; state.toolMs += durationMs; // 统一出口累加工具用时
+  return { result: { ...result, content: pruneResult(content) }, durationMs };
 }
 
 /**

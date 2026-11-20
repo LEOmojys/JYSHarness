@@ -53,6 +53,7 @@ export interface SubagentOutcome {
   reason?: "unknown_type" | "cancelled" | "timeout" | "empty";
 }
 import { discoverSkillsWithWarnings, type SkillMeta } from "./skills.ts";
+import { statsFromMessages } from "./stats.ts";
 import { visibleTools } from "./toolSchedule.ts";
 import { costBreakdown } from "./cost.ts";
 
@@ -263,6 +264,7 @@ export class Session {
       toolCalls: 0,
       toolStats: {},
     };
+    if (this.messages.length) Object.assign(this.stats, statsFromMessages(this.messages)); // 恢复会话：从 usage 重建计数
     this.systemPrompt = this.buildPrompt();
   }
 

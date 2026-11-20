@@ -72,10 +72,7 @@ export interface ServerOptions {
   autoApprove?: boolean;
   /** Build a provider from saved config (hot swap from the settings UI). */
   buildProvider?: (cfg: {
-    provider: string;
-    model: string;
-    baseUrl?: string;
-    apiKeyEnv?: string;
+    provider: string; model: string; baseUrl?: string; apiKeyEnv?: string; reasoningEffort?: string;
   }) => { provider: ModelProvider; model: string; note: string };
   /** Reconnect MCP servers after the config changes. */
   reloadMcp?: (servers: McpServerView[]) => Promise<{
@@ -96,6 +93,7 @@ export interface RunningServer {
 /** 权限模式与沙箱模式的合法取值：模式是安全边界，不能接受任意字符串。 */
 const PERMISSION_MODES = new Set(["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"]);
 const SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]);
 
 interface PendingApproval {
   resolve: (outcome: ApprovalOutcome) => void;
@@ -136,7 +134,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
    * 删掉最后那个活动会话后 sessions 会变空，current() 就返回 undefined，
    * 于是删除接口自己 500（实测就是这个）。
    */
-  const sessionStore = opts.session.store;
+  // 按目标会话解析 store：别的 workspace 各有 sessions 目录，用错会"点开却没有"。
+  const storeOf = (id: string) => sessions.get(id)?.session.store ?? current().session.store;
   const workspacePlugins = new Map<string, Promise<PluginLoadResult>>();
   if (opts.initialPlugins) workspacePlugins.set(opts.session.workspaceRoot, Promise.resolve(opts.initialPlugins));
 
@@ -164,8 +163,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     return sessions.get(activeId) ?? sessions.values().next().value!;
   }
 
-  function broadcast(event: unknown): void {
-    const payload = "data: " + JSON.stringify(event) + "\n\n";
+  function writeAll(payload: string): void {
     for (const res of clients) {
       try {
         res.write(payload);
@@ -173,6 +171,29 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         clients.delete(res);
       }
     }
+  }
+
+  // 流式增量按帧合并：一轮可能上万个 delta，逐个广播会把 SSE 与浏览器主线程压满
+  // （表现为界面卡顿甚至无响应）。同类增量攒到下一次 tick 再发，事件语义不变。
+  let pendingDelta: { type: string; text: string } | null = null;
+  let deltaTimer: ReturnType<typeof setTimeout> | null = null;
+  function flushDelta(): void {
+    if (deltaTimer) { clearTimeout(deltaTimer); deltaTimer = null; }
+    const pending = pendingDelta;
+    pendingDelta = null;
+    if (pending) writeAll("data: " + JSON.stringify(pending) + "\n\n");
+  }
+  function broadcast(event: unknown): void {
+    const kind = (event as { type?: string }).type;
+    if (kind === "text_delta" || kind === "thinking_delta") {
+      const text = String((event as { text?: string }).text ?? "");
+      if (pendingDelta && pendingDelta.type !== kind) flushDelta();
+      pendingDelta = { type: kind, text: (pendingDelta?.text ?? "") + text };
+      if (!deltaTimer) deltaTimer = setTimeout(flushDelta, 50);
+      return;
+    }
+    flushDelta();
+    writeAll("data: " + JSON.stringify(event) + "\n\n");
   }
 
   /** 还没开始过的会话用目录名区分，否则侧栏会堆一排"新会话"。 */
@@ -479,11 +500,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             activeId = body.id;
             return json(res, 200, await buildState(h));
           }
-          // 只在磁盘上的历史会话：现场从转录恢复并注册。
-          // 以前这里直接 404（"restart with --resume"），于是会话列表里的历史项
-          // 点了也切不过去 —— 列表显示得出来，却用不了。
+          // 只在磁盘上的历史会话：现场恢复并注册（早先直接 404，列表点不动）。
           if (!opts.makeSession) return json(res, 404, { error: "not loaded; restart with --resume " + body.id });
-          const loaded = await sessionStore.load(body.id);
+          const loaded = await storeOf(body.id).load(body.id);
           if (!loaded.meta) return json(res, 404, { error: "no such session: " + body.id });
           const fresh = await opts.makeSession(loaded.meta.workspaceRoot, {
             sessionId: body.id,
@@ -496,6 +515,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
         if (action === "new" || action === "fork") {
           if (!opts.makeSession) return json(res, 400, { error: "session factory not configured" });
+          if (sessions.size >= 50) return json(res, 400, { error: "活动会话过多（上限 50），请先删除一些" });
           const source = current().session;
           const fresh = await opts.makeSession(source.workspaceRoot);
           await fresh.init();
@@ -510,9 +530,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
         if (action === "delete" && body.id) {
           const live = sessions.get(body.id);
-          // 判据必须是"所有会话"：活动会话 + 磁盘上的历史会话。
-          // 只数活动会话会在"1 个活动 + N 个历史"时误判成"最后一个"而拒绝删除。
-          const onDisk = await sessionStore.ids();
+          // 判据是"活动 + 磁盘"之和，只数活动会话会误判成最后一个。
+          const onDisk = await storeOf(body.id).ids();
           const all = new Set<string>([...sessions.keys(), ...onDisk]);
           if (all.size <= 1 && all.has(body.id)) {
             return json(res, 400, { error: "不能删除最后一个会话" });
@@ -520,20 +539,23 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           const wasActive = activeId === body.id;
           if (live) {
             live.abort?.abort();
+            // 等回合真退出：abort 是协作式的，落盘队列里可能还有 append；不等就删文件，
+            // 队列里的写会把转录重新创建出来（删了又复活）。
+            for (const deadline = Date.now() + 5000; live.running && Date.now() < deadline; ) await new Promise((r) => setTimeout(r, 10));
             live.session.jobs.killAll();
             for (const [id, pending] of live.pending) {
               clearTimeout(pending.timer);
               pending.resolve("deny");
               live.pending.delete(id);
             }
+            await live.session.flushPersist().catch(() => {});
             sessions.delete(body.id);
             if (activeId === body.id) activeId = sessions.keys().next().value!;
           }
           // 历史会话（只存在于磁盘）也要能删，否则重启后又会冒出来。
-          const removed = await sessionStore.remove(body.id);
+          const removed = await storeOf(body.id).remove(body.id);
           if (!live && !removed) return json(res, 404, { error: "会话不存在" });
-          // 删掉的若是最后一个活动会话，界面不能停在"没有会话"的状态：
-          // 直接开一个新的空会话，用户视角就是"删完自动给你一个新的"。
+          // 删掉最后一个活动会话后自动补一个空的，界面不会停在"没有会话"。
           if (sessions.size === 0 && opts.makeSession) {
             const fresh = await opts.makeSession(undefined);
             await fresh.init();
@@ -669,6 +691,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         if (body.sandboxMode !== undefined && !SANDBOX_MODES.has(body.sandboxMode)) {
           return json(res, 400, { error: "unknown sandbox mode: " + body.sandboxMode });
         }
+        // 空串 = "用端点默认"，是合法输入；其余必须是已知档位。
+        const effortInput = body.reasoningEffort as string | undefined;
+        if (effortInput && !REASONING_EFFORTS.has(effortInput)) return json(res, 400, { error: "unknown reasoning effort: " + effortInput });
 
         // Fail before writing anything: a saved config with no usable key would
         // brick the next start.
@@ -696,13 +721,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
 
         let swapError: string | null = null;
-        if (opts.buildProvider && (body.provider || body.model || body.baseUrl || body.apiKey !== undefined)) {
+        if (opts.buildProvider && (body.provider || body.model || body.baseUrl || body.reasoningEffort !== undefined || body.apiKey !== undefined)) {
           try {
             const built = opts.buildProvider({
               provider: body.provider ?? h0.session.provider.id,
               model: body.model ?? h0.session.model,
               baseUrl: body.baseUrl,
               apiKeyEnv: body.apiKeyEnv,
+              reasoningEffort: body.reasoningEffort ?? readAppConfig({ workspaceRoot: h0.session.workspaceRoot }).behavior.reasoningEffort,
             });
             for (const h of sessions.values()) {
               // 只改同一工作区的会话（user scope 才是全局）：
@@ -1104,16 +1130,17 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       for (const h of sessions.values()) {
         h.abort?.abort();
         h.session.jobs.killAll();
-        // 未决审批的定时器必须在这里清掉：每个审批挂着一个 10 分钟的 Timeout，
-        // 不清理的话进程在 close() 之后还被这些句柄钉着（Ctrl+C 后要等十几秒才退）。
-        for (const [id, pending] of h.pending) {
-          clearTimeout(pending.timer);
-          pending.resolve("deny");
-          h.pending.delete(id);
-        }
+        // 未决审批各挂 10 分钟 Timeout，不清掉进程会被句柄钉住。
+        for (const [id, pending] of h.pending) { clearTimeout(pending.timer); pending.resolve("deny"); h.pending.delete(id); }
+      }
+      // 关窗口/ Ctrl+C 时进程马上要走：先等回合退出再排空落盘队列，
+      // 否则最后几条消息还在 append 队列里，进程已经没了（"关掉就少一轮"）。
+      await Promise.all([...sessions.values()].map(async (h) => {
+        for (const deadline = Date.now() + 3000; h.running && Date.now() < deadline; ) await new Promise((r) => setTimeout(r, 10));
+        await h.session.flushPersist().catch(() => {});
         h.running = false;
         h.abort = null;
-      }
+      }));
       for (const res of clients) {
         try {
           res.end();
@@ -1122,10 +1149,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
       }
       clients.clear();
-      // 插件宿主是独立子进程：服务端关闭时必须一起收掉，否则会残留孤儿进程
+      // 插件宿主是独立子进程，关闭时必须一起收掉，否则残留孤儿进程
       for (const root of workspacePlugins.keys()) shutdownHosts(root);
-      // SSE / keep-alive 连接会把 close 回调拖住几秒：先掐空闲连接，
-      // 再给一个 1s 兜底，别让"退出"变成"等一会儿"。
+      // SSE / keep-alive 会把 close 拖住几秒：先掐空闲连接，再给 1s 兜底。
       server.closeIdleConnections?.();
       const timer = setTimeout(() => server.closeAllConnections?.(), 1000);
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1169,6 +1195,5 @@ async function readWorkspaceFile(root: string, rel: string) {
     truncated: false,
   };
 }
-
 
 export type { HarnessEvent };

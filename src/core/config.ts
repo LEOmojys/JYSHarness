@@ -17,10 +17,11 @@ import { validateHooks, type HookDefinition, type HookEvent } from "../hooks/hoo
 import { CONFIG_DIR, LEGACY_CONFIG_DIR, configHome } from "./configStore.ts";
 
 /**
- * 推理强度。DeepSeek 兼容端点接受 none/minimal/low/medium/high/xhigh/ultra/max，
- * 实测 `max` 的思维链明显长于 high，而"不传"往往比 high 还长 —— 想省 token 就显式设 low。
+ * 推理强度（定义在 configStore，UI 与持久化共用同一套取值）。
+ * 端点接受 none/minimal/low/medium/high/xhigh/ultra/max。
  */
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
+export type { ReasoningEffort } from "./configStore.ts";
+import type { ReasoningEffort } from "./configStore.ts";
 
 export interface HarnessSettings {
   provider?: "openai" | "anthropic" | "mock";

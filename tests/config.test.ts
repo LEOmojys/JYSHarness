@@ -1,8 +1,11 @@
+
+
 import { test } from "node:test";
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { Session } from "../src/core/session.ts";
 import { MockProvider } from "../src/providers/mock.ts";
@@ -10,6 +13,7 @@ import { emptyRuleSet } from "../src/permissions/rules.ts";
 import { Logger } from "../src/util/log.ts";
 import { startServer } from "../src/server/app.ts";
 import {
+
   describeConfig,
   maskKey,
   readAppConfig,
@@ -325,4 +329,14 @@ test("window: persisted in settings and pushed to live sessions", async () => {
       await server.close();
     }
   });
+});
+
+test("config: reasoning effort round-trips and can be cleared", async () => {
+  const { saveAppConfig, readAppConfig } = await import("../src/core/configStore.ts");
+  const ws = mkdtempSync(path.join(os.tmpdir(), "jys-effort-"));
+  saveAppConfig(ws, { scope: "workspace", reasoningEffort: "max" });
+  assert.equal(readAppConfig({ workspaceRoot: ws }).behavior.reasoningEffort, "max");
+  // 空串 = 回到"端点默认"，读回来应当是 undefined 而不是一个空档位
+  saveAppConfig(ws, { scope: "workspace", reasoningEffort: "" });
+  assert.equal(readAppConfig({ workspaceRoot: ws }).behavior.reasoningEffort, undefined);
 });

@@ -67,7 +67,7 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
   };
 
   // Hot reload: the settings UI can swap the model or MCP servers without a restart.
-  const buildProvider = (cfg: { provider: string; model: string; baseUrl?: string; apiKeyEnv?: string }) => {
+  const buildProvider = (cfg: { provider: string; model: string; baseUrl?: string; apiKeyEnv?: string; reasoningEffort?: string }) => {
     const settings: HarnessSettings = {
       ...runtime.settings,
       provider: cfg.provider as HarnessSettings["provider"],
@@ -76,6 +76,8 @@ export async function runServe(argv: string[], desktop: boolean): Promise<void> 
       // 另一个厂商的默认地址（deepseek 的配置被当成 openai）。
       baseUrl: cfg.baseUrl ?? runtime.settings.baseUrl,
       apiKeyEnv: cfg.apiKeyEnv ?? runtime.settings.apiKeyEnv,
+      // 空串 = 用户选择"默认"，必须真的清掉，不能回落到运行时旧值
+      reasoningEffort: (cfg.reasoningEffort === "" ? undefined : (cfg.reasoningEffort ?? runtime.settings.reasoningEffort)) as HarnessSettings["reasoningEffort"],
     };
     const resolved = createProvider({ settings, providerName: cfg.provider, model: cfg.model });
     return { provider: resolved.provider, model: resolved.model, note: resolved.note };

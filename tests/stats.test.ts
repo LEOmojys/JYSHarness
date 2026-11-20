@@ -88,3 +88,52 @@ test("timing: context breakdown splits system, tools and messages", async () => 
   assert.equal(c.used, c.system + c.tools + c.messages);
   assert.ok(c.max > 0, "context window known");
 });
+
+test("stats: resuming a session rebuilds counters from assistant usage", async () => {
+  const { statsFromMessages } = await import("../src/core/stats.ts");
+  const rebuilt = statsFromMessages([
+    { role: "user", content: [{ type: "text", text: "go" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "reading" },
+        { type: "tool_use", id: "t1", name: "Read", input: { file_path: "a" } },
+      ],
+      stopReason: "tool_use",
+      usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 900, cacheCreationTokens: 0 },
+    } as never,
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 120, outputTokens: 30, cacheReadTokens: 1000, cacheCreationTokens: 5 },
+    } as never,
+  ]);
+  assert.equal(rebuilt.turns, 2);
+  assert.equal(rebuilt.toolCalls, 1);
+  assert.equal(rebuilt.steps, 1);
+  assert.equal(rebuilt.inputTokens, 220);
+  assert.equal(rebuilt.outputTokens, 50);
+  assert.equal(rebuilt.cacheReadTokens, 1900);
+  assert.equal(rebuilt.cacheCreationTokens, 5);
+});
+
+
+test("stats: tool execution time is accumulated, not left at zero", async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), "jys-toolms-"));
+  const session = new Session({
+    workspaceRoot: ws,
+    settings: { permissionMode: "bypassPermissions", sandboxMode: "danger-full-access", maxTurns: 3 },
+    rules: emptyRuleSet(),
+    provider: new MockProvider([
+      { text: "sleep", toolCalls: [{ name: "Bash", input: { command: "Start-Sleep -Milliseconds 250" } }] },
+      { text: "done", stopReason: "end_turn" },
+    ]),
+    model: "mock-1",
+    logger,
+    approve: async () => "allow",
+  });
+  await session.init();
+  for await (const _ of session.send("go", new AbortController().signal)) { /* drain */ }
+  assert.ok((session.stats.toolMs ?? 0) >= 150, "toolMs should reflect real tool time: " + session.stats.toolMs);
+});

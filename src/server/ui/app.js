@@ -3,6 +3,8 @@ const $ = (id) => document.getElementById(id);
 
 let state = null;
 let liveText = null;
+let liveSessionId = ""; // liveText 属于哪个会话，切换时不能接到别的会话上
+let liveUsageSeen = { input: 0, output: 0, read: 0, create: 0 }; // usage 是本回合累计，用差值累加
 let activePanel = "files";
 let filesPath = "";
 let fileEntries = [];
@@ -134,7 +136,10 @@ function confirmDeleteSession(session) {
 }
 
 async function switchSession(id) {
+  if (!state) return;
   if (id === state.sessionId) return;
+  // 待发送的图片属于当前会话的草稿，切走就丢弃，避免串到别的会话里发出去。
+  pendingImages = [];
   const res = await fetch("/api/sessions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -149,12 +154,19 @@ async function switchSession(id) {
 }
 
 async function newSession(fork) {
+  pendingImages = [];
   const res = await fetch("/api/sessions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ action: fork ? "fork" : "new" }),
   });
-  if (res.ok) renderState(await res.json());
+  if (!res.ok) {
+    // 以前失败是静默的：点"新建"没反应，用户只能反复点。
+    const err = await res.json().catch(() => ({}));
+    notice("新建会话失败：" + (err.error || res.status));
+    return;
+  }
+  renderState(await res.json());
 }
 
 /* ---------------- sidebar panels ---------------- */
@@ -392,64 +404,8 @@ function noticeLine(text, level) {
   return n;
 }
 
-function renderMessages(messages) {
-  const results = new Map();
-  for (const m of messages) for (const b of m.content || []) if (b.type === "tool_result") results.set(b.tool_use_id, b);
-  const frag = document.createDocumentFragment();
-  for (const m of messages) {
-    const blocks = m.content || [];
-    const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("");
-    if (m.role === "user") {
-      if (!text.trim()) continue;
-      if (m.isMeta) { frag.appendChild(noticeLine(text.trim(), "info")); continue; }
-      const node = el("div", "msg user");
-      const head = el("div", "msg-head");
-      head.appendChild(el("div", "avatar user", "U"));
-      head.appendChild(el("span", "msg-role", "你"));
-      node.appendChild(head);
-      const body = el("div", "msg-body");
-      const imgs = blocks.filter((b) => b.type === "image");
-      if (imgs.length) {
-        const row = el("div", "msg-images");
-        for (const img of imgs) {
-          const im = el("img", "msg-img");
-          im.src = "data:" + img.mediaType + ";base64," + img.data;
-          im.alt = img.name || "attached image";
-          row.appendChild(im);
-        }
-        body.appendChild(row);
-      }
-      if (text.trim()) body.appendChild(document.createTextNode(text));
-      node.appendChild(body);
-      frag.appendChild(node);
-      continue;
-    }
-    const thinking = blocks.filter((b) => b.type === "thinking").map((b) => b.text).join("");
-    if (text.trim() || thinking.trim()) {
-      const node = el("div", "msg assistant");
-      const head = el("div", "msg-head");
-      head.appendChild(el("div", "avatar assistant", "A"));
-      head.appendChild(el("span", "msg-role", "助手"));
-      node.appendChild(head);
-      // 推理过程：默认折叠；只有推理没有正文时也保留这条消息（否则转录里会"消失一轮"）
-      if (thinking.trim()) {
-        const box = el("details", "thinking");
-        box.appendChild(el("summary", "thinking-head", "思考过程（" + thinking.length + " 字）"));
-        box.appendChild(el("div", "thinking-body", thinking));
-        node.appendChild(box);
-      }
-      const body = el("div", "msg-body md");
-      body.innerHTML = text.trim() ? md(text) : "（本轮只有推理，没有正文）";
-      node.appendChild(body);
-      frag.appendChild(node);
-    }
-    for (const b of blocks) {
-      if (b.type !== "tool_use") continue;
-      frag.appendChild(toolCard(b.name, b.input, results.get(b.id), undefined, b.id, changesFor(b.id)));
-    }
-  }
-  return frag;
-}
+// 长会话一次渲染几百条消息、每条都做 markdown 解析，会把主线程卡住（切会话/重连时最明显）。
+// 只渲染最近 RENDER_LIMIT 条，并提示被折叠的数量。
 
 function emptyState() {
   const wrap = el("div", "empty");
@@ -552,8 +508,12 @@ function renderState(next) {
   // 重建 transcript 会把流式节点一起扔掉：先记住已收到的内容，重建后如果这一轮
   // 还在跑就把 live 节点接回去。否则后续 text_delta 会写进已经脱离文档的节点，
   // 界面上的回答看起来"消失"了，直到 turn_end 才整段跳出来。
-  const streaming = liveText ? { text: liveText.text, thinking: liveText.thinkingText } : null;
+  // 只有"这一轮的 live 内容确实属于当前会话"时才接回去：
+  // 否则切到别的会话会把上一个会话正在输出的文字接过来（串台）。
+  const sameSession = Boolean(liveSessionId) && liveSessionId === next.sessionId;
+  const streaming = liveText && sameSession ? { text: liveText.text, thinking: liveText.thinkingText } : null;
   liveText = null;
+  liveSessionId = next.sessionId;
   t.innerHTML = "";
   t.appendChild(next.messages.length ? renderMessages(next.messages) : emptyState());
   if (next.running && streaming) {
@@ -613,6 +573,7 @@ function liveAssistant() {
   if (empty) empty.remove();
   t.appendChild(node);
   liveText = { node, body, text: "", thinking: null, thinkingText: "" };
+  liveSessionId = state ? state.sessionId : "";
   // 注意：live 节点在 stream 期间存在，state 重渲染后由 renderMessages 重新生成
   void 0;
   return liveText;
@@ -641,6 +602,33 @@ function selForTool(id) {
   return "[data-tool-id=" + JSON.stringify(String(id)) + "]";
 }
 
+// 流式增量必须节流：模型一次回复可能有上万个 delta，思考过程甚至十几万字符。
+// 每个 delta 都把累计文本整段写回 DOM 是 O(n²)，主线程会被拖死（表现为"卡死无响应"）。
+// 这里只累积字符串，用一次 rAF 把当前 live 节点的文本刷新一次。
+let deltaFlushQueued = false;
+function scheduleDeltaFlush() {
+  if (deltaFlushQueued) return;
+  deltaFlushQueued = true;
+  const run = () => {
+    deltaFlushQueued = false;
+    const live = liveText;
+    if (!live) return;
+    if (live.dirtyText) {
+      live.dirtyText = false;
+      live.body.textContent = live.text;
+    }
+    if (live.dirtyThinking && live.thinking) {
+      live.dirtyThinking = false;
+      live.thinking.pre.textContent = live.thinkingText;
+      live.thinking.summary.textContent = "思考过程（" + live.thinkingText.length + " 字）";
+    }
+    // 每帧只读一次滚动位置（读 scrollHeight 会强制 reflow）
+    if (live.followBottom !== false && atBottom()) scrollToBottom();
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+  else setTimeout(run, 60);
+}
+
 function handleEvent(ev) {
   const sid = ev.sessionId || (ev.state && ev.state.sessionId);
   // 审批事件必须跨会话显示：它对应一个正在阻塞的工具调用。
@@ -660,24 +648,22 @@ function handleEvent(ev) {
       liveText = null;
       break;
     case "thinking_delta": {
-      const keep = atBottom();
       const live = liveAssistant();
-      const block = thinkingBlock(live);
+      thinkingBlock(live);
       live.thinkingText += ev.text;
-      block.pre.textContent = live.thinkingText;
-      block.summary.textContent = "思考过程（" + live.thinkingText.length + " 字）";
-      if (keep) scrollToBottom();
+      live.dirtyThinking = true;
+      scheduleDeltaFlush();
       break;
     }
     case "text_delta": {
-      const keep = atBottom();
       const live = liveAssistant();
       live.text += ev.text;
-      live.body.textContent = live.text;
-      if (keep) scrollToBottom();
+      live.dirtyText = true;
+      scheduleDeltaFlush();
       break;
     }
     case "assistant_message":
+      if (state && state.stats) state.stats.turns = (state.stats.turns || 0) + 1; // 实时涨；turn_end 会被权威值覆盖
       if (liveText) {
         if (liveText.text.trim()) liveText.body.innerHTML = md(liveText.text);
         // 光有思考没有正文时，保留折叠块并标记"（无正文）"，而不是留一条空白气泡
@@ -748,6 +734,26 @@ function handleEvent(ev) {
         $("transcript").appendChild(noticeLine("已停止：" + reasonLabel(ev.reason) + (ev.error ? " — " + ev.error : ""), "warn"));
       }
       break;
+    case "usage": {
+      // 运行中就更新用量（以前只在 turn_end 刷一次）。      if (!state || !state.stats) break;
+      const st = state.stats;
+      const now = [ev.totalInput || 0, ev.totalOutput || 0, ev.cacheRead || 0, ev.cacheCreation || 0];
+      const prev = [liveUsageSeen.input, liveUsageSeen.output, liveUsageSeen.read, liveUsageSeen.create];
+      const keys = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"];
+      for (let i = 0; i < 4; i++) st[keys[i]] = (st[keys[i]] || 0) + Math.max(0, now[i] - prev[i]);
+      liveUsageSeen = { input: now[0], output: now[1], read: now[2], create: now[3] };
+      if (state.cost) Object.assign(state.cost, { cacheReadTokens: st.cacheReadTokens, cacheCreationTokens: st.cacheCreationTokens });
+      renderStatsChip(state);
+      break;
+    }
+    case "timing": {
+      // 模型/工具用时、TTFT、步数：每轮结束推一次，同样即时反映。
+      if (!state || !state.stats) break;
+      Object.assign(state.stats, { modelMs: ev.modelMs, toolMs: ev.toolMs, ttftAvgMs: ev.ttftAvgMs, steps: ev.steps });
+      if (state.cost) state.cost.tps = state.stats.modelMs > 0 ? Math.round((state.stats.outputTokens || 0) / (state.stats.modelMs / 1000)) : 0;
+      renderStatsChip(state);
+      break;
+    }
     case "turn_end":
       liveText = null;
       $("stopBtn").classList.add("hidden");
@@ -1553,9 +1559,9 @@ function renderStatsPop(state) {
   const st = state.stats || {};
   pop.innerHTML =
     "<h5><span>会话统计</span><span>" + (st.turns || 0) + " 轮 " + (st.steps || 0) + " 步</span></h5>" +
-    "<div class=\"stats-row\"><span>模型用时</span><b>" + dur(st.modelMs) + "</b></div>" +
-    "<div class=\"stats-row\"><span>工具调用用时</span><b>" + dur(st.toolMs) + "</b></div>" +
-    "<div class=\"stats-row\"><span>首 token 平均（TTFT）</span><b>" + dur(st.ttftAvgMs) + "</b></div>" +
+    "<div class=\"stats-row\"><span>模型用时</span><b>" + (st.restored ? "—" : dur(st.modelMs)) + "</b></div>" +
+    "<div class=\"stats-row\"><span>工具调用用时</span><b>" + (st.restored ? "—" : dur(st.toolMs)) + "</b></div>" +
+    "<div class=\"stats-row\"><span>首 token 平均（TTFT）</span><b>" + (st.restored ? "—" : dur(st.ttftAvgMs)) + "</b></div>" +
     "<div class=\"stats-row\"><span>输出速度（TPS）</span><b>" + (k.tps || 0) + " tok/s</b></div>" +
     "<div class=\"stats-sep\"></div>" +
     "<h5><span>Token 用量</span><span>" + fmt(total) + " tok</span></h5>" +

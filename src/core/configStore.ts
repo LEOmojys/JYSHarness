@@ -34,12 +34,17 @@ export function inferContextWindow(model: string): number {
   return 128_000;
 }
 
+/** 推理强度。DeepSeek 兼容端点接受 none/minimal/low/medium/high/xhigh/ultra/max。 */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
+
 export interface BehaviorConfig {
   permissionMode: string;
   sandboxMode: string;
   maxTurns: number;
   maxTokens: number;
   temperature: number;
+  /** 推理强度（留空 = 用端点默认）。 */
+  reasoningEffort?: ReasoningEffort;
   /** 主模型不可用时切过去的模型（空 = 不切换）。 */
   fallbackModel?: string;
   /** 子 Agent 用的模型（空 = 跟随主模型）。 */
@@ -77,6 +82,8 @@ export interface ConfigPatch {
   maxTurns?: number;
   maxTokens?: number;
   temperature?: number;
+  /** 空串表示"用端点默认"（清除已保存的档位）。 */
+  reasoningEffort?: ReasoningEffort | "";
   fallbackModel?: string;
   subagentMaxTurns?: number;
   subagentModel?: string;
@@ -280,6 +287,10 @@ export function readAppConfig(opts: ReadConfigOptions): AppConfig {
       maxTurns: Number(merged.maxTurns ?? 60),
       maxTokens: Number(merged.maxTokens ?? 8192),
       temperature: Number(merged.temperature ?? 0.2),
+      reasoningEffort:
+        typeof merged.reasoningEffort === "string" && merged.reasoningEffort
+          ? (merged.reasoningEffort as ReasoningEffort)
+          : undefined,
       fallbackModel: typeof merged.fallbackModel === "string" ? merged.fallbackModel : undefined,
       subagentModel: typeof merged.subagentModel === "string" ? merged.subagentModel : undefined,
       enableSubagent: merged.enableSubagent !== false,
@@ -309,6 +320,7 @@ export function saveAppConfig(workspaceRoot: string, patch: ConfigPatch): AppCon
   if (patch.maxTurns !== undefined) current.maxTurns = patch.maxTurns;
   if (patch.maxTokens !== undefined) current.maxTokens = patch.maxTokens;
   if (patch.temperature !== undefined) current.temperature = patch.temperature;
+  if (patch.reasoningEffort !== undefined) current.reasoningEffort = patch.reasoningEffort;
   if (patch.fallbackModel !== undefined) current.fallbackModel = patch.fallbackModel;
   if (patch.enableSubagent !== undefined) current.enableSubagent = patch.enableSubagent;
 

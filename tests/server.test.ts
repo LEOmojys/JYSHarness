@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Session } from "../src/core/session.ts";
@@ -290,6 +290,208 @@ test("server: rejects cross-origin mutations", async () => {
     assert.equal(res.status, 403);
   } finally {
     await h.stop();
+  }
+});
+
+test("server: deleting a running session leaves no transcript behind", async () => {
+  const root = await tempWorkspace();
+  // 一轮里持续产出增量，制造"删除时回合仍在跑"的窗口
+  const slow = {
+    id: "mock",
+    model: "mock-1",
+    async *stream() {
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        yield { type: "text_delta", text: "x" };
+      }
+      yield {
+        type: "done",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "end_turn" },
+      };
+    },
+  };
+  const session = new Session({
+    workspaceRoot: root,
+    settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 4 },
+    rules: emptyRuleSet(),
+    provider: slow as never,
+    model: "mock-1",
+    logger,
+    approve: async () => "allow",
+  });
+  await session.init();
+  const server = await startServer({
+    session,
+    logger,
+    makeSession: async (workspaceRoot?: string) =>
+      new Session({
+        workspaceRoot: workspaceRoot ?? root,
+        settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 4 },
+        rules: emptyRuleSet(),
+        provider: new MockProvider([]),
+        model: "mock-1",
+        logger,
+        approve: async () => "deny",
+      }),
+    port: 0,
+    providerId: "mock",
+    autoApprove: true,
+  });
+  try {
+    const base = server.url;
+    const other = await (
+      await fetch(base + "api/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "new" }),
+      })
+    ).json();
+    assert.ok(other.sessionId);
+
+    // 让活动会话开始跑，然后在回合进行中删除它
+    await fetch(base + "api/message", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "go", session: session.sessionId }),
+    }).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 60));
+
+    const removed = await (
+      await fetch(base + "api/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "delete", id: session.sessionId }),
+      })
+    ).json();
+    assert.equal(removed.sessions.some((x: any) => x.id === session.sessionId), false);
+
+    // 关键断言：等过落盘队列可能完成的时间窗，文件不能"复活"
+    await new Promise((r) => setTimeout(r, 400));
+    const still = await (
+      await fetch(base + "api/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "activate", id: session.sessionId }),
+      })
+    ).json();
+    assert.ok(still.error, "deleted session must not be reloadable from disk");
+  } finally {
+    await server.close();
+  }
+});
+
+test("server: closing while a turn runs flushes the transcript to disk", async () => {
+  const root = await tempWorkspace();
+  const slow = {
+    id: "mock",
+    model: "mock-1",
+    async *stream() {
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        yield { type: "text_delta", text: "x" };
+      }
+      yield { type: "done", message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "end_turn" } };
+    },
+  };
+  const session = new Session({
+    workspaceRoot: root,
+    settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 4 },
+    rules: emptyRuleSet(),
+    provider: slow as never,
+    model: "mock-1",
+    logger,
+    approve: async () => "allow",
+  });
+  await session.init();
+  const server = await startServer({ session, logger, port: 0, providerId: "mock", autoApprove: true });
+
+  // 回合开始但不等它跑完
+  void fetch(server.url + "api/message", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "hello", session: session.sessionId }),
+  }).catch(() => undefined);
+  await new Promise((r) => setTimeout(r, 150));
+
+  await server.close();
+
+  const dir = path.join(root, ".harness", "sessions");
+  const files = await readdir(dir);
+  const target = files.find((f: string) => f.startsWith(session.sessionId));
+  assert.ok(target, "transcript file exists after close");
+  const raw = await readFile(path.join(dir, target), "utf8");
+  assert.match(raw, /hello/, "the user message reached disk");
+  assert.ok(raw.length > 0, "transcript is not empty");
+});
+
+test("server: sessions from another workspace can be opened and deleted", async () => {
+  // 复现：列表来自"当前会话的 store"，而切换/删除曾用"启动时那个 store"——
+  // 切到别的 workspace 后，历史会话显示得出来，点开却 no such session、也删不掉。
+  const rootA = await tempWorkspace();
+  const rootB = await tempWorkspace();
+  const mk = (root: string, turns: MockTurn[]) =>
+    new Session({
+      workspaceRoot: root,
+      settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 4 },
+      rules: emptyRuleSet(),
+      provider: new MockProvider(turns),
+      model: "mock-1",
+      logger,
+      approve: async () => "deny",
+    });
+
+  const a = await mk(rootA, []);
+  await a.init();
+  // B 里先写一个"历史遗留"会话（只在磁盘上）
+  const legacy = await mk(rootB, []);
+  await legacy.init();
+  await legacy.store.append(legacy.sessionId, { role: "user", content: [{ type: "text", text: "旧会话" }] });
+
+  const server = await startServer({
+    session: a,
+    logger,
+    makeSession: async (workspaceRoot?: string, resume?: { sessionId: string; resumeMessages: any[] }) => {
+      const s = new Session({
+        workspaceRoot: workspaceRoot ?? rootA,
+        sessionId: resume?.sessionId,
+        resumeMessages: resume?.resumeMessages,
+        settings: { permissionMode: "default", sandboxMode: "workspace-write", maxTurns: 4 },
+        rules: emptyRuleSet(),
+        provider: new MockProvider([]),
+        model: "mock-1",
+        logger,
+        approve: async () => "deny",
+      });
+      return s;
+    },
+    port: 0,
+    providerId: "mock",
+    autoApprove: true,
+  });
+  try {
+    const base = server.url;
+    const post = (body: object) =>
+      fetch(base + "api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    // 真的切到 B 工作区（new 只会沿用当前 workspace，切不过去）
+    const switched = await (
+      await fetch(base + "api/workspace", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: rootB }),
+      })
+    ).json();
+    assert.ok(switched.workspace, "workspace switched");
+
+    const opened = await (await post({ action: "activate", id: legacy.sessionId })).json();
+    assert.equal(opened.error, undefined, "legacy session in the other workspace must open: " + JSON.stringify(opened));
+    assert.equal(opened.sessionId, legacy.sessionId);
+
+    const removed = await (await post({ action: "delete", id: legacy.sessionId })).json();
+    assert.equal(removed.error, undefined, "and must be deletable: " + JSON.stringify(removed));
+    assert.equal(removed.sessions.some((x: any) => x.id === legacy.sessionId), false);
+  } finally {
+    await server.close();
   }
 });
 

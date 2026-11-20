@@ -139,6 +139,22 @@ function renderSettings(cfg) {
   behavior.appendChild(field("最大轮次", input("cfgMaxTurns", cfg.behavior.maxTurns, "number")));
   behavior.appendChild(field("单次输出上限", input("cfgMaxTokens", cfg.behavior.maxTokens, "number")));
   behavior.appendChild(field("temperature", input("cfgTemp", cfg.behavior.temperature, "number")));
+
+  // 推理强度：只对支持 reasoning_effort 的推理模型有意义（DeepSeek 等），留空用端点默认。
+  const effortSel = el("select");
+  effortSel.id = "cfgEffort";
+  for (const [v, l] of [
+    ["", "默认（端点决定）"],
+    ["low", "low｜最快最省"],
+    ["high", "high"],
+    ["max", "max｜最慢最贵，但长任务更少试错"],
+  ]) {
+    const o = el("option", "", l);
+    o.value = v;
+    effortSel.appendChild(o);
+  }
+  effortSel.value = cfg.behavior.reasoningEffort || "";
+  behavior.appendChild(field("推理强度", effortSel));
   const fbInput = input("cfgFallback", cfg.behavior.fallbackModel || "", "text");
   fbInput.placeholder = "主模型不可用时切换到（留空=不启用）";
   behavior.appendChild(field("备用模型", fbInput));
@@ -255,6 +271,7 @@ function collectSettings() {
     maxTurns: Number($("cfgMaxTurns").value),
     maxTokens: Number($("cfgMaxTokens").value),
     temperature: Number($("cfgTemp").value),
+    reasoningEffort: $("cfgEffort") ? $("cfgEffort").value : "",
     fallbackModel: ($("cfgFallback") && $("cfgFallback").value.trim()) || "",
     contextWindow: Number($("cfgWindow").value) || 0,
     enableSubagent: $("cfgSubagent").checked,
