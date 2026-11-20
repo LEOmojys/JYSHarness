@@ -496,8 +496,7 @@ function renderState(next) {
       next.cost.cacheReadTokens + " / 写 " + next.cost.cacheCreationTokens + "）";
     $("costLabel").textContent += " · 缓存 " + (next.cost.cacheHitRate * 100).toFixed(0) + "%";
   }
-  renderSessions();
-  renderPanel();
+  renderSessions(); renderPanel();
   // 首次启动且没有模型凭据时，直接把设置面板弹出来。
   if (next.provider === "unconfigured" && !window.__askedForKey) {
     window.__askedForKey = true;
@@ -510,6 +509,7 @@ function renderState(next) {
   // 界面上的回答看起来"消失"了，直到 turn_end 才整段跳出来。
   // 只有"这一轮的 live 内容确实属于当前会话"时才接回去：
   // 否则切到别的会话会把上一个会话正在输出的文字接过来（串台）。
+  if (liveSessionId && liveSessionId !== next.sessionId) resetTurnWindow();
   const sameSession = Boolean(liveSessionId) && liveSessionId === next.sessionId;
   const streaming = liveText && sameSession ? { text: liveText.text, thinking: liveText.thinkingText } : null;
   liveText = null;
@@ -571,7 +571,7 @@ function liveAssistant() {
   const t = $("transcript");
   const empty = t.querySelector(".empty");
   if (empty) empty.remove();
-  t.appendChild(node);
+  mountLiveIntoCurrentTurn(node);
   liveText = { node, body, text: "", thinking: null, thinkingText: "" };
   liveSessionId = state ? state.sessionId : "";
   // 注意：live 节点在 stream 期间存在，state 重渲染后由 renderMessages 重新生成

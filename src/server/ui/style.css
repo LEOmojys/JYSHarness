@@ -400,3 +400,20 @@ select { background: var(--panel-2); color: var(--text); border: 1px solid var(-
 .plugin-slot-title { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .plugin-slot-body { font-size: 12px; color: var(--fg); line-height: 1.6; }
 
+
+/* ---- 轮次分组：中间过程可折叠，最终回答常显 ---- */
+.turn { margin-bottom: 22px; }
+.turn-process { margin: 2px 0 10px 28px; border-left: 2px solid var(--border); padding-left: 10px; }
+.turn-process-head { cursor: pointer; font-size: 11px; color: var(--muted); user-select: none; list-style: none; padding: 2px 0; }
+.turn-process-head::-webkit-details-marker { display: none; }
+.turn-process-head::before { content: "▸ "; }
+.turn-process[open] > .turn-process-head::before { content: "▾ "; }
+.turn-process-body { margin-top: 6px; }
+.turn-process-body .thinking { margin-left: 0; }
+.turn-process-body .process-text { padding-left: 0; color: var(--muted); font-size: 12.5px; }
+.turn-process-body .tool-card { margin: 6px 0; }
+.turn-process-body > .msg-body { padding-left: 0; }
+.msg.assistant.final .msg-body { padding-left: 28px; }
+
+.load-earlier-row { display: flex; justify-content: center; margin: 10px 0 14px; }
+.load-earlier { cursor: pointer; }
