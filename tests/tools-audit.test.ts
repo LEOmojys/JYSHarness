@@ -69,6 +69,25 @@ test("glob: relative pattern resolves against the session cwd", async () => {
   assert.ok(!/lines\.txt/.test(r.content), "non-matching file excluded");
 });
 
+test("Edit matches LF snippets in CRLF files and preserves the file EOL", async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), "jys-edit-crlf-"));
+  const file = path.join(ws, "config.py");
+  writeFileSync(file, "first\r\nold_value = 1\r\nlast\r\n", "utf8");
+  const result = await tool("Edit").call({ file_path: "config.py", old_string: "old_value = 1\n", new_string: "new_value = 2\n" }, makeCtx(ws));
+  assert.equal(result.isError, undefined, result.content);
+  const content = await (await import("node:fs/promises")).readFile(file, "utf8");
+  assert.equal(content, "first\r\nnew_value = 2\r\nlast\r\n");
+});
+
+test("Edit miss reports the closest line so the model need not re-read the file", async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), "jys-edit-hint-"));
+  writeFileSync(path.join(ws, "mod.py"), "alpha = 1\nbeta_value = 2\ngamma = 3\n", "utf8");
+  const result = await tool("Edit").call({ file_path: "mod.py", old_string: "beta_value = 9", new_string: "beta_value = 4" }, makeCtx(ws));
+  assert.equal(result.isError, true);
+  assert.match(result.content, /Closest line 2/);
+  assert.match(result.content, /beta_value = 2/);
+});
+
 test("bash: timeout honoured via both timeout and timeout_ms", async () => {
   const ws = workspace();
   const started = Date.now();

@@ -10,6 +10,9 @@
  *   4. execute tools (parallel read batches, serial write batches)
  *   5. stop hooks, then either continue or terminate
  */
+import { checkObservation, collectWriteGroup, pushMetaNote, readCacheHit } from "./toolSchedule.ts";
+import { preflight, pruneResult, recordObservation, recordToolResult, timingEvent, toolFeedback } from "./toolSchedule.ts";
+import { createHash } from "node:crypto";
 import type { AssistantMessage, Message, ToolResultBlock, ToolUseBlock, Usage } from "./types.ts";
 import { toolResultMessage } from "./types.ts";
 import { gateCall, toResultBlock } from "./gate.ts";
@@ -125,12 +128,26 @@ interface LoopState {
   ttftTotal: number;
   ttftCount: number;
   steps: number;
+  /** 同一工具调用的连续相同结果，用于提示模型停止无效循环。 */
+  recentCallResults: Map<string, { fingerprint: string; count: number }>;
+  /** 验证命令族计数（git status/pytest 等），用于族级重复提示。 */
+  commandFamilies: Map<string, number>;
+  /** 每次写工具成功后递增；只读结果缓存以此判断"期间有没有文件变过"。 */
+  writeEpoch: number;
+  readOnlyCache: Map<string, { epoch: number; content: string; isError: boolean }>;
+  /** 连续多少个只读步骤没有产生任何写入。 */
+  readOnlyStreak: number;
+  readFiles: Map<string, { mtimeMs: number; size: number }>; // 已观察文件（先读后写）
+  familyChecks: Map<string, number>; testRuns: number; // 族级检查 / 测试计数
+  budgetNudgeSent: boolean;
 }
 
 const MAX_OUTPUT_RECOVERY = 3;
 const MAX_STOP_HOOK_DENIALS = 3;
 /** 单批只读工具的最大并行度。 */
-const MAX_PARALLEL_TOOLS = 6;
+const MAX_PARALLEL_TOOLS = 8;
+/** 不同文件的写操作可并行的上限（同文件永远串行）。 */
+const MAX_PARALLEL_WRITES = 4;
 const ESCALATED_MAX_TOKENS = 32_000;
 const MAX_TRANSIENT_RETRIES = 3;
 
@@ -160,20 +177,46 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
     ttftCount: 0,
     steps: 0,
     totalOutput: 0,
-  };
+    recentCallResults: new Map(),
+    commandFamilies: new Map(),
+    writeEpoch: 0,
+    readOnlyCache: new Map(),
+    readOnlyStreak: 0, readFiles: new Map(), familyChecks: new Map(), testRuns: 0,
+    budgetNudgeSent: false };
 
   while (true) {
     if (params.signal.aborted) {
       yield { type: "done", reason: "aborted", turns: state.turnCount };
       return "aborted";
     }
+    if (state.turnCount >= params.maxTurns) {
+      yield { type: "done", reason: "blocking_limit", turns: state.turnCount };
+      return "blocking_limit";
+    }
     state.turnCount++;
     state.countedThisTurn = false;
     yield { type: "turn_start", turn: state.turnCount };
 
-    if (state.turnCount > params.maxTurns) {
-      yield { type: "done", reason: "blocking_limit", turns: state.turnCount };
-      return "blocking_limit";
+    if (state.readOnlyStreak >= 3 && state.readOnlyStreak % 3 === 0) {
+      pushMetaNote(
+        state,
+        params.onState,
+        "You have spent " + state.readOnlyStreak + " consecutive steps only reading or checking. " +
+          "Stop inspecting: apply the change you already know is needed, then run the smallest relevant test once.",
+      );
+    }
+
+    // 预算耗尽前给一次收敛提示：合批、别重复验证、完成最小验证后收尾。
+    const nudgeAt = Math.max(1, Math.min(15, Math.ceil(params.maxTurns * 0.15)));
+    const remainingTurns = params.maxTurns - state.turnCount;
+    if (!state.budgetNudgeSent && remainingTurns === nudgeAt) {
+      state.budgetNudgeSent = true;
+      pushMetaNote(
+        state,
+        params.onState,
+        "Budget notice: " + remainingTurns + " model turns remain. Batch independent reads/searches into one turn, " +
+          "do not repeat unchanged commands or tests, finish the current edit, run the smallest relevant verification, then report the result.",
+      );
     }
 
     // ---------- 1. proactive compaction ----------
@@ -500,9 +543,9 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
     yield { type: "assistant_message", message: assistant };
 
     if (usage) {
-      state.lastInputTokens = usage.inputTokens;
-      // 真实输入 = 未命中 + 缓存读 + 缓存写；用它校正估算器。
+      // 真实输入 = 未命中 + 缓存读 + 缓存写。
       const actualInput = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheCreationTokens ?? 0);
+      state.lastInputTokens = actualInput;
       if (state.lastEstimate > 0) params.calibrator?.record(state.lastEstimate, actualInput);
       state.totalInput += usage.inputTokens;
       state.totalOutput += usage.outputTokens;
@@ -644,7 +687,8 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
     }
 
     const batches = partitionCalls(approved);
-    for (const batch of batches) {
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex]!;
       if (batch.concurrencySafe) {
         // 同一批里完全相同的只读调用只执行一次：模型经常一口气读同一份文件两遍，
         // 那是纯重复的 token 和 IO。判重键 = 工具名 + 稳定序列化的入参。
@@ -663,7 +707,7 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
         const outcomes = await mapWithLimit(
           unique,
           MAX_PARALLEL_TOOLS,
-          async (call) => ({ call, outcome: await timedExecute(call, params) }),
+          async (call) => ({ call, outcome: await timedExecute(call, params, state) }),
         );
         const byKey = new Map(outcomes.map((o) => [keyOf(o.call), o]));
 
@@ -687,14 +731,23 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
           };
         }
       } else {
-        for (const call of batch.calls) {
+        // 不同文件的写操作彼此独立：按目标路径分组并行，同文件仍保序。
+        const { calls: group, endIndex } = collectWriteGroup(
+          batches,
+          batchIndex,
+          params.toolContext.cwd,
+          MAX_PARALLEL_WRITES,
+        );
+        batchIndex = endIndex;
+        if (group.length === 1) {
+          const call = group[0]!;
           yield {
             type: "tool_start",
             id: call.request.id,
             name: call.request.name,
             input: call.request.input,
           };
-          const outcome = await timedExecute(call, params);
+          const outcome = await timedExecute(call, params, state);
           results.push(toResultBlock(call.request.id, call.request.name, outcome.result));
           yield {
             type: "tool_end",
@@ -703,10 +756,38 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
             result: outcome.result,
             durationMs: outcome.durationMs,
           };
+        } else {
+          for (const call of group) {
+            yield {
+              type: "tool_start",
+              id: call.request.id,
+              name: call.request.name,
+              input: call.request.input,
+            };
+          }
+          const outcomes = await mapWithLimit(
+            group,
+            MAX_PARALLEL_WRITES,
+            async (call) => ({ call, outcome: await timedExecute(call, params, state) }),
+          );
+          for (const { call, outcome } of outcomes) {
+            results.push(toResultBlock(call.request.id, call.request.name, outcome.result));
+            yield {
+              type: "tool_end",
+              id: call.request.id,
+              name: call.request.name,
+              result: outcome.result,
+              durationMs: outcome.durationMs,
+            };
+          }
         }
       }
     }
 
+    // 多轮"只看不改"是长任务里最典型的空转。
+    const wroteSomething = approved.some((call) => call.tool?.isReadOnly !== true);
+    state.readOnlyStreak = wroteSomething ? 0 : state.readOnlyStreak + 1;
+    state.steps += results.length;
     state.messages = [...state.messages, toolResultMessage(results)];
     try {
       params.onState?.(state.messages);
@@ -725,30 +806,20 @@ export async function* queryLoop(params: QueryParams): AsyncGenerator<HarnessEve
   }
 }
 
-/** 累计耗时快照：模型 / 工具 / 首 token 平均 / 步数。 */
-function timingEvent(state: LoopState): {
-  type: "timing";
-  modelMs: number;
-  toolMs: number;
-  ttftAvgMs: number | null;
-  steps: number;
-} {
-  return {
-    type: "timing",
-    modelMs: state.modelMs,
-    toolMs: state.toolMs,
-    ttftAvgMs: state.ttftCount ? Math.round(state.ttftTotal / state.ttftCount) : null,
-    steps: state.steps,
-  };
-}
-
 async function timedExecute(
   call: PreparedCall,
   params: QueryParams,
+  state: LoopState,
 ): Promise<{ result: ToolResult; durationMs: number }> {
   const started = Date.now();
-
-  // 熔断：同一个工具连续失败多次后先歇一会，把预算留给别的办法。
+  // 执行前三道闸：族级检查短路 → 先读后写 → 只读结果缓存（期间无写则结果不变）。
+  const gated = preflight(state, call);
+  if (gated) return { result: { content: gated }, durationMs: 0 };
+  const blocked = await checkObservation(state, call, params.toolContext.cwd);
+  if (blocked) return { result: { content: blocked, isError: true }, durationMs: 0 };
+  const cached = readCacheHit(state, call);
+  if (cached) return { result: { content: cached.content, isError: cached.isError }, durationMs: 0 };
+  // 熔断：同一个工具连续失败多次后先歇一会。
   const shorted = params.toolHealth?.check(call.request.name);
   if (shorted) {
     return {
@@ -793,7 +864,12 @@ async function timedExecute(
     if (failed.additionalContext) content += "\n\n[failure hook] " + failed.additionalContext;
   }
 
-  return { result: { ...result, content }, durationMs: Date.now() - started };
+  const feedback = toolFeedback(state, call, content, Boolean(result.isError));
+  if (feedback) content += feedback;
+  recordToolResult(state, call, result.content, Boolean(result.isError));
+  await recordObservation(state, call, params.toolContext.cwd);
+
+  return { result: { ...result, content: pruneResult(content) }, durationMs: Date.now() - started };
 }
 
 /**

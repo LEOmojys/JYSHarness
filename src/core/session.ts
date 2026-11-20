@@ -53,6 +53,7 @@ export interface SubagentOutcome {
   reason?: "unknown_type" | "cancelled" | "timeout" | "empty";
 }
 import { discoverSkillsWithWarnings, type SkillMeta } from "./skills.ts";
+import { visibleTools } from "./toolSchedule.ts";
 import { costBreakdown } from "./cost.ts";
 
 export interface SessionOptions {
@@ -247,7 +248,7 @@ export class Session {
     this.registry = buildDefaultRegistry({ enableSubagent: opts.enableSubagent !== false });
     this.fileSkills = discoverSkillsWithWarnings(this.workspaceRoot).skills;
     this.skills = this.fileSkills;
-    this.tools = this.registry.assemble();
+    this.tools = visibleTools(this.registry.assemble(), this.skills.length > 0 || this.pluginSkills.length > 0);
     this.stats = {
       turns: 0,
       inputTokens: 0,
@@ -284,7 +285,7 @@ export class Session {
   /** Register MCP tools; plugin tools stay in place across reloads. */
   setExtensionTools(tools: Tool[]): void {
     this.extensionTools = tools;
-    this.tools = this.registry.assemble([...this.pluginTools, ...tools]);
+    this.tools = visibleTools(this.registry.assemble([...this.pluginTools, ...tools]), this.skills.length > 0 || this.pluginSkills.length > 0);
     this.warnDroppedTools([...this.pluginTools, ...tools]);
     this.systemPrompt = this.buildPrompt();
   }
@@ -352,7 +353,7 @@ export class Session {
       }
     }
     this.hooks = hooks;
-    this.tools = this.registry.assemble([...this.pluginTools, ...this.extensionTools]);
+    this.tools = visibleTools(this.registry.assemble([...this.pluginTools, ...this.extensionTools]), this.skills.length > 0 || this.pluginSkills.length > 0);
     this.warnDroppedTools([...this.pluginTools, ...this.extensionTools]);
     this.systemPrompt = this.buildPrompt();
   }

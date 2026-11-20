@@ -58,7 +58,13 @@ export function createProvider(opts: {
     const configured = (opts.settings.baseUrl ?? "").trim();
     const baseUrl =
       configured || (name === "deepseek" ? "https://api.deepseek.com/v1" : "https://api.openai.com/v1");
-    const provider = new OpenAIProvider({ apiKey, baseUrl, model: model || "gpt-4.1", id: name });
+    const provider = new OpenAIProvider({
+      apiKey,
+      baseUrl,
+      model: model || "gpt-4.1",
+      id: name,
+      reasoningEffort: opts.settings.reasoningEffort,
+    });
     return { provider, model: provider.model, note: "openai-compatible " + baseUrl + " (key from " + keyInfo.from + ")" };
   }
 

@@ -43,6 +43,8 @@ for (const exitCode of [0, 1]) {
     const { dir, file, git } = fixture(t, true);
     const before = git("rev-parse", "HEAD");
     const model = new MockProvider([
+      // 先读后写：覆盖已存在的冲突文件前必须先读它
+      { toolCalls: [{ name: "Read", input: { file_path: "message.txt" } }] },
       { toolCalls: [{ name: "Write", input: { file_path: "message.txt", content: "combined\n" } }] },
       { text: "done" },
     ]);
@@ -50,7 +52,7 @@ for (const exitCode of [0, 1]) {
     const cmd = 'node -e "if(require(\'fs\').existsSync(\'.git/MERGE_HEAD\')) process.exit(' + exitCode + ')"';
     const code = await runWorktree(["merge", "--force-merge", "--resolve-with-agent", "task", "--verify", cmd], dir);
     assert.equal(code, exitCode);
-    assert.equal(model.requests.length, 2);
+    assert.equal(model.requests.length, 3);
     assert.equal(existsSync(path.join(dir, ".git", "MERGE_HEAD")), false);
     if (exitCode) {
       assert.equal(git("rev-parse", "HEAD"), before);

@@ -77,7 +77,7 @@ export async function runInstance(
         permissionMode: "bypassPermissions",
         sandboxMode: "workspace-write",
         maxTurns: opts.maxTurns ?? 40,
-        maxTokens: 4_096,
+        maxTokens: Number(process.env.BENCH_MAX_TOKENS ?? 8_192),
         enableSubagent: false,
       },
       rules: emptyRuleSet(),

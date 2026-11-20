@@ -31,6 +31,8 @@ export interface OpenAIProviderOptions {
    * 就被当成 openai 处理：baseUrl 回落到 api.openai.com，请求直接失败。
    */
   id?: string;
+  /** 推理强度：仅 OpenAI 兼容的推理模型（DeepSeek 等）接受该字段。 */
+  reasoningEffort?: import("../core/config.ts").ReasoningEffort;
 }
 
 type WireMessage =
@@ -50,6 +52,7 @@ export class OpenAIProvider implements ModelProvider {
   private apiKey: string;
   private baseUrl: string;
   private extraHeaders: Record<string, string>;
+  private reasoningEffort?: import("../core/config.ts").ReasoningEffort;
 
   constructor(opts: OpenAIProviderOptions) {
     this.id = opts.id ?? "openai";
@@ -57,6 +60,7 @@ export class OpenAIProvider implements ModelProvider {
     this.baseUrl = (opts.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
     this.model = opts.model ?? "gpt-4.1";
     this.extraHeaders = opts.extraHeaders ?? {};
+    this.reasoningEffort = opts.reasoningEffort;
   }
 
   async *stream(req: ModelRequest): AsyncGenerator<StreamEvent> {
@@ -70,6 +74,7 @@ export class OpenAIProvider implements ModelProvider {
       tool_choice: "auto",
       max_tokens: req.maxTokens,
       temperature: req.temperature,
+      ...(this.reasoningEffort ? { reasoning_effort: this.reasoningEffort } : {}),
       stream: true,
       stream_options: { include_usage: true },
     };

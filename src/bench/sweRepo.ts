@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { SweInstance } from "./swebench.ts";
 
@@ -7,8 +7,8 @@ type Instance = Pick<SweInstance, "instance_id" | "repo" | "base_commit">;
 type Outcome = { ok: boolean; detail: string };
 
 const marker = "harness-swe-instance";
-const sourcePaths = [".", ":(exclude).venv", ":(exclude).harness",
-  ":(exclude,glob)**/tests/**", ":(exclude,glob)**/testing/**"];
+const testExcludes = [":(exclude,glob)**/tests/**", ":(exclude,glob)**/testing/**"];
+const sourcePathsWhenIgnored = [".", ...testExcludes];
 
 function git(dir: string, args: string[], env = process.env) {
   // Explicit paths prevent Git from discovering the harness repository above an instance directory.
@@ -80,9 +80,15 @@ export function extractPatch(dir: string, inst: Instance): string {
     const index = path.join(temp, "index");
     if (existsSync(path.join(gitDir, "index"))) copyFileSync(path.join(gitDir, "index"), index);
     const env = { ...process.env, GIT_INDEX_FILE: index };
-    const add = git(dir, ["add", "-A", "--", ...sourcePaths], env);
+    // 有的仓库（pytest）把 .venv 写进 .gitignore：此时显式 pathspec 排除 .venv 会被
+    // git 当成"显式指定被忽略路径"而报错。探测一下，只在没被忽略时才需要排除。
+    const venvIgnored = git(dir, ["check-ignore", "-q", ".venv"]).status === 0;
+    const addPaths = venvIgnored
+      ? sourcePathsWhenIgnored
+      : [".", ":(exclude).venv", ":(exclude).harness", ...testExcludes];
+    const add = git(dir, ["add", "-A", "--", ...addPaths], env);
     if (add.status !== 0) throw new Error(failure(add));
-    const diff = git(dir, ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", inst.base_commit, "--", ...sourcePaths], env);
+    const diff = git(dir, ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", inst.base_commit, "--", ...addPaths], env);
     if (diff.status !== 0) throw new Error(failure(diff));
     return diff.stdout;
   } finally {

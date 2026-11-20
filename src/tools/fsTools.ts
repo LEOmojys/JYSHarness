@@ -43,7 +43,8 @@ export const ReadTool: Tool = {
   name: "Read",
   description:
     "Read a text file from the filesystem. Returns line-numbered content. " +
-    "Use offset/limit for large files; always read a file before editing it.",
+    "Use offset/limit for large files; always read a file before editing it. " +
+    "Prefer this over reading files through the shell (cat/type/Get-Content).",
   inputSchema: {
     type: "object",
     properties: {
@@ -75,7 +76,7 @@ export const ReadTool: Tool = {
     }
 
     const text = (await readFile(abs, "utf8")).replace(/^\uFEFF/, "");
-    const lines = text.split("\n");
+    const lines = text.split("\n").map((line) => line.replace(/\r$/, ""));
     const total = lines.length;
     const start = Math.min(offset, total);
     const end = Math.min(start + limit - 1, total);
@@ -164,23 +165,38 @@ export const EditTool: Tool = {
     // 而这里的原文带 BOM —— 不剥的话"改首行"永远 old_string not found。
     const hadBom = rawText.charCodeAt(0) === 0xfeff;
     const original = hadBom ? rawText.slice(1) : rawText;
+    // Read 会按行展示且模型通常输出 LF。Windows checkout 的 CRLF 文件应做等价匹配，
+    // 但写回仍沿用文件原有 EOL，避免模型为了修代码而先用 shell 改整份换行。
+    const hasCrLf = original.includes("\r\n");
+    const mixedEol = hasCrLf && /(^|[^\r])\n/.test(original);
+    const eol = hasCrLf ? "\r\n" : "\n";
+    const matchOld = mixedEol ? oldStr : oldStr.replace(/\r?\n/g, eol);
+    const replacement = mixedEol ? newStr : newStr.replace(/\r?\n/g, eol);
+    if (!matchOld || matchOld === replacement) {
+      return { content: "Error: old_string must be nonempty and differ from new_string after newline matching.", isError: true };
+    }
 
     let count = 0;
-    let idx = original.indexOf(oldStr);
+    let idx = original.indexOf(matchOld);
     const firstIdx = idx;
     while (idx !== -1) {
       count++;
-      idx = original.indexOf(oldStr, idx + oldStr.length);
+      idx = original.indexOf(matchOld, idx + matchOld.length);
     }
     if (count === 0) {
-      return { content: "Error: old_string not found in " + abs + ". Re-read the file and match exactly (including indentation).", isError: true };
+      return {
+        content:
+          "Error: old_string not found in " + abs + ". " + nearestHint(original, oldStr) +
+          " Match exactly (including indentation); use Read with offset/limit on that region.",
+        isError: true,
+      };
     }
     if (count > 1 && !replaceAll) {
       return { content: "Error: old_string appears " + count + " times. Add more context, or set replace_all=true.", isError: true };
     }
     const updated = replaceAll
-      ? original.split(oldStr).join(newStr)
-      : original.slice(0, firstIdx) + newStr + original.slice(firstIdx + oldStr.length);
+      ? original.split(matchOld).join(replacement)
+      : original.slice(0, firstIdx) + replacement + original.slice(firstIdx + matchOld.length);
     ctx.checkpoints?.record(abs);
     // BOM 原样还回去：剥掉是给匹配用的，不该改文件编码。
     await writeFileAtomic(abs, hadBom ? "\uFEFF" + updated : updated);
@@ -196,6 +212,31 @@ export const EditTool: Tool = {
     };
   },
 };
+
+/** old_string 没命中时，指出原文件里最接近的那一行，省掉一次“整文件重读”。 */
+function nearestHint(original: string, oldStr: string): string {
+  const needle = oldStr.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length >= 4);
+  if (!needle) return "";
+  const lines = original.split(/\r?\n/);
+  let best = -1;
+  let bestScore = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const candidate = lines[i]!.trim();
+    if (!candidate) continue;
+    let score = 0;
+    const short = needle.slice(0, 40);
+    for (let k = 0; k < short.length && k < candidate.length; k++) {
+      if (short[k] === candidate[k]) score++;
+      else break;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  if (best < 0 || bestScore < 4) return "";
+  return "Closest line " + (best + 1) + ": " + JSON.stringify(lines[best]!.slice(0, 160)) + ".";
+}
 
 function walk(root: string, dir: string, out: string[], limit: number): void {
   if (out.length >= limit) return;
@@ -222,7 +263,7 @@ function walk(root: string, dir: string, out: string[], limit: number): void {
 
 export const GlobTool: Tool = {
   name: "Glob",
-  description: "Find files by glob pattern (e.g. \"src/**/*.ts\"). Returns paths sorted by path.",
+  description: 'Find files by glob pattern (e.g. "src/**/*.ts"). Returns paths sorted by path. Prefer this over shell ls/dir/Get-ChildItem for discovery.',
   inputSchema: {
     type: "object",
     properties: {
@@ -270,7 +311,8 @@ export const GlobTool: Tool = {
 export const GrepTool: Tool = {
   name: "Grep",
   description:
-    "Search file contents with a regular expression. Returns matching lines with file:line.",
+    "Search file contents with a regular expression. Returns matching lines with file:line. " +
+    "Prefer this over shell grep/findstr: it is faster and returns structured locations.",
   inputSchema: {
     type: "object",
     properties: {

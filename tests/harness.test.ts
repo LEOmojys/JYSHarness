@@ -171,14 +171,14 @@ async function collect(gen: AsyncGenerator<HarnessEvent>): Promise<HarnessEvent[
   return events;
 }
 
-async function makeSession(root: string, turns: MockTurn[], opts: { approve?: boolean; mode?: string } = {}) {
+async function makeSession(root: string, turns: MockTurn[], opts: { approve?: boolean; mode?: string; maxTurns?: number } = {}) {
   const provider = new MockProvider(turns);
   const session = new Session({
     workspaceRoot: root,
     settings: {
       permissionMode: (opts.mode as never) ?? "default",
       sandboxMode: "workspace-write",
-      maxTurns: 10,
+      maxTurns: opts.maxTurns ?? 10,
       maxTokens: 4096,
     },
     rules: emptyRuleSet(),
@@ -191,6 +191,153 @@ async function makeSession(root: string, turns: MockTurn[], opts: { approve?: bo
   await session.init();
   return { session, provider };
 }
+
+test("agent loop: unchanged repeated calls and near-budget runs get a convergence nudge", async () => {
+  const root = await tempWorkspace();
+  await writeFile(path.join(root, "target.txt"), "same result", "utf8");
+  const repeatedRead = { name: "Read", input: { file_path: "target.txt" } };
+  const turns: MockTurn[] = [
+    { text: "inspect", toolCalls: [repeatedRead] },
+    { text: "inspect again", toolCalls: [repeatedRead] },
+    { text: "inspect once more", toolCalls: [repeatedRead] },
+    { text: "done", stopReason: "end_turn" },
+  ];
+  const { session } = await makeSession(root, turns, { maxTurns: 4 });
+  const events = await collect(session.send("inspect and finish", new AbortController().signal));
+  const toolEnds = events.filter((event) => event.type === "tool_end");
+  assert.equal(toolEnds.length, 3);
+  assert.equal(session.stats.steps, 3);
+  // 第二次相同的只读调用就命中缓存：期间没有任何写操作，结果必然相同。
+  assert.match(toolEnds[1]!.result.content, /Cached: no file changed/);
+  assert.match(toolEnds[2]!.result.content, /Cached: no file changed/);
+  assert.ok(
+    session.messages.some((message) => message.isMeta && message.content.some((block) => block.type === "text" && block.text.includes("Budget notice"))),
+    "near-budget convergence note should enter the next model context",
+  );
+});
+
+test("scheduling: read-only shell commands join the parallel batch, writes stay serial", () => {
+  const registry = buildDefaultRegistry({ enableSubagent: false }).assemble();
+  const bash = registry.find((tool) => tool.name === "Bash")!;
+  const read = registry.find((tool) => tool.name === "Read")!;
+  assert.equal(bash.isConcurrencySafe({ command: "git status --short" }), true);
+  assert.equal(bash.isConcurrencySafe({ command: "Get-ChildItem src" }), true);
+  assert.equal(bash.isConcurrencySafe({ command: "Get-Content README.md | Select-Object -First 5" }), true);
+  assert.equal(bash.isConcurrencySafe({ command: "Get-Content a.txt | Set-Content b.txt" }), false);
+  assert.equal(bash.isConcurrencySafe({ command: "Select-String foo README.md | Out-File out.txt" }), false);
+  assert.equal(bash.isConcurrencySafe({ command: "rm -rf build" }), false);
+  assert.equal(bash.isConcurrencySafe({ command: "python -c \"open('a','w')\"" }), false);
+
+  const lookup = {
+    get: (name: string) => registry.find((tool) => tool.name === name),
+    names: () => registry.map((tool) => tool.name),
+  };
+  const prepared = [
+    prepareCall(lookup, { id: "1", name: "Bash", input: { command: "git status" } }),
+    prepareCall(lookup, { id: "2", name: "Read", input: { file_path: "README.md" } }),
+    prepareCall(lookup, { id: "3", name: "Bash", input: { command: "rm -rf build" } }),
+    prepareCall(lookup, { id: "4", name: "Read", input: { file_path: "README.md" } }),
+  ];
+  assert.equal(read.isConcurrencySafe({ file_path: "README.md" }), true);
+  const batches = partitionCalls(prepared);
+  assert.deepEqual(batches.map((batch) => [batch.concurrencySafe, batch.calls.length]), [
+    [true, 2],
+    [false, 1],
+    [true, 1],
+  ]);
+});
+
+test("scheduling: writes to different files run together, writes to one file stay ordered", async () => {
+  const root = await tempWorkspace();
+  const turns: MockTurn[] = [
+    {
+      text: "write two files",
+      toolCalls: [
+        { name: "Write", input: { file_path: "a.txt", content: "A" } },
+        { name: "Write", input: { file_path: "b.txt", content: "B" } },
+        { name: "Write", input: { file_path: "c.txt", content: "C1" } },
+        { name: "Write", input: { file_path: "c.txt", content: "C2" } },
+      ],
+    },
+    { text: "done", stopReason: "end_turn" },
+  ];
+  const { session } = await makeSession(root, turns);
+  const events = await collect(session.send("write", new AbortController().signal));
+  assert.equal(events.filter((event) => event.type === "tool_end").length, 4);
+  assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "A");
+  assert.equal(await readFile(path.join(root, "b.txt"), "utf8"), "B");
+  assert.equal(await readFile(path.join(root, "c.txt"), "utf8"), "C2", "same file must apply in order");
+});
+
+test("scheduling: a write invalidates cached read results", async () => {
+  const root = await tempWorkspace();
+  await writeFile(path.join(root, "value.txt"), "first", "utf8");
+  const read = { name: "Read", input: { file_path: "value.txt" } };
+  const turns: MockTurn[] = [
+    { text: "read", toolCalls: [read] },
+    { text: "read again", toolCalls: [read] },
+    { text: "write", toolCalls: [{ name: "Write", input: { file_path: "value.txt", content: "second" } }] },
+    { text: "read after write", toolCalls: [read] },
+    { text: "done", stopReason: "end_turn" },
+  ];
+  const { session } = await makeSession(root, turns);
+  const events = await collect(session.send("go", new AbortController().signal));
+  const results = events.filter((event) => event.type === "tool_end").map((event) => event.result.content);
+  assert.match(results[1]!, /Cached: no file changed/);
+  assert.ok(!/Cached/.test(results[3]!), "a write must invalidate the cache");
+  assert.match(results[3]!, /second/);
+});
+
+test("scheduling: read-only streak asks the model to stop inspecting", async () => {
+  const root = await tempWorkspace();
+  await writeFile(path.join(root, "a.txt"), "x", "utf8");
+  await writeFile(path.join(root, "b.txt"), "y", "utf8");
+  await writeFile(path.join(root, "c.txt"), "z", "utf8");
+  const turns: MockTurn[] = [
+    { text: "r1", toolCalls: [{ name: "Read", input: { file_path: "a.txt" } }] },
+    { text: "r2", toolCalls: [{ name: "Read", input: { file_path: "b.txt" } }] },
+    { text: "r3", toolCalls: [{ name: "Read", input: { file_path: "c.txt" } }] },
+    { text: "done", stopReason: "end_turn" },
+  ];
+  const { session } = await makeSession(root, turns);
+  await collect(session.send("inspect only", new AbortController().signal));
+  assert.ok(
+    session.messages.some(
+      (message) => message.isMeta && message.content.some((block) => block.type === "text" && /consecutive steps only reading/.test(block.text)),
+    ),
+    "three read-only steps should trigger an act-now note",
+  );
+});
+
+test("scheduling: verification command families are normalised", async () => {
+  const { commandFamily, noteFamilyRepeat, CACHEABLE_READ_TOOLS } = await import("../src/core/toolSchedule.ts");
+  assert.equal(commandFamily("Bash", { command: "git status --short" }), "git:status");
+  assert.equal(commandFamily("Bash", { command: "git --no-pager diff HEAD" }), "git:diff");
+  assert.equal(commandFamily("Bash", { command: ".venv/Scripts/python.exe -m pytest -q" }), "pytest");
+  assert.equal(commandFamily("Read", { file_path: "x" }), null);
+  const tracker = { recentCallResults: new Map(), commandFamilies: new Map() };
+  assert.equal(noteFamilyRepeat(tracker, "git:status"), "");
+  assert.match(noteFamilyRepeat(tracker, "git:status"), /already ran a git:status/);
+  assert.ok(CACHEABLE_READ_TOOLS.has("Bash"));
+});
+
+test("scheduling: editing an unread file is blocked, reading then editing works", async () => {
+  const root = await tempWorkspace();
+  await writeFile(path.join(root, "target.ts"), "const before = 1;\n", "utf8");
+  const turns: MockTurn[] = [
+    { text: "edit first", toolCalls: [{ name: "Edit", input: { file_path: "target.ts", old_string: "const before = 1;", new_string: "const after = 2;" } }] },
+    { text: "read", toolCalls: [{ name: "Read", input: { file_path: "target.ts" } }] },
+    { text: "edit again", toolCalls: [{ name: "Edit", input: { file_path: "target.ts", old_string: "const before = 1;", new_string: "const after = 2;" } }] },
+    { text: "done", stopReason: "end_turn" },
+  ];
+  const { session } = await makeSession(root, turns);
+  const events = await collect(session.send("edit", new AbortController().signal));
+  const ends = events.filter((event) => event.type === "tool_end");
+  assert.equal(ends[0]!.result.isError, true, "edit before read must be rejected");
+  assert.match(ends[0]!.result.content, /read .* before editing it/);
+  assert.equal(ends[2]!.result.isError, undefined, "edit after read must succeed");
+  assert.equal(await readFile(path.join(root, "target.ts"), "utf8"), "const after = 2;\n");
+});
 
 test("end-to-end: tool calls execute and final text is produced", async () => {
   const root = await tempWorkspace();
@@ -316,6 +463,7 @@ test("file edit requires unique match unless replace_all", async () => {
   await mkdir(path.join(root, "src"), { recursive: true });
   await writeFile(path.join(root, "src/a.ts"), "const a = 1;\nconst a = 1;\n", "utf8");
   const provider = new MockProvider([
+    { text: "read", toolCalls: [{ name: "Read", input: { file_path: "src/a.ts" } }] },
     { text: "e", toolCalls: [{ name: "Edit", input: { file_path: "src/a.ts", old_string: "const a = 1;", new_string: "const a = 2;" } }] },
     { text: "e", toolCalls: [{ name: "Edit", input: { file_path: "src/a.ts", old_string: "const a = 1;", new_string: "const a = 2;", replace_all: true } }] },
     { text: "done", stopReason: "end_turn" },
@@ -332,9 +480,9 @@ test("file edit requires unique match unless replace_all", async () => {
   await session.init();
   const events = await collect(session.send("edit", new AbortController().signal));
   const ends = events.filter((e) => e.type === "tool_end");
-  assert.equal(ends.length, 2);
-  const first = ends[0];
-  const second = ends[1];
+  assert.equal(ends.length, 3);
+  const first = ends[1];
+  const second = ends[2];
   assert.ok(first.type === "tool_end" && first.result.isError, "ambiguous edit must fail");
   assert.ok(second.type === "tool_end" && !second.result.isError, "replace_all must succeed");
   const content = await readFile(path.join(root, "src/a.ts"), "utf8");

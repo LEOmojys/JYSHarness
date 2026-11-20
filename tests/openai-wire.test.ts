@@ -216,6 +216,47 @@ test("openai wire: multimodal user content uses the array form", async () => {
   }
 });
 
+test("openai wire: reasoningEffort is sent only when configured", async () => {
+  const chunks = [
+    'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  let seen = "";
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += String(c)));
+    req.on("end", () => {
+      seen = raw;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      for (const c of chunks) res.write(c);
+      res.end();
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const run = async (provider: OpenAIProvider) => {
+      for await (const _ of provider.stream({
+        model: "deepseek-flash",
+        system: "s",
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        tools: [],
+        maxTokens: 64,
+      })) {
+        /* drain */
+      }
+    };
+    const base = { apiKey: "k", baseUrl: "http://127.0.0.1:" + port, model: "deepseek-flash" };
+    await run(new OpenAIProvider({ ...base, reasoningEffort: "low" }));
+    assert.equal((JSON.parse(seen) as { reasoning_effort?: string }).reasoning_effort, "low");
+    await run(new OpenAIProvider(base));
+    assert.equal((JSON.parse(seen) as { reasoning_effort?: string }).reasoning_effort, undefined);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
 test("openai wire: reasoning_content becomes thinking_delta, not answer text", async () => {
   const chunks = [
     'data: {"choices":[{"delta":{"reasoning_content":"先想一下"}}]}\n\n',

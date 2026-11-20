@@ -16,6 +16,12 @@ import type { CompactionConfig } from "../context/compaction.ts";
 import { validateHooks, type HookDefinition, type HookEvent } from "../hooks/hooks.ts";
 import { CONFIG_DIR, LEGACY_CONFIG_DIR, configHome } from "./configStore.ts";
 
+/**
+ * 推理强度。DeepSeek 兼容端点接受 none/minimal/low/medium/high/xhigh/ultra/max，
+ * 实测 `max` 的思维链明显长于 high，而"不传"往往比 high 还长 —— 想省 token 就显式设 low。
+ */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
+
 export interface HarnessSettings {
   provider?: "openai" | "anthropic" | "mock";
   model?: string;
@@ -28,6 +34,8 @@ export interface HarnessSettings {
   /** Model context window; 0/undefined = infer from the model name. */
   contextWindow?: number;
   temperature?: number;
+  /** 推理强度；留空 = 端点默认（实测偏长）。常用 low / high / max。 */
+  reasoningEffort?: ReasoningEffort;
   /** 备用模型：主模型认证失败/限流耗尽/5xx 时切一次（同一 provider）。 */
   fallbackModel?: string;
   /** 子 Agent 的轮次上限（默认 25）。 */

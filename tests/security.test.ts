@@ -146,6 +146,29 @@ test("ssrf: a public hostname resolving to a private address is refused", async 
   assert.equal(MAX_REDIRECTS > 0, true);
 });
 
+test("security: shell file reading is steered to the dedicated tools", async () => {
+  const { buildDefaultRegistry } = await import("../src/tools/index.ts");
+  const { Logger } = await import("../src/util/log.ts");
+  const registry = buildDefaultRegistry({ enableSubagent: false }).assemble();
+  const bash = registry.find((tool) => tool.name === "Bash")!;
+  const ctx = {
+    workspaceRoot: process.cwd(),
+    cwd: process.cwd(),
+    sandbox: { mode: "workspace-write" as const, workspaceRoot: process.cwd() },
+    signal: new AbortController().signal,
+    logger: new Logger("error"),
+    depth: 0,
+  };
+  for (const command of ["cat README.md", "Get-Content README.md", "Select-String foo a.txt", "ls src"]) {
+    const decision = bash.toolCheck?.({ command }, ctx as never) ?? null;
+    assert.equal(decision?.behavior, "deny", command + " should be denied");
+    assert.ok(String(decision?.message).includes("Use Read (to open), Grep"), command + " should point at the dedicated tools");
+  }
+  // 真正的非文件命令仍然放行（管道尾部的 Select-Object 不算读文件）
+  assert.equal(bash.toolCheck?.({ command: "pytest -q tests/x.py" }, ctx as never) ?? null, null);
+  assert.equal(bash.toolCheck?.({ command: ".venv/Scripts/python.exe -m pytest -q | Select-Object -Last 10" }, ctx as never) ?? null, null);
+});
+
 test("security: the harness provider key never reaches a child process", async () => {
   const { scrubEnv } = await import("../src/sandbox/policy.ts");
   const base = { ANTHROPIC_API_KEY: "sk-ant-secret", OPENAI_API_KEY: "sk-openai", PATH: "/usr/bin" };

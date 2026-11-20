@@ -168,7 +168,7 @@ export async function runBench(opts: {
         permissionMode: "bypassPermissions",
         sandboxMode: "workspace-write",
         maxTurns: opts.maxTurns ?? 30,
-        maxTokens: opts.mode === "real" ? 4_096 : 512,
+        maxTokens: opts.mode === "real" ? Number(process.env.BENCH_MAX_TOKENS ?? 8_192) : 512,
         enableSubagent: false,
       },
       rules: emptyRuleSet(),

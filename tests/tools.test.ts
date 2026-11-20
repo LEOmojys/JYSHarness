@@ -1,3 +1,23 @@
+
+test("preflight: repeated git checks short-circuit until a write happens, and test runs are capped", async () => {
+  const { preflight, MAX_TEST_RUNS } = await import("../src/core/toolSchedule.ts");
+  const state = { writeEpoch: 0, familyChecks: new Map<string, number>(), testRuns: 0 };
+  const git = { request: { id: "1", name: "Bash", input: { command: "git status --short" } } } as never;
+  const gitOther = { request: { id: "2", name: "Bash", input: { command: "git --no-pager diff" } } } as never;
+  const pytest = { request: { id: "3", name: "Bash", input: { command: ".venv/Scripts/python.exe -m pytest -q" } } } as never;
+  const read = { request: { id: "4", name: "Read", input: { file_path: "a.ts" } } } as never;
+
+  assert.equal(preflight(state, git), null, "first check runs");
+  assert.match(String(preflight(state, git)), /Nothing changed since your last git:status/);
+  assert.equal(preflight(state, read), null, "non-shell tools are untouched");
+  state.writeEpoch += 1;
+  assert.equal(preflight(state, git), null, "a write re-arms the check");
+  assert.equal(preflight(state, gitOther), null, "a different family is independent");
+
+  for (let i = 0; i < MAX_TEST_RUNS; i++) assert.equal(preflight(state, pytest), null);
+  assert.match(String(preflight(state, pytest)), /already run tests/);
+});
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { partitionCalls, prepareCall, executeCall, ToolRegistry } from "../src/tools/registry.ts";

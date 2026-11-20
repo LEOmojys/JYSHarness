@@ -200,11 +200,12 @@ test("checkpoints: write is undoable and emits a diff", async () => {
   const root = await tempWorkspace();
   await writeFile(path.join(root, "app.txt"), "line1\nline2\n", "utf8");
   const session = await makeSession(root, [
+    { text: "reading", toolCalls: [{ name: "Read", input: { file_path: "app.txt" } }] },
     { text: "editing", toolCalls: [{ name: "Edit", input: { file_path: "app.txt", old_string: "line2", new_string: "CHANGED" } }] },
     { text: "done", stopReason: "end_turn" },
   ]);
   const events = await collect(session.send("edit it", new AbortController().signal));
-  const toolEnd = events.find((e) => e.type === "tool_end");
+  const toolEnd = events.filter((e) => e.type === "tool_end")[1];
   const changes = toolEnd.result.metadata.changes;
   assert.equal(changes.length, 1);
   assert.equal(changes[0].created, false);
